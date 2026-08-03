@@ -1,0 +1,6 @@
+Run	Email	Sample Name	BCL	Species	Chemistry	RNA Index	Lane	SB Index	SB Lane	Puck ID	Merge RNA From BCL	Merge Spatial From BCL	Add RNA Index	Add SB Index	Add Puck ID	Cellranger	Flex Probe Barcode IDs
+YES	you@example.org	tumor	20240101_RUNID	Human	3Pv3	SI-TT-A1	1,2	SI-TT-B1	1,2	P00001							
+YES	you@example.org	normal	20240101_RUNID	Human	3Pv3	SI-TT-A2	1,2	SI-TT-B2	1,2	P00002						V8	
+NO	you@example.org	pilot	20240101_RUNID	Human	3Pv3	SI-TT-A3	1	SI-TT-B3	1	P00003							
+YES	you@example.org	deep	20240101_RUNID	Human	3Pv3	SI-TT-A4	1,2	SI-TT-B4	1,2	P00004	20231215_RUNID		SI-TT-C4				
+YES	you@example.org	flex_pool	20240202_FLEXID	Mouse	Flex	SI-TT-D1	1	SI-TT-E1	1	P00005						V9	BC001,BC002

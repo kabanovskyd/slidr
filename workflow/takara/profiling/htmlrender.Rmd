@@ -1,0 +1,463 @@
+---
+title: "`r params$sample`"
+date: "Analysis Date: `r Sys.Date()`"
+author:
+  - "Tile ID: `r params$beadbarcode`"
+  - "Pipeline Version: Trekker v1.4.3"
+  - "Single cell assay platform: `r params$platform`"
+output: 
+  html_document:
+    keep_md: false
+    css: style.css
+params:
+  sample: ""
+  beadbarcode: ""
+  platform: ""
+  file_metrics: ""
+  file_variable_features_clusters: ""
+  file_variable_features_spatial_moransi: ""
+  file_matched_seurato: ""
+  file_matched_seurato_cpositioned: ""
+  file_freq_mismatch: ""
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message=FALSE)
+library(Seurat)
+library(ggplot2)
+library(ggprism)
+library(knitr)
+library(kableExtra)
+library(RColorBrewer)
+library(fields)
+library(ggpubr)
+#library(plotly)
+library(ggrepel)
+library(tidyverse)
+```
+
+```{r functions, echo=FALSE, warning = FALSE, results='hide', comment=NA}
+gen_markers_bycluster<-function(variable_features_cluster){
+  markers_bycluster<-lapply(unique(variable_features_cluster$cluster), function(x){
+  genes<-variable_features_cluster[variable_features_cluster$cluster==x,]
+  genes.top<-genes[genes$p_val_adj<0.05,]
+  genes.top<-genes.top[order(genes.top$avg_log2FC, decreasing = T),]
+  });names(markers_bycluster)<-unique(variable_features_cluster$cluster)
+  markers_bycluster
+}
+
+dotplot_topn<-function(seuratO, markers_bycluster, n=5, group.by="SCT_snn_res.0.2"){
+  topn<-n
+  top_markers_bycluster<-lapply(markers_bycluster, function(x){
+    top<-x$gene[1:topn]
+  })
+  
+  col <- rev(designer.colors(col=brewer.pal(9, "Spectral")))
+  top_markers_bycluster<-unique(unlist(top_markers_bycluster))
+  top_markers_bycluster<-top_markers_bycluster[!is.na(top_markers_bycluster)]
+  
+  DotPlot(seuratO, feature=unique(unlist(top_markers_bycluster)), group.by = group.by)+
+    ggtitle("")+
+    theme(axis.text.y = element_text(face = "italic",size=10),axis.text.x = element_text(face = "italic",angle = 90, size=10, vjust=0.5, hjust=1),plot.title = element_text(hjust = 0.7, face="plain", size=20))+
+  ylab("Clusters")+xlab("Genes")+
+  scale_colour_gradientn(colors=c("#00DCF7","#00E79A"))+
+  geom_point(aes(size=pct.exp), shape = 21, colour="black", stroke=0.5)
+}
+
+show_condition_cluster_markers <- function(f) {
+  tryCatch(
+    {
+      cluster_markers<-read.csv(file=f)
+      return(cluster_markers)
+    },
+      error = function(c) {
+      msg=conditionMessage(c)
+      print(paste0(msg, " ", f))
+      return(FALSE)
+    },
+      warning = function(c) "warning",
+      message = function(c) "message"
+  )
+}
+
+pal_atac <- c("#0BB19F","#FE6900","#870E75","#CEFF1A","#3E71A8","#F5E400","#9A32CD","#FF4500","#009ACD","#29BF12","#00A5CF","#DE1A1A","#574AE2","#FFBF00",
+              "#66CD00","#202547","#53354A","#7A6C5D","#BE3144","#FF7844","#E3D26F","#628395","#C5D86D","#DB2763","#17377A","#FC471E","#55DDE0","#558AA6",
+              "#B1740F","#D5006A","#08585A","#FFFD98","#9449D2","#BBBE64","#D7263D","#1D3554","#DFE07C","#7F8E39","#42858C","#E48F1B","#570D32","#E5C616",
+              "#D33B44","#943CB4","#194D44","#C6CF6E","#5B6DC8","#3CA437","#6B244C","#6ACDC5","#BBB53E","#2A297A","#995533","#D590DA","#273B5B","#C1C243",
+              "#E73E26","#2E6657","#E8F5B3","#24A99C","#D12600","#DB6A00","#B2FF2E","#00AD00","#9CCADE","#005B94","#1E2085","#610052","#953272")
+
+get_palette_vector <- function(pal_custom, num_clusters) {
+  if (length(pal_custom) >= num_clusters) {
+    pal_vec <- pal_custom
+  } else {
+    pal_vec <- rep_len(pal_custom, num_clusters)
+  }
+  return(pal_vec)
+}
+
+get_shared_range <- function(sobj, features, digits = 2) {
+  # Extract all values
+  vals <- unlist(lapply(features, function(f) {
+    sobj[[f]][,1]
+  }))
+  
+  low  <- round(min(vals, na.rm = TRUE), digits)
+  high <- round(max(vals, na.rm = TRUE), digits)
+  
+  return(list(low = low, high = high))
+}
+```
+
+```{r single cell platforms, echo=FALSE, warning = FALSE, results='hide', comment=NA}
+if (params$platform %in% c("TrekkerU_M", "TrekkerU_RATAC")) {
+	run_atac_chunk<-TRUE
+	run_spatial_qc_chunk<-TRUE
+}else if (length(grep(params$platform, c("TrekkerU_C", "TrekkerU_CX", "TrekkerCX", "TrekkerC", "TrekkerFX_FLEX", "TrekkerU_R", "TrekkerU_RVDJ", "TrekkerR", "TrekkerU_IL",  "TrekkerU_PIP", "TrekkerQ_P", "TrekkerQ_S", "Trekker5C_C", "Trekker5C_CX")))){
+	run_atac_chunk<-FALSE
+        run_spatial_qc_chunk<-TRUE
+}else if (length(grep(params$platform, c("TrekkerSHA_WGA")))) {
+        run_atac_chunk<-FALSE
+	run_spatial_qc_chunk<-FALSE
+}else{
+        stop(paste0("Unrecognized single cell platform: ", assay,
+        ".\nPlease choose among TrekkerU_C, TrekkerU_CX, TrekkerCX, TrekkerC, TrekkerFX_FLEX, TrekkerU_R, TrekkerU_RATAC, TrekkerU_RVDJ, TrekkerR, TrekkerU_IL, TrekkerU_PIP, TrekkerQ_P, TrekkerQ_S, TrekkerU_M, Trekker5C_C, Trekker5C_CX, TrekkerSHA_WGA.",
+       "\nTroubleshooting:",
+       "\n \u2022 The pipeline sets this to TrekkerFX_FLEX for Flex runs, so an unexpected value means the Trekker samplesheet was hand-edited",
+       "\n \u2022 Re-run the stage through the pipeline with `./slidr --bcl <BCL_ID> --spatial-analysis --force`"))
+}
+
+```
+
+<script>
+$(document).ready(function(){
+    $('[data-toggle="popover"]').popover();
+});
+</script>
+
+```{r data import, sample quality, echo=FALSE, warning = FALSE, comment=NA, results='hide'}
+quality<-read.csv(params$file_metrics, header=T, row.name=1)
+numbers_interested<-c(
+	"Min_spatial_barcodes_used_to_locate_a_nucleus_centroid",
+	"Total_nuclei_from_single-nuclei_sequencing_library",
+	"Pct_nuclei_in_Trekker_library",
+	"Pct_nuclei_in_Trekker_library_with_valid_spatial_barcodes",
+	"Nuclei_positioned",
+	"Nuclei_confidently_positioned",
+
+	"Total_readpairs_in_Trekker_library",
+	"Pct_readpairs_with_proper_structure",
+	"Pct_readpairs_matched_to_single_nuclei_barcodes_with_valid_spatial_barcodes",
+
+	"Median_useful_reads_per_nuclei"
+)
+
+numbers_toint <- c(
+	"Min_spatial_barcodes_used_to_locate_a_nucleus_centroid",
+	"Total_nuclei_from_single-nuclei_sequencing_library",
+	"Nuclei_positioned",
+	"Nuclei_confidently_positioned",
+	"Total_readpairs_in_Trekker_library",
+
+	"Median_useful_reads_per_nuclei"
+)
+
+quality[numbers_toint,"Value"]<-as.integer(quality[numbers_toint,"Value"])
+
+numbers_interested_meta<-data.frame("def"=rep("-", length(numbers_interested)), "action"=rep("", length(numbers_interested)))
+rownames(numbers_interested_meta)<-numbers_interested
+numbers_interested_meta["Min_spatial_barcodes_used_to_locate_a_nucleus_centroid",]<-c("Minimum number of spatial barcodes used to assign 1 spatial location. This is the parameter minPts used for DBSCAN. For each sample, it is dynamically chosen within an expected range (10x Chromium 3’ v3.1, 3’ v4 [4,15]; 10x Chromium Multiome [4,26]; 10x Chromium 5' [4,60]; 10x Chromium FLEX [4,80]; BD Rhapsody WTA, ATAC+WTA, VDJ+WTA [9,31]; Parse Evercode WT v3, Illumina 3’ RNA Prep [4,60]). The chosen number maximizes the metric 'Pct nuclei positioned with 1 spatial location'.","")
+numbers_interested_meta["Total_nuclei_from_single-nuclei_sequencing_library",]<-c("Total high-quality nuclei retained from single-nuclei pipeline analysis", "If significantly lower or higher than expected, check if the threshold set by the single-nuclei analysis pipeline to retain high-quality nuclei is appropriate. Alternatively, check if nuclei counting was performed appropriately. If lower than expected, check if the assayed tissue had compromised quality.")
+numbers_interested_meta["Pct_nuclei_in_Trekker_library",]<-c("% nuclei from single-nuclei pipeline analysis found in the Trekker library", "If < 95%, check your samplesheet.csv to see if a wrong single-nuclei assay platform was selected for the Trekker pipeline analysis, and if your Trekker FASTQ inputs and single-nuclei output are incorrectly paired and are not from the same group of nuclei.")
+numbers_interested_meta["Pct_nuclei_in_Trekker_library_with_valid_spatial_barcodes",]<-c("% nuclei from single-nuclei pipeline analysis found in the Trekker library with R2 matched to the Trekker tile spatial barcode whitelist", "If < 50%, check your samplesheet.csv to see if a wrong tile ID was used for the Trekker pipeline analysis.")
+numbers_interested_meta["Nuclei_positioned",]<-c("Nuclei from single-nuclei pipeline analysis with at least 1 spatial location assigned", "If low, check for noticeable bead loss during nuclei counting. Alternatively, check if your Trekker library has been sufficiently sequenced to reach saturation, using metric 'Median useful reads per nuclei' (10x Chromium 3’ v3.1, 3’ v4, Multiome, 5', FLEX, Parse Evercode WT v3, Illumina 3’ RNA Prep >= 400, BD Rhapsody WTA, ATAC+WTA, VDJ+WTA >= 250).")
+numbers_interested_meta["Nuclei_confidently_positioned",]<-c("Nuclei from single-nuclei pipeline analysis with 1 spatial location assigned (singlets)", "If low, check for noticeable bead loss or multiplets during nuclei counting. Alternatively, check if your Trekker library has reached saturation, using metric 'Median useful reads per nuclei' (10x Chromium 3’ v3.1, 3’ v4, Multiome, 5', FLEX, Parse Evercode WT v3, Illumina 3’ RNA Prep >= 400, BD Rhapsody WTA, ATAC+WTA, VDJ+WTA >= 250).")
+numbers_interested_meta["Total_readpairs_in_Trekker_library",]<-c("Total raw FASTQ readpairs in the Trekker library", "If notably lower than expected, check sequencing run quality and if demultiplexing was performed appropriately.")
+numbers_interested_meta["Pct_readpairs_with_proper_structure",]<-c("% Trekker spatial barcode reads with expected linker sequence (hamming dist <=1)", "If < 80%, check your samplesheet.csv for a potential swap between Trekker R1 and R2 FASTQs or if a wrong primer was used during Trekker library preparation.")
+numbers_interested_meta["Pct_readpairs_matched_to_single_nuclei_barcodes_with_valid_spatial_barcodes",]<-c("% properly structured, single-nuclei matched readpairs that matched to the Trekker tile whitelist", "If < 50%, check your samplesheet.csv to see if a wrong tile ID was used for the Trekker pipeline analysis.")
+numbers_interested_meta["Median_useful_reads_per_nuclei",]<-c("Median reads per nuclei that matched to nuclei barcodes, properly structured, and matched to the Trekker tile spatial barcode whitelist", "If <400 for 10x Chromium 3’ v3.1, 3’ v4, Multiome, 5', FLEX, Parse Evercode WT v3, Illumina 3’ RNA Prep or <250 for BD Rhapsody WTA, ATAC+WTA, VDJ+WTA and no severe bead loss was observed, consider performing additional sequencing to obtain more reads and reach saturation.")
+
+numbers_interested_cleaned <- numbers_interested
+numbers_interested_cleaned <- gsub("_|\\.", " ", numbers_interested_cleaned)
+numbers_interested_cleaned <- gsub("Percent|percent|Pct", "%",  numbers_interested_cleaned)
+toupdate <- sapply(gregexpr("%", numbers_interested_cleaned, fixed=T), function(x) x[1])==1
+substr(numbers_interested_cleaned[toupdate], 3, 3) <- toupper(substr(numbers_interested_cleaned[toupdate], 3, 3))
+toprint <- data.frame(matrix(rep("", 2*length(numbers_interested)), ncol=2))
+
+colnames(toprint)<-c('', '')
+toprint[,1] <- cell_spec(
+  numbers_interested_cleaned,
+  popover = spec_popover(
+    content = numbers_interested_meta[numbers_interested, "def"],
+    title = NULL,                          
+    position = rep("left", length(numbers_interested))
+))
+
+toprint[,2] <- cell_spec(
+  quality[numbers_interested, "Value"],
+  popover = spec_popover(
+    content = numbers_interested_meta[numbers_interested, "action"],
+    title = NULL,
+    position = rep("right", length(numbers_interested))
+))
+```
+
+<div style="margin-bottom:40px;">
+</div>
+
+## Quality Metrics
+<p>Hover over the metric names and values to view metric definitions and action conditions.</p>
+<details>
+  <summary><strong>Nuclei Positioning Metrics</strong></summary>
+</details>
+
+```{r Nuclei positioning metrics, echo=FALSE, warning = FALSE, comment=NA}
+toprint_section <- toprint[1:6,]
+rownames(toprint_section) = NULL
+kbl(toprint_section[1:6,], align = c("l","r"), col.names = NULL, escape = FALSE, booktabs=TRUE, centering=F, format = "html", table.attr = "style='width:75%;'", format.args = list(big.mark = ","))%>%
+kable_styling(full_width = TRUE, position = "center", bootstrap_options = c("hover", "condensed"), font_size = 14)
+```
+
+<details>
+  <summary><strong>Spatial Barcode Library Quality</strong></summary>
+</details>
+
+```{r Spatial Barcode Library Metrics, echo=FALSE, warning = FALSE, comment=NA}
+toprint_library_metrics <- toprint[7:9,]
+rownames(toprint_library_metrics) = NULL
+kbl(toprint_library_metrics, align = c("l","r"), col.names = NULL, escape = FALSE, booktabs=TRUE, centering=F, format = "html", table.attr = "style='width:75%;'", format.args = list(big.mark = ","))%>%
+kable_styling(full_width = TRUE, position = "center", bootstrap_options = c("hover", "condensed"), font_size = 14)
+```
+
+<div style="margin-bottom:10px;">
+</div>
+
+<details>
+  <summary><strong>Spatial Barcode Library Depth</strong></summary>
+</details>
+
+```{r Spatial Barcode library Depth, echo=FALSE, warning = FALSE, comment=NA}
+toprint_section = toprint[10,]
+rownames(toprint_section)<-NULL
+kbl(toprint_section, align = c("l","r"), col.names = NULL, escape = FALSE, booktabs=TRUE, centering=F, format = "html", table.attr = "style='width:75%;'", format.args = list(big.mark = ","))%>%
+kable_styling(full_width = TRUE, position = "center", bootstrap_options = c("hover", "condensed"), font_size = 14)
+```
+
+<div style="margin-bottom:10px;">
+</div>
+
+```{r data import for plots, echo=FALSE, results='hide', warning = FALSE, comment=NA}
+seuratO<-readRDS(params$file_matched_seurato)
+seuratO_cpositioned<-readRDS(params$file_matched_seurato_cpositioned)
+cluster_markers<-show_condition_cluster_markers(params$file_variable_features_clusters)
+spatial_markers<-read.table(params$file_variable_features_spatial_moransi, sep="\t")
+```
+
+```{r determine tile size, echo=FALSE}
+#tile_size = strtoi(quality["Total_barcodes_on_substrate", "Values", drop=F])/10^5
+tile_size=1
+m <- ifelse(tile_size > 1, 3.3, 1)
+n <- ifelse(tile_size > 1, 2.2, 1)
+raster <- FALSE
+```
+
+## Spatial Maps
+<p>Click the plot title for detailed interpretations.</p>
+```{r QC2, fig.align="left", fig.width=18, echo=FALSE, fig.height=6, eval=run_spatial_qc_chunk, results='asis', warning=FALSE}
+# Conditionally show the HTML content based on the value of run_spatial_qc_chunk
+if (run_spatial_qc_chunk) {
+  cat('
+  <details>
+  <summary><strong>Spatial Map of Quality Metrics</strong></summary>
+  <p>Spatial locations of nuclei, colored according to the relative abundance of mitochondrial genes, number of UMI (transcripts) and genes detected. Higher % expression of mitochondrial can indicate cellular debris retained in the nuclei prep but can also be biological. A lack of structural patterns in quality metrics may not reflect run quality.<br> <br>Nuclei confidently positioned (with 1 location assigned) were included in the spatial maps. Values used for coloring were extracted from the single-nuclei expression matrix.
+  </p>
+</details>
+  ')
+}
+
+features<-c("percent.mt", "log10_nCount_RNA", "log10_nFeature_RNA")#, "pct_rrna")
+titles<-c("% Mitochondrial UMI", expression('log'[10]*' (Number of UMI)'), expression('log'[10]*' (Number of genes)'))
+col <- rev(designer.colors(col=brewer.pal(9, "Spectral")))
+
+shared_range <- get_shared_range(
+  seuratO_cpositioned,
+  c("log10_nCount_RNA", "log10_nFeature_RNA")
+)
+
+b<-lapply(1:length(features), function(i){
+  #low <- round(min(seuratO_cpositioned[[features[i]]]),2)
+  #high <- round(max(seuratO_cpositioned[[features[i]]]),2)
+  #col <- rev(designer.colors(col=brewer.pal(9, "Spectral")))
+  feat <- features[i]
+  # define pallete scale
+  if (feat == "percent.mt") {
+
+    low  <- 0
+    high <- 100
+
+  } else if (feat %in% c("log10_nCount_RNA", "log10_nFeature_RNA")) {
+
+    low  <- shared_range$low
+    high <- shared_range$high
+
+  } else {
+
+    vals <- seuratO_cpositioned[[feat]][,1]
+    low  <- round(min(vals, na.rm=TRUE), 2)
+    high <- round(max(vals, na.rm=TRUE), 2)
+  }
+
+  if (high==0){
+    FeaturePlot(seuratO_cpositioned, features = features[i],
+              reduction="SPATIAL", slot = "counts", order=T, pt.size = 0.5, raster=raster)&
+    xlab("X")&ylab("Y")&NoAxes()&ggtitle(titles[i])&
+    scale_colour_gradientn(colours = col)&
+      theme(plot.title = element_text(hjust = 0.5, face="plain",size=30*m),
+            legend.text=element_text(size=rel(1.1*m)),
+            legend.key.height = unit(1*m, 'cm'),
+            legend.key.width = unit(1*m, 'cm'))&coord_fixed()
+  }else{
+    FeaturePlot(seuratO_cpositioned, features = features[i],
+              reduction="SPATIAL", slot = "counts", order=T, pt.size = 0.5, raster=raster)&
+    xlab("X")&ylab("Y")&NoAxes()&ggtitle(titles[i])&
+    scale_colour_gradientn(colours = col,
+                           limits = c(low, high),
+                           breaks = seq(low, high, length.out=5),
+                           labels = round(seq(low, high, length.out=5),2))&
+        theme(plot.title = element_text(hjust = 0.5, face="plain",size=30*m),
+         legend.text=element_text(size=rel(1.1*m)),
+         legend.key.height = unit(1*n, 'cm'),
+         legend.key.width = unit(1*n, 'cm'))&coord_fixed()
+ }
+})
+plotQC2 <- ggarrange(b[[1]], b[[2]], b[[3]], nrow = 1, ncol = 3)
+plotQC2
+```
+
+<div style="margin-bottom:10px;">
+</div>
+
+<details>
+  <summary><strong>Spatial Map of Cell Types</strong></summary>
+  <p>Dimensional reduction (left) and spatial localizations (right) of nuclei, colored according to their cluster assignments. Dimensional reduction was performed using UMAP (Uniform Manifold Approximation and Projection) on the top 30 principal components, with clusters identified through an unsupervised graph-based clustering method.<br> <br>All nuclei from single-nuclei pipeline analysis (including those without spatial locations) were included in the UMAP. Nuclei confidently positioned (with 1 location assigned) were included in the spatial map.
+  </p>
+</details>
+
+```{r Cluster_SPATIAL_combined, fig.align="left", echo=FALSE, fig.width=16, fig.height=8}
+qual_col_pals = brewer.pal.info[brewer.pal.info$category %in% c('qual','seq'),]
+pal_rna = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+col_vector <- get_palette_vector(pal_rna, length(levels(seuratO$SCT_snn_res.0.2)))
+
+plotUMAP <- DimPlot(seuratO, reduction = "umap", group.by = "SCT_snn_res.0.2", label = T, label.size = 6, cols = col_vector, pt.size = 1, repel = TRUE, raster=raster)&
+  xlab("UMAP1")&ylab("UMAP2")&ggtitle("")&
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.title.x = element_text(size=20*n, margin = margin(t = 10)), 
+	axis.title.y = element_text(size=20*n, margin = margin(r = 10)),
+	axis.ticks.x = element_blank(),
+        axis.text.x = element_blank(),
+	axis.ticks.y = element_blank(),
+        axis.text.y = element_blank(),
+	legend.position="none")&coord_fixed()
+
+plotSPATIAL <- DimPlot(seuratO_cpositioned, group.by = "SCT_snn_res.0.2", reduction = "SPATIAL", cols = col_vector, pt.size = 1.4, raster=raster)&
+  NoAxes()&
+  ggtitle("")&
+  guides(color = guide_legend(override.aes = list(size = 5*n)))&
+  theme(plot.title = element_text(hjust = 0.5), 
+	legend.text=element_text(size=18*n), 
+	legend.key.size = unit(1*n, "cm")
+	)&
+  labs(fill = "")&coord_fixed()
+
+plotUMAP_SPATIAL=plotUMAP+plotSPATIAL
+plotUMAP_SPATIAL
+```
+
+```{r Cluster_SPATIAL_combined_atac, fig.align="left", echo=FALSE, fig.width=16, fig.height=8, eval=run_atac_chunk, results='asis',warning = FALSE, comment=NA}
+# Conditionally show the HTML content based on the value of run_atac_chunk
+if (run_atac_chunk) {
+  cat('
+  <details>
+  <summary><strong>Spatial Map of Cell Types Based on ATAC peaks</strong></summary>
+  <p>Dimensional reduction (left) and spatial localizations (right) of nuclei, colored according to their cluster assignments. Dimensional reduction was performed using UMAP (Uniform Manifold Approximation and Projection) on the top 50 LSI components, with clusters identified through an unsupervised graph-based clustering method.<br> <br>All nuclei from single-nuclei pipeline analysis (including those without spatial locations) were included in the UMAP. Nuclei confidently positioned (with 1 location assigned) were included in the spatial maps.
+  </p>
+</details>
+  ')
+}
+
+
+col_vector <- get_palette_vector(pal_atac, length(levels(seuratO$ATAC_snn_res.0.8)))
+
+plotUMAP_ATAC <- DimPlot(seuratO, reduction = "umap.atac", group.by = "ATAC_snn_res.0.8", label = TRUE, 
+                         label.size = 6, cols = col_vector, pt.size = 1, repel = TRUE, raster=raster, label.color = "white")&
+  xlab("ATAC_UMAP1")&ylab("ATAC_UMAP2")&ggtitle("")&
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.title.x = element_text(size=20*n, margin = margin(t = 10), color="white"),
+        axis.title.y = element_text(size=20*n, margin = margin(r = 10), color="white"),
+        axis.line.x = element_line(color = "white"),
+        axis.line.y = element_line(color = "white"),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank(),
+        plot.background = element_rect(fill = "black", color = NA),
+        panel.background = element_rect(fill = "black", color = NA),
+        legend.position="none")&coord_fixed()
+
+plotSPATIAL_ATAC <- DimPlot(seuratO_cpositioned, group.by = "ATAC_snn_res.0.8", reduction = "SPATIAL", cols = col_vector, pt.size = 1.4, raster=raster)&
+  NoAxes()&
+  ggtitle("")&
+  guides(color = guide_legend(override.aes = list(size = 5*n)))&
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.text=element_text(size=18*n, color="white"),
+        legend.key.size = unit(1*n, "cm"),
+        plot.background = element_rect(fill = "black", color = NA),
+        panel.background = element_rect(fill = "black", color = NA),
+        legend.background = element_rect(fill = "black", color = NA),
+        legend.key = element_rect(fill = "black", color = NA)
+  )&labs(fill = "")&coord_fixed()
+
+plotUMAP_SPATIAL_ATAC=plotUMAP_ATAC+plotSPATIAL_ATAC
+plotUMAP_SPATIAL_ATAC
+```
+
+<div style="margin-bottom:40px;">
+</div>
+
+## Variable Genes
+<p>Click the plot title for detailed interpretations.</p>
+<details>
+ <summary><strong>Top Cluster Defining Genes</strong></summary>
+ <p>One-to-all Wilcoxon Rank Sum test was used to identify genes that define each cluster. The cluster IDs align with those in the UMAP visualization above. The results display the top 5 genes, or all genes that passed the threshold for each cluster, whichever is fewer.<br><br>All nuclei were included in the analysis (including those with no spatial location assigned).
+ </p>
+</details>
+
+
+```{r Top_differentially_expressed_genes_per_cluster, fig.align="left", fig.width=12, fig.height=5, echo=FALSE, warning=FALSE}
+if(is.logical(cluster_markers)){
+  print("No statistically significant variable feature was identified.")
+}else{
+  markers_bycluster<-gen_markers_bycluster(cluster_markers)
+  plotDOT <- dotplot_topn(seuratO, markers_bycluster, n=5, group.by="SCT_snn_res.0.2")
+  plotDOT
+}
+```
+
+<div style="margin-bottom:10px;">
+</div>
+
+<details>
+ <summary><strong>Top 10 Spatially Variable Features</strong></summary>
+ <p>Moran's I was used to measure spatial variability.<br><br>Nuclei confidently positioned (with 1 location assigned) were included in the analysis and spatial maps.</p>
+</details>
+
+
+```{r Top_spatially_variable_features, fig.align="left", fig.width=15*m, fig.height=8*m, echo=FALSE, message=FALSE, warning=FALSE}
+DefaultAssay(seuratO_cpositioned)<-"SCT"
+plotSPATIALFEATURE <- SpatialFeaturePlot(seuratO_cpositioned, features = rownames(spatial_markers)[1:10], ncol = 5, alpha = c(0.1, 1), max.cutoff = "q95", slot = "data", pt.size.factor = 1.6/m)&
+  theme(legend.title = element_text(colour="black", size = 12*m, face = "italic"),
+        legend.text = element_text(color="black", size=rel(0.8*m)),
+        legend.key.height = unit(0.7*n, 'cm'),
+        legend.key.width = unit(0.7*n, 'cm'),
+        plot.title = element_text(color="black",hjust=0.5,vjust=0.5,size=rel(1*n), face="italic"))
+plotSPATIALFEATURE
+```

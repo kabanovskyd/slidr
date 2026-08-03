@@ -1,0 +1,679 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOCAL_CONFIG="${SCRIPT_DIR}/config/config.yaml"
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") --bcl BCL_ID [OPTIONS]
+       $(basename "$0") --version
+
+Required:
+  --bcl BCL_ID          BCL run ID passed to workflow/main.py
+
+Informational (these exit immediately and need no other flags):
+  -v, --version         Print the pipeline version and exit
+  -h, --help            Print this message and exit
+
+Where inputs come from:
+  Staging location is configuration, not a flag. \`settings.input_bucket\` in
+  config/config.yaml names the GCS prefix holding config.yaml, auth_key.json and
+  the <BCL_ID> data folder; the VM or compute node is handed that location and
+  downloads everything it needs itself. --gcp always stages (a fresh VM has
+  nothing else); --slurm stages only when asked with --stage-gcs.
+
+GCP VM options:
+  --project  PROJECT    GCP project (required for --gcp; no default)
+  --zone     ZONE       GCP zone           (default: us-central1-a)
+  --machine  TYPE       Machine type       (default: n1-standard-16)
+  --disk     SIZE       Boot disk size     (default: 200GB)
+  --gpu [TYPE]          Attach a GPU. TYPE is optional and defaults to
+                         nvidia-tesla-t4; pass a GCE accelerator name to pick
+                         another (e.g. --gpu nvidia-l4). List what a zone offers
+                         with \`gcloud compute accelerator-types list\`. Under
+                         --slurm an explicit TYPE becomes a gres type
+                         (--gres=gpu:TYPE:1), which must match your cluster's
+                         gres.conf naming rather than GCE's.
+
+Slurm options (only apply with --slurm; CPUs and memory are read from
+settings.threads / settings.memory in the config the job will run with):
+  --partition NAME      Slurm partition to submit to (default: cluster default)
+  --time      LIMIT     Job time limit, e.g. 24:00:00 or 1-00:00:00 (default: 24:00:00)
+
+Slurm staging options (only apply with --slurm --stage-gcs):
+  --workdir  PATH       Directory on cluster storage to stage inputs into and
+                         write outputs to. Usually unnecessary: it defaults to
+                         the parent of \`paths.output_path\` in the config, then
+                         to \$SCRATCH/slidr, then to <repo>/slidr-work/<BCL_ID>.
+                         Pass it when none of those is the right filesystem -- a
+                         BCL run is routinely hundreds of GB.
+
+Authenticating to GCS, and overriding \`software_path\` for this cluster, are done
+outside slidr: run \`gcloud auth login\` (or \`gcloud auth activate-service-account\`)
+once on the submit node, and export SLIDR_SOFTWARE_PATH before submitting. See
+'All options' in the README.
+
+Pipeline flags (passed through to workflow/main.py; short forms match its own):
+  --fastqs, -fq [PATH]  Treat the input as already-demultiplexed FASTQs, skipping
+                         cellranger mkfastq. PATH is optional: with no value the
+                         FASTQs are read from \`paths.input_path\`, which is the
+                         usual case. Mutually exclusive with --mkfastq. With --gcp
+                         a PATH must be one on the VM (e.g. /pipeline/data/BCL_ID,
+                         where the input bucket is staged).
+  --metadata, -md PATH  Metadata .tsv/.csv path (or Google Sheet URL) for this
+                         run, overriding \`settings.metadata_source\`.
+  --stage-gcs, -sg      Fetch this run's inputs from GCS rather than the local
+                         filesystem: reference_path/puck_path/raw_barcodes_path
+                         for the pipeline, and -- under --slurm -- the config,
+                         auth key and sequencing data too. The location comes
+                         from \`settings.input_bucket\`. Implied by --gcp.
+  --run-all, -ra        Run all pipeline components (default if no step flag given)
+  --mkfastq, -mf        Run cellranger mkfastq only
+  --count, -ct          Run cellranger count only
+  --cellbender, -cb     Run cellbender only
+  --no-cellbender, -nb  Skip cellbender when running the full pipeline
+  --spatial-count, -sc  Run spatial barcode counting only
+  --spatial-analysis, -sa
+                        Run spatial analysis only
+  --force, -f           Overwrite existing outputs
+
+Where the run executes:
+  --gcp, -gc            Create a GCE VM, run there, and stream its logs back
+  --slurm, -sl          Submit as a Slurm batch job (consumed here, not passed on
+                         to workflow/main.py, which has no --slurm flag)
+EOF
+  exit 1
+}
+
+# read a top-level scalar value for a key from config/config.yaml. Simple line-based parse
+# (first matching `key:` line, inline comment stripped, value trimmed) -- NOT a full YAML parser;
+# sufficient for slidr's flat scalar fields (input_bucket, threads, memory). Prints nothing if the
+# config file or key is absent.
+read_config_scalar() {
+    local key="$1" file="${2:-$LOCAL_CONFIG}" line
+    [[ -f "$file" ]] || return 0
+    line="$(grep -E "^[[:space:]]*${key}:" "$file" 2>/dev/null | head -1 || true)"
+    line="${line%%#*}"                                # strip any inline comment
+    cut -d: -f2- <<< "$line" | xargs 2>/dev/null || true   # value after first colon, trimmed
+}
+
+# Map a short pipeline flag to its long form.
+#
+# ./slidr accepts the same short options as workflow/main.py, but always *forwards* the long form.
+# The pass-through flags are re-serialized into GCE instance metadata and echoed into the run
+# summary, so pinning them to one canonical spelling keeps both readable no matter which spelling the
+# caller used. Only the flags ./slidr passes through need to appear here -- the ones it consumes
+# itself (--bcl and the GCP/Slurm options) are matched directly in the case statement.
+canonical_flag() {
+    case "$1" in
+        -mf) echo "--mkfastq" ;;
+        -ct) echo "--count" ;;
+        -cb) echo "--cellbender" ;;
+        -nb) echo "--no-cellbender" ;;
+        -sc) echo "--spatial-count" ;;
+        -sa) echo "--spatial-analysis" ;;
+        -ra) echo "--run-all" ;;
+        -f)  echo "--force" ;;
+        -fq) echo "--fastqs" ;;
+        -sg) echo "--stage-gcs" ;;
+        -md) echo "--metadata" ;;
+        -gc) echo "--gcp" ;;
+        *)   echo "$1" ;;
+    esac
+}
+
+# Strip every trailing slash from a GCS prefix.
+#
+# Everything downstream builds object URIs by appending directly to this prefix
+# ("${INPUT}/config.yaml", "${INPUT}/${BCL_ID}"), and GCS object names are literal strings: the name
+# `in//config.yaml` is a *different* object than `in/config.yaml`, so a trailing slash would make
+# every staging copy fail to find its input. This mirrors the normalization gcs_uri() applies to the
+# `paths.*` fields on the Python side. A loop rather than "${value%/}" because that removes only one
+# slash, leaving `inputs//` -- the very form that breaks -- still broken.
+strip_trailing_slashes() {
+    local value="$1"
+    while [[ "$value" == */ ]]; do value="${value%/}"; done
+    printf '%s' "$value"
+}
+
+# print the pipeline version and exit. Read straight out of pyproject.toml -- the same source
+# config.py's get_version() falls back to -- rather than shelling out to `uv run python
+# workflow/main.py --version`, so `--version` stays instant and keeps working on a machine where the
+# Python environment has not been set up (or is broken), which is exactly when you want to check it.
+# Only the `version` key inside the [project] table is considered: a bare grep would also match a
+# version key belonging to some later [tool.*] table.
+print_version() {
+    local file="${SCRIPT_DIR}/pyproject.toml" version
+    if [[ ! -f "$file" ]]; then
+        echo "[ERROR]: cannot determine the slidr version: ${file} not found" >&2
+        echo "Troubleshooting:" >&2
+        echo " • Run \`git pull\` to restore the missing pyproject.toml file" >&2
+        echo " • Check you are running ./slidr from inside the repository checkout" >&2
+        exit 1
+    fi
+    version="$(awk -F= '
+        /^\[/            { in_project = ($0 == "[project]"); next }
+        in_project && $1 ~ /^[ \t]*version[ \t]*$/ {
+            gsub(/[ \t"'"'"']/, "", $2); print $2; exit
+        }' "$file")"
+    if [[ -z "$version" ]]; then
+        echo "[ERROR]: cannot determine the slidr version: no \`version\` key in the [project] table of ${file}" >&2
+        echo "Troubleshooting:" >&2
+        echo " • Run \`git checkout pyproject.toml\` to restore the file to its committed state" >&2
+        exit 1
+    fi
+    # same wording as `workflow/main.py --version`, so both entry points report identically
+    echo "slidr version ${version}"
+    exit 0
+}
+
+# Download the config.yaml from a GCS prefix to a local temp file and echo its path.
+#
+# Used at submit time only, so a Slurm allocation and its staging directory can both be derived from
+# the config the job will actually run with rather than from whatever the local checkout happens to
+# hold. Fetched once and read repeatedly with read_config_scalar, rather than re-fetching per key.
+# Returns non-zero (and echoes nothing) if the object cannot be read, leaving the caller to fall back.
+fetch_remote_config() {
+    local prefix="$1" tmp
+    tmp="$(mktemp)" || return 1
+    if gcloud storage cat "${prefix}/config.yaml" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+        printf '%s' "$tmp"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+# ensure uv is installed and on PATH (installs into $HOME/.local/slidr on first use)
+ensure_uv() {
+    # UV_INSTALL_DIR is the directory uv's binary is placed in directly (uv's default is
+    # ~/.local/bin, a leaf bindir), so the installed binary lands at $HOME/.local/slidr/uv --
+    # add that exact directory to PATH, not a nonexistent .../slidr/bin subdirectory
+    mkdir -p "$HOME/.local/slidr"
+    export PATH="$HOME/.local/slidr:$PATH"
+    if ! command -v uv &> /dev/null; then
+        echo "Installing uv..."
+        if ! curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR="$HOME/.local/slidr" sh; then
+            echo "[ERROR]: uv installation failed" >&2
+            echo "Troubleshooting:" >&2
+            echo " • The installer is fetched with curl, so this usually means no network access or a proxy blocking https://astral.sh" >&2
+            echo " • Install uv manually: https://docs.astral.sh/uv/getting-started/installation/" >&2
+            echo " • Or install it with pipx/pip: \`pipx install uv\`" >&2
+            echo " • Check there is free space and write permission on ${HOME}/.local/slidr" >&2
+            exit 1
+        fi
+        export PATH="$HOME/.local/slidr:$PATH"
+        echo "uv installed to ${HOME}/.local/slidr/uv"
+    fi
+}
+
+# ensure conda is installed (the pipeline uses it for the R / CellBender environments)
+ensure_conda() {
+    if ! command -v conda &> /dev/null; then
+        echo "Installing Miniforge..."
+
+        # detect OS
+        OS=$(uname -s)
+        ARCH=$(uname -m)
+
+        if [ "$OS" = "Linux" ]; then
+            INSTALLER="Miniforge3-Linux-${ARCH}.sh"
+        elif [ "$OS" = "Darwin" ]; then
+            INSTALLER="Miniforge3-MacOSX-${ARCH}.sh"
+        else
+            echo "[ERROR]: cannot install Miniforge automatically on this platform: $OS" >&2
+            echo "Troubleshooting:" >&2
+            echo " • Automatic installation supports Linux and macOS (Darwin) only" >&2
+            echo " • Install Miniforge yourself and make sure \`conda\` is on PATH: https://github.com/conda-forge/miniforge#install" >&2
+            echo " • conda/mamba is needed for the R and CellBender environments; the rest of the pipeline uses uv" >&2
+            exit 1
+        fi
+
+        # download and run the installer. Both steps are checked explicitly: under `set -e` a bare
+        # failure here aborts the script with no output at all, leaving the user with no idea that
+        # it was conda -- not their run -- that failed.
+        if ! curl -fLO "https://github.com/conda-forge/miniforge/releases/latest/download/${INSTALLER}"; then
+            echo "[ERROR]: could not download the Miniforge installer (${INSTALLER})" >&2
+            echo "Troubleshooting:" >&2
+            echo " • This usually means no network access or a proxy blocking https://github.com" >&2
+            echo " • Install Miniforge yourself and make sure \`conda\` is on PATH: https://github.com/conda-forge/miniforge#install" >&2
+            echo " • On a cluster, check whether conda/mamba is already available as a module (e.g. \`module load miniforge\`)" >&2
+            exit 1
+        fi
+        if ! bash "${INSTALLER}" -b -p "$HOME/miniforge3"; then
+            echo "[ERROR]: the Miniforge installer failed" >&2
+            echo "Troubleshooting:" >&2
+            echo " • A pre-existing ${HOME}/miniforge3 blocks the install; remove it or install elsewhere and put it on PATH" >&2
+            echo " • Check there is free space and write permission in ${HOME}" >&2
+            echo " • Installer left in place for inspection: ./${INSTALLER}" >&2
+            exit 1
+        fi
+        rm "${INSTALLER}"
+
+        # add to PATH for the rest of this script
+        export PATH="$HOME/miniforge3/bin:$PATH"
+        conda init bash
+        echo "Miniforge installed. Please restart your shell or run: source ~/.bashrc"
+    fi
+}
+
+# --- defaults ---
+PROJECT=""
+ZONE="us-central1-a"
+MACHINE_TYPE="n1-standard-16"
+DISK_SIZE="200GB"
+# Where inputs are staged FROM always comes from `settings.input_bucket`: ./slidr only ever runs from
+# a checkout that has a config, and the VM / compute node is handed the location as a parameter. The
+# flags say *whether* to stage (--gcp implies it, --stage-gcs requests it), never where from.
+INPUT_GCS=""
+# set by --stage-gcs: intent to fetch this run's inputs from GCS rather than the local filesystem
+STAGE_GCS=""
+BCL_ID=""
+FASTQ_DIR=""
+METADATA_PATH=""
+SLIDR_ARGS=()
+# tracks whether the caller named a pipeline stage; --gcp/--slurm/--fastqs/--force say *how* or
+# *on what* to run, not *what* to run, so they must not suppress the --run-all default
+STAGE_FLAG=""
+GCP=""
+GPU=""
+# GCE accelerator type attached when --gpu is passed without an explicit one. T4 is the cheapest
+# card with enough memory for CellBender and is available in most zones. Kept in its own variable so
+# the validation error below can still name the default after GPU_TYPE has been overwritten.
+GPU_TYPE_DEFAULT="nvidia-tesla-t4"
+GPU_TYPE="$GPU_TYPE_DEFAULT"
+SLURM=""
+PARTITION=""
+TIME="24:00:00"
+WORKDIR=""
+
+# --- parse arguments ---
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --bcl)             BCL_ID="$2";       shift 2 ;;
+    # -sl has no canonical_flag entry, and needs none: --slurm is consumed here rather than forwarded
+    # (workflow/main.py has no --slurm flag -- scheduler dispatch is entirely a wrapper concern), so
+    # it never reaches the pass-through array that canonicalization exists to normalize.
+    -sl|--slurm)       SLURM=true; shift ;;
+    -gc|--gcp)         GCP=true; SLIDR_ARGS+=("$(canonical_flag "$1")"); shift ;;
+    # --gpu takes an optional accelerator type. The next argument is consumed as the type only when
+    # it is not itself a flag, so a bare `--gpu` (or `--gpu --run-all`) keeps working and defaults to
+    # $GPU_TYPE below rather than swallowing the following flag as a type name.
+    --gpu)             GPU=true
+                       if [[ $# -gt 1 && "$2" != -* ]]; then GPU_TYPE="$2"; shift 2; else shift; fi ;;
+    --project)         PROJECT="$2";      shift 2 ;;
+    --zone)            ZONE="$2";         shift 2 ;;
+    --machine)         MACHINE_TYPE="$2"; shift 2 ;;
+    --disk)            DISK_SIZE="$2";    shift 2 ;;
+    --partition)       PARTITION="$2";    shift 2 ;;
+    --time)            TIME="$2";         shift 2 ;;
+    --workdir)         WORKDIR="$2";      shift 2 ;;
+    # pass-through pipeline flags that take a value. --fastqs's is optional: a bare one means "the
+    # FASTQs are in `paths.input_path`", so the next argument is consumed only when it is not itself
+    # a flag (same rule as --gpu above).
+    -fq|--fastqs)      SLIDR_ARGS+=("$(canonical_flag "$1")")
+                       if [[ $# -gt 1 && "$2" != -* ]]; then
+                           FASTQ_DIR="$2"; SLIDR_ARGS+=("$2"); shift 2
+                       else
+                           shift
+                       fi ;;
+    -md|--metadata)    METADATA_PATH="$2"; SLIDR_ARGS+=("$(canonical_flag "$1")" "$2"); shift 2 ;;
+    # pass-through stage-selection flags
+    -ra|--run-all|-mf|--mkfastq|-ct|--count|-cb|--cellbender|-sc|--spatial-count|-sa|--spatial-analysis)
+                       STAGE_FLAG=true; SLIDR_ARGS+=("$(canonical_flag "$1")"); shift ;;
+    # pass-through boolean modifier flags. --stage-gcs asks the pipeline to pull
+    # reference_path/puck_path/raw_barcodes_path out of GCS; --gcp already implies it, so this is
+    # for staging on a cluster that is not a GCE VM.
+    -nb|--no-cellbender|-f|--force)
+                       SLIDR_ARGS+=("$(canonical_flag "$1")"); shift ;;
+    # --stage-gcs is both forwarded (the pipeline stages reference/puck/barcode paths) and acted on
+    # here (a --slurm run stages its config, key and sequencing data), so it is captured as well as
+    # passed through.
+    -sg|--stage-gcs)   STAGE_GCS=true; SLIDR_ARGS+=("$(canonical_flag "$1")"); shift ;;
+    # handled inline (and before the --bcl check below) so `./slidr --version` works on its own
+    -v|--version)      print_version ;;
+    -h|--help)         usage ;;
+    *)                 echo "[ERROR]: unknown argument: $1" >&2
+                       echo " • Check the flag against the list below; pipeline flags are passed through to workflow/main.py unchanged" >&2
+                       echo " • A value-taking flag needs its value as a separate argument (e.g. \`--fastqs /path\`, not \`--fastqs=/path\`)" >&2
+                       usage ;;
+  esac
+done
+
+[[ "$GCP" == true ]] && [[ "$SLURM" == true ]] && {
+    echo "[ERROR]: both --gcp and --slurm flags are provided - please choose one" >&2
+    echo " • --gcp creates a GCE VM and runs there; --slurm submits a batch job to this cluster" >&2
+    echo " • Drop both to run locally in the current shell" >&2
+    usage
+}
+[[ -z "$BCL_ID" ]] && {
+    echo "[ERROR]: --bcl is required" >&2
+    echo " • Pass the BCL run ID, e.g. \`--bcl 20240101_RUNID\`" >&2
+    echo " • It must match a value in the \`BCL\` column of your metadata sheet" >&2
+    echo " • Give the ID itself, not a path -- the run folder is resolved as <input_path>/<BCL_ID>" >&2
+    usage
+}
+
+# --fastqs supplies already-demultiplexed reads; --mkfastq asks for BCLs to be demultiplexed.
+# main.py rejects the combination too, but catching it here avoids creating a billable VM first.
+if [[ -n "$FASTQ_DIR" ]] && printf '%s\n' "${SLIDR_ARGS[@]}" | grep -qx -- --mkfastq; then
+    echo "[ERROR]: --fastqs and --mkfastq are mutually exclusive - choose one" >&2
+    echo "Troubleshooting:" >&2
+    echo " • --mkfastq asks for BCLs to be demultiplexed; --fastqs asserts that already happened" >&2
+    echo " • Drop --fastqs to demultiplex the BCLs under \`paths.input_path\`" >&2
+    echo " • Drop --mkfastq to run the downstream stages on the FASTQs you provided" >&2
+    exit 1
+fi
+
+# run everything by default: only a stage flag suppresses this, so `--fastqs DIR` (or `--gcp`) on
+# its own still runs the pipeline rather than silently doing nothing
+[[ -z "$STAGE_FLAG" ]] && SLIDR_ARGS+=(--run-all)
+
+# Resolve the GCS input prefix from the config. Trailing slashes are stripped because everything
+# downstream appends object names directly to it, and a GCS name containing '//' is a different object.
+INPUT_GCS="$(strip_trailing_slashes "$(read_config_scalar input_bucket)")"
+
+# Sanity-check the accelerator type before it reaches gcloud/sbatch. GCE accelerator names are
+# lowercase alphanumerics and hyphens (nvidia-tesla-t4, nvidia-l4, nvidia-a100-80gb), so anything
+# else is a typo -- and catching it here beats a VM-creation failure minutes later, or (on Slurm) a
+# job that sits pending forever against a resource the cluster has never heard of.
+if [[ "$GPU" == true ]] && ! [[ "$GPU_TYPE" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    echo "[ERROR]: invalid GPU type: '${GPU_TYPE}'" >&2
+    echo "Troubleshooting:" >&2
+    echo " • Accelerator names are lowercase letters, digits and hyphens, e.g. nvidia-tesla-t4, nvidia-l4, nvidia-a100-80gb" >&2
+    echo " • List what your zone offers: \`gcloud compute accelerator-types list --filter=\"zone:${ZONE}\"\`" >&2
+    echo " • Pass a bare \`--gpu\` to use the default (${GPU_TYPE_DEFAULT})" >&2
+    exit 1
+fi
+
+if [[ "$GCP" == true ]]; then
+
+    # Fail fast, before creating a billable VM, if the inputs it needs are missing. A fresh VM has no
+    # filesystem of ours at all, so --gcp always stages -- there is no non-staging mode to fall back to
+    # and hence no flag to opt in with. Without this check an empty prefix produces a VM that boots,
+    # runs `gcloud storage cp "/config.yaml" ...` (fails), and self-deletes: a silent, costly no-op
+    # instead of a clear local error.
+    if [[ -z "$INPUT_GCS" ]]; then
+        echo "[ERROR]: \`settings.input_bucket\` is not set, so a --gcp run has nowhere to stage its inputs from" >&2
+        echo "Troubleshooting:" >&2
+        echo " • Set \`settings.input_bucket\` in ${LOCAL_CONFIG} to the GCS prefix holding this run's inputs" >&2
+        echo " • That prefix must already hold config.yaml, auth_key.json and the ${BCL_ID} data folder -- upload them before launching" >&2
+        echo " • The VM is handed this location as instance metadata and downloads everything else itself" >&2
+        exit 1
+    fi
+    if [[ -z "$PROJECT" ]]; then
+        echo "[ERROR]: --project is required for a --gcp run" >&2
+        echo "Troubleshooting:" >&2
+        echo " • Pass your GCP project ID: \`--project my-project-id\`" >&2
+        echo " • List the projects you can use: \`gcloud projects list\`" >&2
+        echo " • The project must have a \`slidr-runner\` service account and the slidr-vm-image6 VM image" >&2
+        exit 1
+    fi
+    # BCL_ID/INPUT_GCS are embedded into gcloud's comma/equals-delimited --metadata value below, and
+    # so is --fastqs (via SLIDR_ARGS_STR); a ',' or '=' in any of them would silently split into
+    # bogus metadata keys or truncate a value.
+    if [[ "$BCL_ID" == *[,=]* || "$INPUT_GCS" == *[,=]* || "$FASTQ_DIR" == *[,=]* || "$METADATA_PATH" == *[,=]* ]]; then
+        echo "[ERROR]: --bcl, --fastqs, --metadata and \`settings.input_bucket\` must not contain ',' or '=' characters" >&2
+        echo "Troubleshooting:" >&2
+        echo " • These values are passed to the VM through GCE instance metadata, which is itself comma- and equals-delimited" >&2
+        echo " • Rename the offending path or BCL folder to remove the character, then re-launch" >&2
+        echo " • Received: --bcl '${BCL_ID}' --fastqs '${FASTQ_DIR}' --metadata '${METADATA_PATH}', input_bucket '${INPUT_GCS}'" >&2
+        exit 1
+    fi
+
+    SERVICE_ACCOUNT="slidr-runner@${PROJECT}.iam.gserviceaccount.com"
+    VM_NAME="slidr-run-$(date +%s)-${RANDOM}"
+
+    # Serialize the SLIDR_ARGS array into a single shell-quoted string so it
+    # survives the round-trip through GCE instance metadata (a flat string)
+    # and can be safely reconstituted into an array on the VM.
+    SLIDR_ARGS_STR="$(printf '%q ' "${SLIDR_ARGS[@]}")"
+
+    CMD=(
+        gcloud compute instances create "${VM_NAME}"
+        --zone="${ZONE}"
+        --image=slidr-vm-image6
+        --machine-type="${MACHINE_TYPE}"
+        --network=vpc1
+        --subnet=my-subnet-central
+        --service-account="${SERVICE_ACCOUNT}"
+        --project="${PROJECT}"
+        --boot-disk-size="${DISK_SIZE}"
+        --boot-disk-type=pd-balanced
+        # Narrowest set of scopes the VM actually uses: bucket read/write
+        # (staging inputs, uploading outputs), self-delete via the Compute
+        # API, and ops-agent log/metric forwarding. IAM roles on the
+        # slidr-runner service account still gate what's actually allowed;
+        # this just stops a minted token from also carrying access to every
+        # other API (BigQuery, Pub/Sub, IAM, etc.) that account could reach.
+        --scopes=storage-rw,compute-rw,logging-write,monitoring-write
+        --metadata=input-gcs="${INPUT_GCS}",bcl-id="${BCL_ID}",slidr-args="${SLIDR_ARGS_STR}"
+        --metadata-from-file=startup-script="${SCRIPT_DIR}/workflow/bash/slidr_gcp.sh"
+    )
+
+    if [[ "$GPU" == true ]]; then
+        echo "Attaching GPU: ${GPU_TYPE}"
+        CMD+=(
+            --accelerator="type=${GPU_TYPE},count=1"
+            # GPU-attached instances cannot live-migrate, so host maintenance must terminate them
+            --maintenance-policy=TERMINATE
+        )
+    fi
+
+    "${CMD[@]}"
+
+    # VM name on line 1, its project on line 2 -- watch_run.sh needs both to build the Cloud
+    # Logging filter, and reading the project back from here is what keeps it out of the script.
+    printf '%s\n%s\n' "${VM_NAME}" "${PROJECT}" > "${SCRIPT_DIR}/.last_run"
+
+    echo ""
+    echo "VM launched: ${VM_NAME}"
+    echo "Pipeline continues running if you disconnect. Reattach with: ./watch_run.sh"
+    echo ""
+
+    "${SCRIPT_DIR}/watch_run.sh" "${VM_NAME}" "${PROJECT}"
+elif [[ "$SLURM" == true ]]; then
+
+    # run relative-path commands from the repo root regardless of the caller's directory
+    cd "$SCRIPT_DIR"
+
+    # A --slurm run stages its inputs from GCS only when --stage-gcs asks it to. Left off, the job
+    # reads everything off the local filesystem exactly as before: whether a run is self-staging is
+    # stated by the flag, never guessed from whether input_bucket happens to be set in a config.
+    SLURM_STAGE=""
+    [[ "$STAGE_GCS" == true ]] && SLURM_STAGE=true
+
+    if [[ "$SLURM_STAGE" == true ]]; then
+        command -v gcloud >/dev/null 2>&1 || {
+            echo "[ERROR]: --slurm --stage-gcs needs the gcloud CLI to stage inputs, but it is not on PATH" >&2
+            echo "Troubleshooting:" >&2
+            echo " • Many clusters ship it as a module; load it first (e.g. \`module load google-cloud-sdk\`)" >&2
+            echo " • Otherwise install it: https://cloud.google.com/sdk/docs/install" >&2
+            echo " • Or drop --stage-gcs to run entirely off the local filesystem, with no staging" >&2
+            exit 1
+        }
+        [[ "$INPUT_GCS" == gs://* ]] || {
+            echo "[ERROR]: --stage-gcs needs \`settings.input_bucket\` to be a gs:// URL, but it is: '${INPUT_GCS}'" >&2
+            echo "Troubleshooting:" >&2
+            echo " • Set \`settings.input_bucket\` in ${LOCAL_CONFIG} to the prefix holding config.yaml, auth_key.json and the ${BCL_ID} data folder" >&2
+            echo " • Write the full URL including the scheme, e.g. gs://my-bucket/inputs" >&2
+            echo " • To read inputs off this cluster's own filesystem instead, drop --stage-gcs and set the paths in config/config.yaml" >&2
+            exit 1
+        }
+        # Fetch the config the job will run with, once. Both the allocation size and the default
+        # staging directory are derived from it, so a single copy is read rather than one per key.
+        REMOTE_CONFIG=""
+        if REMOTE_CONFIG="$(fetch_remote_config "$INPUT_GCS")"; then
+            CONFIG_SOURCE="$REMOTE_CONFIG"
+        else
+            echo "[WARNING]: could not read ${INPUT_GCS}/config.yaml; sizing the job from the local config" >&2
+            echo " • Check the object exists: \`gcloud storage ls ${INPUT_GCS}/config.yaml\`" >&2
+            echo " • Check you are authenticated: \`gcloud auth print-access-token\`" >&2
+            echo " • The job will still stage and use the bucket's config -- only the values read here fall back to the local file" >&2
+            CONFIG_SOURCE="$LOCAL_CONFIG"
+        fi
+
+        # Default the staging directory from the config rather than from the checkout. `output_path`
+        # is the best available hint at where this cluster keeps large storage, and its parent is the
+        # natural staging root -- the job puts data/ and outs/ side by side beneath the workdir, so
+        # deriving from `<...>/outs` reproduces the configured output location exactly. Falling back
+        # through $SCRATCH (set on most HPC sites) before the checkout means the last resort -- a
+        # home-directory quota, which is the wrong place for hundreds of GB -- is rarely reached.
+        if [[ -n "$WORKDIR" ]]; then
+            WORKDIR_SOURCE="--workdir"
+        else
+            CONFIG_OUTPUT_PATH="$(read_config_scalar output_path "$CONFIG_SOURCE")"
+            CONFIG_WORKDIR=""
+            [[ "$CONFIG_OUTPUT_PATH" == /* ]] && CONFIG_WORKDIR="$(dirname "$CONFIG_OUTPUT_PATH")"
+            if [[ -n "$CONFIG_WORKDIR" && "$CONFIG_WORKDIR" != "/" && "$CONFIG_WORKDIR" != "." ]]; then
+                WORKDIR="$CONFIG_WORKDIR"
+                WORKDIR_SOURCE="parent of \`paths.output_path\` in the config"
+            elif [[ -n "${SCRATCH:-}" ]]; then
+                WORKDIR="${SCRATCH}/slidr"
+                WORKDIR_SOURCE="\$SCRATCH"
+            else
+                WORKDIR="${SCRIPT_DIR}/slidr-work/${BCL_ID}"
+                WORKDIR_SOURCE="the repository checkout -- pass --workdir to stage on scratch instead"
+            fi
+        fi
+    elif [[ -n "$WORKDIR" ]]; then
+        echo "[ERROR]: --workdir applies to staged runs only; add --stage-gcs too" >&2
+        echo "Troubleshooting:" >&2
+        echo " • --workdir configures where inputs are staged *to*, so it only means something once there is something to stage" >&2
+        echo " • Add \`--stage-gcs\` to turn this into a self-staging run (the location comes from \`settings.input_bucket\`)" >&2
+        echo " • Or drop it: without --stage-gcs the job reads everything off the local filesystem, as configured in config/config.yaml" >&2
+        exit 1
+    fi
+
+    # Interpolate CPUs and memory (the same values Cellranger/Julia use) to size the allocation.
+    # sbatch needs them now, so for a staged run they come from the config in the bucket -- the one
+    # the job will actually run with -- rather than from whatever the local checkout happens to hold.
+    if [[ "$SLURM_STAGE" == true ]]; then
+        CPUS="$(read_config_scalar threads "$CONFIG_SOURCE")"
+        MEM="$(read_config_scalar memory "$CONFIG_SOURCE")"
+        [[ -n "$REMOTE_CONFIG" ]] && rm -f "$REMOTE_CONFIG"
+    else
+        CPUS="$(read_config_scalar threads)"
+        MEM="$(read_config_scalar memory)"
+    fi
+    CPUS="${CPUS:-16}"
+    MEM="${MEM:-50}"
+    if ! [[ "$CPUS" =~ ^[0-9]+$ ]]; then
+        echo "[ERROR]: settings.threads must be a positive integer (got '${CPUS}')" >&2
+        echo "Troubleshooting:" >&2
+        echo " • This value becomes sbatch's --cpus-per-task, so it has to be a bare integer" >&2
+        echo " • Set \`settings.threads\` to e.g. 16, with no quotes, units or inline comment" >&2
+        if [[ "$SLURM_STAGE" == true ]]; then
+            echo " • It is read from the config in the bucket: \`gcloud storage cat ${INPUT_GCS}/config.yaml | grep threads\`" >&2
+        else
+            echo " • It is read from ${LOCAL_CONFIG}" >&2
+        fi
+        exit 1
+    fi
+    # settings.memory is an integer number of GB per the config schema; append the 'G' suffix
+    # Slurm's --mem expects, but pass an already-suffixed value (e.g. 50G, 50000M) through unchanged
+    if [[ "$MEM" =~ ^[0-9]+$ ]]; then MEM_ARG="${MEM}G"; else MEM_ARG="$MEM"; fi
+
+    SBATCH_OPTS=(
+        --job-name="slidr-${BCL_ID}"
+        --cpus-per-task="$CPUS"
+        --mem="$MEM_ARG"
+        --time="$TIME"
+        --chdir="$SCRIPT_DIR"
+        --output="${SCRIPT_DIR}/slurm-slidr-${BCL_ID}-%j.out"
+    )
+    # --partition omitted (uses the cluster default) unless one is given
+    [[ -n "$PARTITION" ]] && SBATCH_OPTS+=(--partition="$PARTITION")
+    # Request a GPU when --gpu is passed. An explicit type is forwarded as a Slurm gres type
+    # (gpu:<type>:1) rather than dropped, but note Slurm gres names are whatever the cluster's
+    # gres.conf calls them (often bare, e.g. `a100`) and will not match GCE accelerator names.
+    if [[ "$GPU" == true ]]; then
+        if [[ "$GPU_TYPE" == "$GPU_TYPE_DEFAULT" ]]; then
+            SBATCH_OPTS+=(--gres=gpu:1)
+        else
+            SBATCH_OPTS+=(--gres="gpu:${GPU_TYPE}:1")
+        fi
+    fi
+
+    # make uv (and conda, used by the pipeline for R/CellBender) available and sync deps here on
+    # the submitting node: sbatch exports the current environment to the job by default
+    # (--export=ALL), so the PATH set by these reaches the compute node (assumes a shared
+    # filesystem, as is standard on Slurm clusters), and syncing now surfaces dependency errors
+    # at submit time rather than inside a detached batch job
+    ensure_uv
+    ensure_conda
+    uv sync
+
+    # Submit as a batch job (not srun) so the run survives an SSH disconnect and executes
+    # independently of this shell; --parsable makes sbatch print just the job ID.
+    echo "Submitting slidr to Slurm (sbatch ${SBATCH_OPTS[*]})"
+    if [[ "$SLURM_STAGE" == true ]]; then
+        # Staged run: hand off to workflow/bash/slidr_slurm.sh, which downloads config.yaml,
+        # auth_key.json and the sequencing data before running the pipeline. Staging happens inside
+        # the job rather than here so hundreds of GB do not move through a shared login node.
+        # sbatch exports the submitting environment by default (--export=ALL), which is how these
+        # reach the compute node.
+        export INPUT="$INPUT_GCS"
+        export BCL_ID
+        export SLIDR_WORKDIR="$WORKDIR"
+        export SLIDR_REPO="$SCRIPT_DIR"
+
+        echo "  Staging inputs from: ${INPUT_GCS}"
+        # name where the workdir came from: it is now usually derived rather than passed, and a
+        # several-hundred-GB download landing somewhere unexpected should never be a surprise
+        echo "  Staging into:        ${WORKDIR}  (from ${WORKDIR_SOURCE})"
+        JOB_ID="$(sbatch --parsable "${SBATCH_OPTS[@]}" \
+                  "${SCRIPT_DIR}/workflow/bash/slidr_slurm.sh" "${SLIDR_ARGS[@]}")" \
+            || {
+                echo "[ERROR]: sbatch submission failed" >&2
+                echo "Troubleshooting:" >&2
+                echo " • sbatch's own error is printed above -- it names the real cause" >&2
+                echo " • Check the partition exists and you may use it: \`sinfo -s\`" >&2
+                echo " • Check the requested resources fit the partition's limits (${CPUS} CPUs, ${MEM_ARG} memory, ${TIME} walltime)" >&2
+                echo " • Check you are on a submit node with Slurm available: \`sinfo\`" >&2
+                exit 1
+            }
+    else
+        # Local run: invoke the pipeline directly. Built as a single shell-quoted string for
+        # sbatch --wrap; --bcl is captured into $BCL_ID during arg parsing but is NOT in
+        # SLIDR_ARGS, so re-add it here.
+        WRAP_CMD="uv run python workflow/main.py --bcl $(printf '%q' "$BCL_ID")"
+        for arg in "${SLIDR_ARGS[@]}"; do WRAP_CMD+=" $(printf '%q' "$arg")"; done
+
+        JOB_ID="$(sbatch --parsable "${SBATCH_OPTS[@]}" --wrap="$WRAP_CMD")" \
+            || {
+                echo "[ERROR]: sbatch submission failed" >&2
+                echo "Troubleshooting:" >&2
+                echo " • sbatch's own error is printed above -- it names the real cause" >&2
+                echo " • Check the partition exists and you may use it: \`sinfo -s\`" >&2
+                echo " • Check the requested resources fit the partition's limits (${CPUS} CPUs, ${MEM_ARG} memory, ${TIME} walltime)" >&2
+                echo " • Check you are on a submit node with Slurm available: \`sinfo\`" >&2
+                exit 1
+            }
+    fi
+    JOB_ID_NUM="${JOB_ID%%;*}"   # strip any ";cluster" suffix (federated clusters)
+    LOG_FILE="${SCRIPT_DIR}/slurm-slidr-${BCL_ID}-${JOB_ID_NUM}.out"
+
+    echo ""
+    echo "Submitted batch job ${JOB_ID_NUM}"
+    echo "  Log:     ${LOG_FILE}"
+    echo "  Monitor: squeue -j ${JOB_ID_NUM}   |   tail -f '${LOG_FILE}'"
+    echo "  Cancel:  scancel ${JOB_ID_NUM}"
+    echo "The job runs independently of this shell; you can safely disconnect."
+else
+
+    # run relative-path commands (uv sync, workflow/main.py) from the repo root regardless of the
+    # caller's current directory
+    cd "$SCRIPT_DIR"
+
+    ensure_uv
+    ensure_conda
+
+    # run the pipeline
+    # --bcl is captured into $BCL_ID during arg parsing but is NOT in SLIDR_ARGS, so it must be
+    # re-added here (the GCP path does the same in slidr_gcp.sh); main.py's --bcl is required, so
+    # omitting it aborts every local run with an argparse error before any stage runs
+    uv sync
+    uv run python workflow/main.py --bcl "$BCL_ID" "${SLIDR_ARGS[@]}"
+fi

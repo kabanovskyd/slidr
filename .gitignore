@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.venv/
+
+# Credentials -- never commit these. `auth_key_path` and `slack_token` should point
+# at a file outside the repo or a gs:// object; these patterns are a backstop.
+auth_key.json
+*_auth_key.json
+slack_token
+slack_token.txt
+
+# Per-machine run state, written by ./slidr
+.last_run
+software_cache.txt
+
+# Staged inputs and outputs from a --slurm run, plus its sbatch logs
+slidr-work/
+slurm-slidr-*.out

@@ -1,0 +1,39 @@
+# input and output paths
+paths:
+  output_path:
+  input_path:
+  software_path:
+  raw_barcodes_path:
+  puck_path:
+  reference_path:
+  auth_key_path:      # Google service account JSON key, needed only when metadata_source is a
+                      # Google Sheet. May be a local path or a gs:// object, which is downloaded
+                      # into the run's tmp/ directory (mode 600) when needed
+
+# run settings
+settings:
+  memory: 50
+  threads: 16
+  metadata_source:
+  input_bucket:   # GCS prefix --gcp runs stage config.yaml/auth_key.json/<BCL_ID> from (--input overrides)
+  output_bucket:
+  reference_genome:
+  alerts:
+  slack_token:    # where to find the Slack bot token: a local file path, or a gs:// object (read
+                  # straight from the bucket, never written to disk). Preferred over a literal token,
+                  # which would travel with this file as it gets copied and staged to buckets
+
+# workflow components and parameters
+workflow:
+  generate_bam: false
+  cellbender_total_droplets:
+  cellbender_estimated_cells:
+  cellbender_epochs:
+  cellbender_learn_rate:
+  spatial_downsampling:
+  top_n_percent_umi_filter:
+  flex_emptydrops_minimum_umis:
+  flex_probe_set:
+  flex_spatial_R1_path:
+  flex_spatial_R2_path:
+  flex_gex_fastqs:

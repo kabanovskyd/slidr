@@ -1,0 +1,1741 @@
+import os
+import sys
+import re
+import subprocess
+import signal
+import types
+import shutil
+import pynvml
+import zipfile
+
+import pandas as pd
+import xml.etree.ElementTree as ET
+
+from datetime import datetime
+from pathlib import Path
+from rich.console import Console
+
+sys.path.append(str(Path(__file__).parent))
+from config import args, cfg, gcs_uri, is_int, is_number, bool_value_hint
+
+from helpers import (
+    log_write,
+    log_ts,
+    log_detail,
+    log_stage_start,
+    format_duration,
+    run_relative,
+    stage_from_gcs,
+    job_crash,
+    job_success,
+    format_multi_samplesheet,
+    ensure_conda_env,
+    load_metadata,
+    test_and_install_software,
+    create_tmp_dir,
+    parse_cellranger_html,
+    missing_fastqs,
+    find_sample_fastqs,
+    stage_spatial_fastqs,
+    declared_lanes,
+    FASTQ_NAME_RE,
+    retrieve_takara_bead_barcode_file,
+    sanitize_path_component,
+    split_probe_barcodes,
+    resolve_cellranger_version,
+    downsample_spatial
+)
+
+
+# unpack globals from config dictionary
+ROOT_PATH = cfg['root_path']
+OUTPUT_PATH = cfg['output_path']
+SCRIPT_PATH = cfg['script_path']
+LOG_PATH = cfg['log_path']
+INPUT_PATH = cfg['input_path']
+FASTQ_INPUT = cfg['fastq_input']
+STAGE_GCS = cfg['stage_gcs']
+METADATA_PATH = cfg['metadata_path']
+TMP_PATH = cfg['tmp_path']
+METADATA_SRC = cfg['metadata_src']
+RAW_BARCODES_PATH = cfg['raw_barcodes_path']
+PUCK_PATH = cfg['puck_path']
+REF_PATH = cfg['ref_path']
+SUMMARY_PATH = cfg['summary_path']
+SUMMARY_LOG = cfg['summary_log']
+REF_GENOME = cfg['ref_genome']
+NUM_THREADS = cfg['num_threads']
+MEM_SIZE = cfg['mem_size']
+MKFASTQ_OUTS = cfg['mkfastq_outs']
+COUNT_OUTS = cfg['count_outs']
+CELLBENDER_OUTS = cfg['cellbender_outs']
+CELLBENDER_CELLS = cfg['cellbender_cells']
+CELLBENDER_DROPLETS = cfg['cellbender_droplets']
+CELLBENDER_EPOCHS = cfg['cellbender_epochs']
+CELLBENDER_RATE = cfg['cellbender_rate']
+SPATIAL_DOWNSAMPLING = cfg['spatial_downsampling']
+PERCENT_UMI_FILTERING = cfg['percent_umi_filtering']
+FLEX_OUTS = cfg['flex_outs']
+SPATIAL_COUNT_OUTS = cfg['spatial_count_outs']
+SPATIAL_ANALYSIS_OUTS = cfg['spatial_analysis_outs']
+SAMPLESHEET_PATH = cfg['samplesheet_path']
+GENERATE_BAM = cfg['generate_bam']
+EMPTYDROPS_MIN_UMI = cfg['emptydrops_min_umis']
+FLEX_PROBE_SET = cfg['flex_probe_set']
+FLEX_R1_PATH = cfg['flex_r1_path']
+FLEX_R2_PATH = cfg['flex_r2_path']
+FLEX_GEX_FASTQS = cfg['flex_gex_fastqs']
+BCL_ID = cfg['bcl_id']
+
+# Local directories GCS-hosted resources are staged into when --stage-gcs/--gcp is in effect. They
+# live under OUTPUT_PATH so a run is self-contained: on a cluster the pipeline may have no writable
+# location other than its own output tree, and keeping them there means nothing is left behind
+# outside it.
+#   REF_DEST       reference genome, assigned by create_samplesheet (via `global REF_DEST`) and read
+#                  by run_count/run_spatial_analysis. Declared here so a reference before assignment
+#                  is a clear guarded error rather than a NameError.
+#   PUCK_DEST      puck CSVs -- both those downloaded from puck_path and those generated locally
+#                  from raw barcodes, which is why it must be a writable local directory and not the
+#                  gs:// puck_path itself
+#   BARCODES_DEST  raw barcode directories downloaded from raw_barcodes_path
+REF_DEST = None
+PUCK_DEST = OUTPUT_PATH / "pucks"
+BARCODES_DEST = OUTPUT_PATH / "barcodes"
+
+
+def staged_ref_dir() -> Path:
+    """
+    Directory holding the reference genome for this run: the local copy when staging from GCS, the
+    configured reference_path otherwise.
+    """
+
+    if not STAGE_GCS:
+        return Path(REF_PATH) / REF_GENOME
+    if REF_DEST is None:
+        log_write("[ERROR]: the reference genome has not been staged yet (REF_DEST unset)")
+        log_write("Troubleshooting:")
+        log_write(" • This stage needs the reference; run it together with --count/--run-all, which stages it first")
+        sys.exit(1)
+    return REF_DEST / REF_GENOME
+
+
+# set up a rich console
+console = Console()
+
+# define a global process state and a signal handler for capturing SIGINT/SIGTERM signals
+proc = None
+
+def handle_signal(
+    signum: int,
+    frame: types.FrameType | None
+) -> None:
+    """
+    Gracefully terminate the active subprocess on SIGINT or SIGTERM
+
+    Inputs:
+     - signum: signal number received from the OS
+     - frame:  current stack frame (required by signal.signal interface, unused)
+    """
+
+    if proc is not None:
+        log_write(f"[ERROR]: signal {signum} received, terminating subprocess...")
+        log_write("Troubleshooting:")
+        log_write(" • Partial outputs from the interrupted stage may be left behind; re-run with --force to overwrite them")
+        log_write(" • If you did not interrupt this yourself, the job was killed externally -- on a cluster check the scheduler's accounting for an OOM or time-limit kill (e.g. `sacct -j $SLURM_JOB_ID`)")
+        # send SIGTERM to subprocess
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            # force kill if process doesn't stop
+            proc.kill()
+    sys.exit(1)
+
+# set signal handlers to monitor for signals
+signal.signal(signal.SIGTERM, handle_signal)
+signal.signal(signal.SIGINT, handle_signal)
+
+
+def write_metadata_to_file() -> None:
+    """
+    Load sample metadata from Google Sheet or CSV, filter and verify the data, and save the metadata to a CSV
+    """
+
+    # log execution
+    log_ts("loading sample metadata...")
+
+    # load sample metadata from Google Sheet or CSV
+    metadata_df = load_metadata(METADATA_SRC)
+
+    # check if any rows with matching BCL have the "Run" column set to "YES" and exit if not
+    mask = (metadata_df['BCL'] == BCL_ID) & (metadata_df['Run'].str.upper().isin(['YES', 'Y']))
+    matching_rows = metadata_df[mask]
+    if matching_rows.empty:
+        if len(metadata_df[metadata_df['BCL'] == BCL_ID].values) > 0:
+            log_write(f"[ERROR]: All the runs with the specified BCL have their run status set to `NO` in the Google Sheet: {BCL_ID}")
+            log_write(f"Troubleshooting:")
+            log_write(f" • Find your runs in the samplesheet and set their value in the `Run` column to `YES`")
+            log_write(f" • Metadata source: {METADATA_SRC}")
+            sys.exit(1)
+        else:
+            log_write(f"[ERROR]: No runs matching the provided BCL found in the input table/Google Sheets: {BCL_ID}")
+            log_write("Troubleshooting:")
+            log_write(f" • Check that the `BCL` column contains a row whose value is exactly `{BCL_ID}` (no trailing spaces, and matching case)")
+            log_write(" • Check that --bcl was given the BCL ID as written in the metadata, not the path to the run folder")
+            log_write(f" • Metadata source: {METADATA_SRC}")
+            sys.exit(1)
+
+    # validate that species and chemistry are the same across all samples
+    if len(set(matching_rows['Species'].dropna().tolist())) > 1:
+        log_write(f"[ERROR]: More than a single species is specified: ")
+        for species in set(matching_rows['Species'].dropna().tolist()):
+            log_write(f" • {species}")
+        log_write("Troubleshooting:")
+        log_write(" • One run uses one reference genome, so all samples in a BCL must share a `Species` value")
+        log_write(f" • Correct the `Species` column for the {BCL_ID} rows, or split the mismatched samples into a separate BCL and run them one at a time")
+        log_write(f" • Metadata source: {METADATA_SRC}")
+        sys.exit(1)
+
+    if len(set(matching_rows['Chemistry'].dropna().tolist())) > 1:
+        log_write(f"[ERROR]: More than a single sequencing chemistry is specified: ")
+        for chemistry in set(matching_rows['Chemistry'].dropna().tolist()):
+            log_write(f" • {chemistry}")
+        log_write("Troubleshooting:")
+        log_write(" • Chemistry selects which cellranger invocation the whole run uses, so all samples in a BCL must share a `Chemistry` value")
+        log_write(f" • Correct the `Chemistry` column for the {BCL_ID} rows, or set `Run` to `NO` on the mismatched samples and run them separately")
+        log_write(f" • Metadata source: {METADATA_SRC}")
+        sys.exit(1)
+
+    # write the metadata sheet to file
+    matching_rows.to_csv(SUMMARY_PATH, index=False)
+
+
+def create_samplesheet() -> list[Path]:
+    """
+    Load metadata from a local CSV file and format according to Cellranger specifications
+
+    Output:
+     - A list of paths to generated samplesheet files in CSV format
+    """
+
+    # log execution
+    log_ts("generating samplesheets...")
+
+    # load the metadata DataFrame
+    try:
+        metadata_df = pd.read_csv(SUMMARY_PATH)
+    except Exception as exc:
+        log_write(f"[ERROR]: Could not read {SUMMARY_PATH}: {exc}")
+        log_write("Troubleshooting:")
+        log_write(" • This file is written by the metadata-loading step at the start of every run; a failure here usually means the run's output directory is not writable or ran out of space")
+        log_write(f" • Check the permissions and free space on {SUMMARY_PATH.parent}")
+        log_write(" • Delete the file and re-run to have it regenerated from the metadata source")
+        sys.exit(1)
+
+    if args.run_all or args.count or args.mkfastq or args.spatial_analysis:
+        # match species name with a reference genome folder
+        global REF_GENOME
+        species = metadata_df['Species'].values[0]
+
+        match species:
+            case 'Mouse':
+                REF_GENOME = 'refdata-gex-GRCm39-2024-A'
+            case 'Human':
+                REF_GENOME = 'refdata-gex-GRCh38-2024-A'
+            case _:
+                if REF_GENOME is None:
+                    log_write(f'[ERROR]: Analyzing {species} samples requiring a custom reference genome, but `reference_genome` is not set in the configuration file')
+                    log_write("Troubleshooting:")
+                    log_write(f" • Set `settings.reference_genome` to the name of the reference directory to use for {species}")
+                    log_write(f" • That directory must exist under `paths.reference_path` ({REF_PATH})")
+                    log_write(" • `Human` and `Mouse` select a reference automatically; check the `Species` column for a typo if you meant one of those")
+                    sys.exit(1)
+        
+        # stage the reference genome out of GCS when the local filesystem does not hold it
+        if STAGE_GCS:
+            global REF_DEST
+            REF_DEST = OUTPUT_PATH / "reference"
+            REF_DEST.mkdir(exist_ok=True)
+            # skip the download if a previous run in this output tree already staged it
+            if (REF_DEST / REF_GENOME).is_dir():
+                log_write(f"  Reference genome {REF_GENOME} already staged at {REF_DEST}")
+            else:
+                log_write(f"  Staging reference genome {REF_GENOME} from {REF_PATH}... ", terminator="")
+                with console.status(f"  Staging reference genome {REF_GENOME}..."):
+                    stage_from_gcs(
+                        f'{gcs_uri(REF_PATH)}/{REF_GENOME}',
+                        REF_DEST,
+                        recursive=True,
+                        description=f'reference genome {REF_GENOME}'
+                    )
+                log_write("Done.")
+
+        # set up data for cellranger multi samplesheet
+        if metadata_df['Chemistry'].values[0] == 'Flex':
+            # when staging, the reference lives in the local copy under REF_DEST rather than at the
+            # gs:// reference_path, which cannot be path-joined
+            ref_dir = staged_ref_dir()
+
+            # validate flex parameters
+            if not Path(FLEX_PROBE_SET).is_file():
+                log_write(f'[ERROR]: the Flex probe set {FLEX_PROBE_SET} is not found or is not a file')
+                log_write('Troubleshooting:')
+                log_write(" • Set `workflow.flex_probe_set` to the probe-set CSV that ships with your Flex kit's cellranger release")
+                log_write(" • The probe set is shipped inside the cellranger install, e.g. <cellranger>/probe_sets/Chromium_Human_Transcriptome_Probe_Set_v1.0.1_GRCh38-2020-A.csv")
+                log_write(" • Check the path for typos and that the file is readable")
+                sys.exit(1)
+            if not ref_dir.is_dir():
+                log_write(f'[ERROR]: the reference genome directory {ref_dir} is not found or is not a directory')
+                log_write('Troubleshooting:')
+                log_write(f" • Check that `settings.reference_genome` ({REF_GENOME}) names a directory that exists under `paths.reference_path` ({REF_PATH})")
+                if STAGE_GCS:
+                    log_write(f" • Check the reference exists in the bucket: `gcloud storage ls {gcs_uri(REF_PATH)}/{REF_GENOME}`")
+                else:
+                    log_write(" • If the reference lives in a bucket rather than on this filesystem, pass --stage-gcs to download it")
+                sys.exit(1)
+            # Resolve the emptydrops cutoff into a local rather than reassigning the module global.
+            # Assigning to EMPTYDROPS_MIN_UMI here would make the name local to this whole function,
+            # so the isinstance() read below would raise UnboundLocalError before the default could
+            # ever be applied. A local is also the honest scope: nothing outside this function reads
+            # the value (unlike REF_GENOME/REF_DEST above, which staged_ref_dir()/run_count() do read
+            # and which therefore genuinely need `global`).
+            emptydrops_min_umi = EMPTYDROPS_MIN_UMI
+            if emptydrops_min_umi is None:
+                emptydrops_min_umi = 500
+            elif not is_int(emptydrops_min_umi):
+                log_write(f'[ERROR]: unrecognized value for the `flex_emptydrops_minimum_umis` field in the configuration file (should be an integer): {emptydrops_min_umi!r}')
+                log_write('Troubleshooting:')
+                log_write(" • Set `workflow.flex_emptydrops_minimum_umis` to a plain integer (no quotes, no decimal point), e.g. 100")
+                log_write(" • Remove the field entirely to use the default of 500")
+                hint = bool_value_hint(emptydrops_min_umi, 'workflow.flex_emptydrops_minimum_umis')
+                if hint:
+                    log_write(hint)
+                sys.exit(1)
+            # cellranger multi consumes FASTQs, never BCLs, so a Flex run's GEX reads come from
+            # --fastqs when it is given and from `input_path` otherwise
+            flex_fastq_path = FASTQ_INPUT if FASTQ_INPUT is not None else Path(INPUT_PATH)
+
+            if not isinstance(FLEX_GEX_FASTQS, list):
+                log_write(f'[ERROR]: the `flex_gex_fastqs` field of the configuration file should be a list: {FLEX_GEX_FASTQS}')
+                log_write('Troubleshooting:')
+                log_write(" • Write the field as a YAML list of FASTQ name prefixes, one per line:")
+                log_write("     flex_gex_fastqs:")
+                log_write("       - fastq_prefix_1")
+                log_write("       - fastq_prefix_2")
+                log_write(" • A single prefix still needs the leading `- ` so YAML parses it as a list rather than a bare string")
+                sys.exit(1)
+            for fastq in FLEX_GEX_FASTQS:
+                if not isinstance(fastq, str) or not fastq.strip():
+                    log_write(f'[ERROR]: each entry in the `flex_gex_fastqs` field of the configuration file should be a non-empty string, but one is: {fastq!r}')
+                    log_write('Troubleshooting:')
+                    log_write(" • Remove the blank/malformed list entry -- a stray `- ` on its own line parses as an empty value")
+                    log_write(" • Each entry is the FASTQ filename prefix cellranger matches on, e.g. `mysample_GEX` for mysample_GEX_S1_L001_R1_001.fastq.gz")
+                    sys.exit(1)
+                fastq_glob = list(flex_fastq_path.rglob(f'{fastq}*'))
+                if len(fastq_glob) < 2:
+                    log_write(f'[ERROR]: fewer than 2 GEX FASTQs found for the `flex_gex_fastqs` prefix `{fastq}` under {flex_fastq_path}')
+                    log_write(f'  Found: {[str(f.name) for f in fastq_glob] or "nothing"}')
+                    log_write('Troubleshooting:')
+                    log_write(" • cellranger multi needs at least an R1 and an R2 per library; check both reads are present and gzipped (.fastq.gz)")
+                    log_write(f" • Check the prefix matches the start of the real filenames: `ls {flex_fastq_path}`")
+                    log_write(" • Flex GEX reads are taken from --fastqs when it is given, and from `paths.input_path` otherwise -- make sure the one you are using points at the FASTQs")
+                    sys.exit(1)
+
+            # assemble the samplesheet
+            gene_expression = {
+                "reference": ref_dir,
+                "probe-set": FLEX_PROBE_SET,
+                "create-bam": GENERATE_BAM
+            }
+            samples = []
+            libraries = []
+            for _, sample in metadata_df.iterrows():
+                probe_barcodes = split_probe_barcodes(sample['Flex Probe Barcode IDs'])
+                if not probe_barcodes:
+                    log_write(f"[ERROR]: sample {sample['Sample Name']} uses Flex chemistry but its `Flex Probe Barcode IDs` metadata field is empty")
+                    log_write('Troubleshooting:')
+                    log_write(" • Fill in the `Flex Probe Barcode IDs` column for every Flex sample -- cellranger multi needs it to split the pooled libraries")
+                    log_write(" • Use the probe barcode IDs from your Flex kit (e.g. BC001), separated by ',' or '|' when a sample carries more than one")
+                    log_write(" • If this sample is not actually Flex, correct its `Chemistry` column instead")
+                    log_write(f" • Metadata source: {METADATA_SRC}")
+                    sys.exit(1)
+
+                # emit one cellranger-multi sample per probe barcode, with sample_id
+                # "<Sample Name>_<BC>" and a single probe barcode. cellranger names each
+                # per_sample_outs directory after its sample_id, producing
+                # count/flex/<Sample Name>_<BC>/... -- exactly the per-barcode layout the
+                # downstream demux / Trekker pipeline (sc_outdir, sub-sample naming) expects. A
+                # single sample_id carrying all barcodes would instead pool them into one
+                # count/flex/<Sample Name>/ output that nothing downstream can find.
+                sample_name = str(sample['Sample Name'])
+                for bc in probe_barcodes:
+                    samples.append({
+                        "sample_id": f"{sample_name}_{bc}",
+                        "probe_barcode_ids": bc,
+                        "emptydrops_minimum_umis": emptydrops_min_umi
+                    })
+        
+            for fastq in FLEX_GEX_FASTQS:
+                libraries.append({
+                    "fastq_id": fastq,
+                    "fastqs": flex_fastq_path,
+                    "feature_types": "Gene Expression"
+                })
+
+            # generate a Flex-specific input samplesheet. Write it to METADATA_PATH (alongside the
+            # other samplesheets), which is exactly where run_count reads it back as
+            # METADATA_PATH/multi_samplesheet.csv -- the FASTQ paths inside are absolute, so the
+            # samplesheet's own location is independent of the input FASTQ dir.
+            flex_samplesheet_path = format_multi_samplesheet(
+                gene_expression,
+                libraries,
+                samples,
+                outdir=METADATA_PATH
+            )
+
+            # return a Flex samplesheet
+            return [flex_samplesheet_path]
+
+    if metadata_df['Chemistry'].values[0] == 'Flex':
+        return []
+
+    # format a samplesheet for cellranger mkfastq
+    samplesheet_rows = []
+    for _, row in metadata_df.iterrows():
+        lanes = str(row['Lane']).split(',')
+        for lane in lanes:
+            if lane == '':
+                continue
+            samplesheet_rows.append(row[['Lane', 'Sample Name', 'RNA Index']])
+            samplesheet_rows[len(samplesheet_rows) - 1]['Lane'] = lane
+
+    samplesheet_df = pd.DataFrame(samplesheet_rows)
+    samplesheet_df.columns=['Lane', 'Sample', 'Index']
+
+    # check that every sample has an associated spatial barcodes field
+    spatial_barcodes = metadata_df[['Sample Name', 'SB Index', 'SB Lane']]
+    spatial_barcodes = spatial_barcodes[spatial_barcodes['SB Index'].notna() & (spatial_barcodes['SB Index'] != '')]
+
+    # add spatial barcode samples to the samplesheet
+    for _, row in spatial_barcodes.iterrows():
+        for lane in str(row['SB Lane']).split(','):
+            new_row = {'Lane': lane, 'Sample': (str(row['Sample Name']) + '_sb'), 'Index': str(row['SB Index'])}
+            samplesheet_df = pd.concat([samplesheet_df, pd.DataFrame([new_row])], ignore_index=True)
+
+    split_bcls = []
+    # identify samples with split BCLs
+    if 'Merge RNA From BCL' in metadata_df:
+        split_bcls += metadata_df['Merge RNA From BCL'].unique().tolist()
+    
+    if 'Merge Spatial From BCL' in metadata_df:
+        split_bcls += metadata_df['Merge Spatial From BCL'].unique().tolist()
+
+    split_samplesheets = {}
+    for bcl in split_bcls:
+        if bcl != "" and bcl is not None and not pd.isna(bcl):
+            split_samplesheets[bcl] = pd.DataFrame(columns=['Lane', 'Sample', 'Index'])
+    
+    # create individual samplesheets for samples with split BCLs
+    for _, sample in metadata_df.iterrows():
+        if 'Merge RNA From BCL' in metadata_df:
+            rna_bcl = sample['Merge RNA From BCL']
+            if rna_bcl != "" and rna_bcl is not None and not pd.isna(rna_bcl):
+                new_row = {'Lane': '*', 'Sample': (str(sample['Sample Name']) + '_split_rna'), 'Index': str(sample['Add RNA Index'])}
+                split_samplesheets[rna_bcl] = pd.concat([split_samplesheets[rna_bcl], pd.DataFrame([new_row])], ignore_index=True)
+        if 'Merge Spatial From BCL' in metadata_df:
+            spatial_bcl = sample['Merge Spatial From BCL']
+            if spatial_bcl != "" and spatial_bcl is not None and not pd.isna(spatial_bcl):
+                new_row = {'Lane': '*', 'Sample': (str(sample['Sample Name']) + '_split_sb'), 'Index': str(sample['Add SB Index'])}
+                split_samplesheets[spatial_bcl] = pd.concat([split_samplesheets[spatial_bcl], pd.DataFrame([new_row])], ignore_index=True)
+
+    # set up the output samplesheets list
+    output_samplesheets = []
+
+    # write samplesheets to CSV
+    for bcl in split_samplesheets:
+        split_samplesheets[bcl] = split_samplesheets[bcl][['Lane', 'Sample', 'Index']]
+        samplesheet_name = METADATA_PATH / f"{bcl}_samplesheet.csv"
+        split_samplesheets[bcl].to_csv(samplesheet_name, index=False)
+        output_samplesheets.append(samplesheet_name)
+
+    # save the main samplesheet to CSV
+    global SAMPLESHEET_PATH
+    if split_samplesheets:
+        main_samplesheet = METADATA_PATH / f"{BCL_ID}_samplesheet.csv"
+        samplesheet_df.to_csv(main_samplesheet, index=False)
+
+        # insert the main samplesheet at the beginning of the list
+        output_samplesheets.insert(0, main_samplesheet)
+    else:
+        main_samplesheet = METADATA_PATH / f"samplesheet.csv"
+        samplesheet_df.to_csv(main_samplesheet, index=False)
+        output_samplesheets.append(main_samplesheet)
+
+    SAMPLESHEET_PATH = main_samplesheet
+
+    return output_samplesheets
+
+
+def run_mkfastq() -> None:
+    """
+    Run cellranger mkfastq on samples specified in the samplesheet to generate FASTQ files from BCLs in DATA_PATH
+    """
+
+    # read metadata file and set up the logfile and output directory
+    global proc
+    metadata_df = pd.read_csv(SUMMARY_PATH)
+    mkfastq_log = LOG_PATH / "mkfastq.log"
+    MKFASTQ_OUTS.mkdir(exist_ok=True)
+
+    # Retrieve executable paths. mkfastq demultiplexes every sample in one invocation, so unlike
+    # count it cannot honour a per-sample `Cellranger` override; take the single declared version, and
+    # say so plainly if the samples disagree rather than silently picking one.
+    declared_versions = sorted({
+        resolve_cellranger_version(v)
+        for v in (metadata_df['Cellranger'] if 'Cellranger' in metadata_df.columns else [None])
+    })
+    mkfastq_version = declared_versions[0]
+    if len(declared_versions) > 1:
+        log_write(f"[WARNING]: the `Cellranger` metadata column names more than one version "
+                  f"({', '.join(declared_versions)}); demultiplexing the whole run with {mkfastq_version}")
+        log_write(" • mkfastq processes every sample in a single invocation, so only one version can be used")
+        log_write(" • The per-sample versions are still honoured by the count stage")
+
+    log_detail(f"cellranger {mkfastq_version} for demultiplexing", terminal=False)
+    cellranger_path = test_and_install_software('cellranger', version=mkfastq_version)
+    bcl2fastq_path = test_and_install_software('bcl2fastq')
+
+    # enable cellranger to call bcl2fastq by modifying PATH
+    env = os.environ.copy()
+    env["PATH"] = str(Path(bcl2fastq_path).parent) + ':' + os.environ["PATH"]
+
+    stage_started = log_stage_start("cellranger mkfastq")
+
+    # create a list of all BCL IDs used in the experiment (for RNA and spatial barcodes)
+    bcls = [BCL_ID]
+    if 'Merge RNA From BCL' in metadata_df:
+        bcls += metadata_df['Merge RNA From BCL'].unique().tolist()
+    if 'Merge Spatial From BCL' in metadata_df:
+        bcls += metadata_df['Merge Spatial From BCL'].unique().tolist()
+
+    bcls = list(dict.fromkeys(bcls))
+    bcls = [bcl for bcl in bcls if not pd.isna(bcl) and bcl is not None]
+    tmp_dirs = {}
+
+    # create output directories
+    for _, sample in metadata_df.iterrows():
+        sample_path = MKFASTQ_OUTS / sample['Sample Name']
+        sample_path.mkdir(parents=True, exist_ok=True)
+
+        spatial_barcode_path = MKFASTQ_OUTS / f"{sample['Sample Name']}_sb"
+        spatial_barcode_path.mkdir(parents=True, exist_ok=True)
+
+    # build an exact library-name -> destination-directory map for routing demultiplexed FASTQs.
+    # Each samplesheet library (primary GEX <sample>, primary spatial <sample>_sb, and the merged
+    # <sample>_split_rna / <sample>_split_sb libraries created by create_samplesheet) maps to the
+    # folder its reads belong in. Matching the cellranger sample name exactly -- rather than a
+    # substring of the file path -- avoids misrouting when one sample name is a prefix of another
+    # (e.g. "tumor" vs "tumor_ln").
+    route_map = {}
+    for _, sample in metadata_df.iterrows():
+        sname = str(sample['Sample Name'])
+        route_map[sname] = MKFASTQ_OUTS / sname                        # primary GEX library
+        route_map[f"{sname}_split_rna"] = MKFASTQ_OUTS / sname         # merged-in GEX library
+        route_map[f"{sname}_sb"] = MKFASTQ_OUTS / f"{sname}_sb"        # primary spatial library
+        route_map[f"{sname}_split_sb"] = MKFASTQ_OUTS / f"{sname}_sb"  # merged-in spatial library
+
+    # cellranger/bcl2fastq FASTQ names are "<library>_S<n>_L<lane>_<R1|R2|I1|I2>_001.fastq.gz";
+    # capture the library prefix so it can be matched exactly against route_map
+    fastq_name_re = re.compile(r'^(?P<lib>.+)_S\d+_L\d+_[RI][12]_\d+\.fastq\.gz$')
+
+    # track every destination written during this run so that two source FASTQs from different
+    # BCLs resolving to the same destination are caught (and refused) rather than silently
+    # overwriting each other via shutil.move
+    moved_dests = set()
+
+    # run mkfastq with appropriate inputs
+    for bcl in bcls:
+        # define samplesheet paths
+        if len(bcls) > 1:
+            samplesheet_path = METADATA_PATH / f"{bcl}_samplesheet.csv"
+        else:
+            samplesheet_path = METADATA_PATH / 'samplesheet.csv'
+
+        # create temporary output directory to avoid cellranger output conflicts
+        tmp_dir = create_tmp_dir(bcl)
+        tmp_dirs[bcl] = tmp_dir
+
+        # specify data path
+        if INPUT_PATH.name == BCL_ID:
+            data_path = INPUT_PATH.parent / bcl
+        else:
+            data_path = INPUT_PATH / bcl
+
+        # launch mkfastq
+        log_write(f"  Generating FASTQs from BCLs in {bcl}...", terminal=False, terminator="")
+        with open(mkfastq_log, "a") as logfile:
+            with console.status(f"  Generating FASTQs from BCLs in {bcl}..."):
+                proc = subprocess.Popen(
+                    ['time', 'stdbuf', '-oL', '-eL', cellranger_path, 'mkfastq', 
+                    f'--run={data_path}',
+                    f'--localcores={NUM_THREADS}',
+                    f'--localmem={MEM_SIZE}',
+                    f'--id={bcl}',
+                    f'--output-dir={tmp_dir}',
+                    f'--csv={samplesheet_path}',
+                    f'--delete-undetermined'],
+                    stdout=logfile,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    cwd=tmp_dir
+                )
+
+                proc.wait()
+
+        # check that the job finished successfully
+        if proc.returncode != 0:
+            job_crash("cellranger mkfastq", proc.returncode, mkfastq_log)
+        else:
+            log_ts(f"demultiplexed {bcl}")
+
+        # extract the flowcell ID for each BCL run
+        run_info = data_path / 'RunInfo.xml'
+        try:
+            tree = ET.parse(run_info)
+        except Exception as exc:
+            log_write(f"[ERROR]: Could not parse {run_info}: {exc}")
+            log_write("Troubleshooting:")
+            log_write(" • RunInfo.xml is written by the sequencer; a parse failure usually means the run folder was copied while the run was still in progress")
+            log_write(f" • Check the file is complete and well-formed: `xmllint --noout {run_info}`")
+            log_write(f" • Re-copy the {bcl} run folder from the sequencer and re-run with --force")
+            sys.exit(1)
+        try:
+            flowcell_id = tree.getroot().find('.//Flowcell').text
+        except Exception as exc:
+            log_write(f"[ERROR]: could not extract flowcell ID from {run_info}: {exc}")
+            log_write("Troubleshooting:")
+            log_write(f" • {run_info} parsed but has no <Flowcell> element; check it with `grep -i flowcell {run_info}`")
+            log_write(" • This is how the pipeline locates cellranger's output directory, so the run folder cannot be used without it")
+            log_write(f" • Re-copy the {bcl} run folder from the sequencer and re-run with --force")
+            sys.exit(1)
+        flowcell_dir = tmp_dirs[bcl] / flowcell_id
+        if not flowcell_dir.is_dir():
+            log_write(f"[ERROR]: cellranger mkfastq reported success but wrote no output directory for flowcell {flowcell_id}: {flowcell_dir}")
+            log_write("Troubleshooting:")
+            log_write(f" • Check the tail of {mkfastq_log} -- mkfastq can exit 0 after demultiplexing zero reads")
+            log_write(f" • Check the flowcell ID in {run_info} matches the one in the sequencing data (a mismatched run folder demultiplexes into a differently named directory)")
+            log_write(f" • Check the samplesheet indices for {bcl} match the run: `cat {samplesheet_path}`")
+            sys.exit(1)
+
+        # move FASTQ files from cellranger's flowcell output into per-sample/library folders,
+        # routing by the exact parsed library name
+        for fastq_file in flowcell_dir.rglob("*.fastq.gz"):
+            match = fastq_name_re.match(fastq_file.name)
+            if match is None:
+                # not a standard per-sample FASTQ (e.g. Undetermined_*); leave it in place
+                continue
+
+            dest_dir = route_map.get(match.group('lib'))
+            if dest_dir is None:
+                # a library that isn't in this run's metadata; don't guess a destination
+                log_write(f"  [WARNING]: FASTQ {fastq_file.name} from {bcl} does not match any sample library; leaving it in place", terminal=False)
+                continue
+
+            dest = dest_dir / fastq_file.name
+            if dest in moved_dests:
+                # two source FASTQs (from different BCLs) collapse to the same destination file;
+                # moving the second would silently destroy the first
+                log_write(f"[ERROR]: FASTQ filename collision: '{fastq_file.name}' was produced for the same library by more than one BCL and both resolve to {dest}.")
+                log_write("Distinct BCLs must not yield identically named FASTQs for the same sample library; moving the second would silently destroy the first.")
+                log_write("Troubleshooting:")
+                log_write(" • Check the `Merge RNA From BCL` / `Merge Spatial From BCL` columns -- a BCL listed there must not be the same as the `BCL` column value")
+                log_write(" • Check `Add RNA Index` / `Add SB Index` differ from the primary `RNA Index` / `SB Index`; the same index in both BCLs produces identically named FASTQs")
+                log_write(f" • The colliding libraries came from these BCLs: {', '.join(str(b) for b in bcls)}")
+                log_write(f" • Metadata source: {METADATA_SRC}")
+                sys.exit(1)
+
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(fastq_file), str(dest))
+            moved_dests.add(dest)
+
+    # logging the job results
+    job_success("cellranger mkfastq", mkfastq_log, MKFASTQ_OUTS, started=stage_started)
+
+
+def run_cellranger_count(
+    cellranger_path: str | Path,
+    sample_index: str,
+    sample_name: str | list,
+    fastq_dir: str | Path,
+    output_path: str | Path,
+    ref_genome: str,
+    chemistry: str,
+    threads: str,
+    memory: str,
+    generate_bam: str,
+    logpath
+) -> subprocess.Popen:
+    """
+    Run cellranger count on a single sample and block until completion
+
+    Inputs:
+     - cellranger_path: path to the cellranger executable
+     - sample_index:    sample name used as the cellranger --id and --sample arguments
+     - fastq_dir:       directory containing input FASTQ files for this sample
+     - output_path:     directory where cellranger count outputs will be written
+     - ref_genome:      path to the cellranger-compatible reference transcriptome
+     - chemistry:       sequencing chemistry string passed to cellranger (e.g. SC3Pv3)
+     - threads:         number of local cores to allocate
+     - memory:          local memory limit in GB
+     - generate_bam:    whether to generate a BAM file ("true" or "false")
+     - logpath:         path to the file where stdout/stderr will be written
+    Output:
+     - a completed subprocess.Popen object; check .returncode for exit status
+    """
+
+    # define the global process variable and create output directory
+    global proc
+    output_path = Path(output_path)
+    output_path.mkdir(exist_ok=True, parents=True)
+
+    # if processing multiple samples, concatenate them with commas
+    if isinstance(sample_name, list):
+        sample_name = ','.join(sample_name)
+
+    # launch cellranger count as a child process
+    with open(logpath, "a") as logfile:
+        proc = subprocess.Popen(
+            ['time', 'stdbuf', '-oL', '-eL', cellranger_path, 'count',
+            f'--id={sample_index}',
+            f'--sample={sample_name}',
+            f'--fastqs={fastq_dir}',
+            f'--transcriptome={ref_genome}',
+            f'--chemistry={chemistry}',
+            f'--localcores={threads}',
+            f'--localmem={memory}',
+            f'--jobmode=local',
+            f'--project=fastqs',
+            f'--disable-ui',
+            f'--nosecondary',
+            f'--include-introns=true',
+            f'--create-bam={generate_bam}'],
+            cwd=output_path.parent,
+            stdout=logfile,
+            stderr=subprocess.STDOUT
+        )
+
+        proc.wait()
+
+    return proc
+
+
+def run_cellranger_multi(
+    cellranger_path: str | Path,
+    sample_index: str,
+    samplesheet: str | Path,
+    output_path: str | Path,
+    threads: str,
+    memory: str,
+    logpath: str | Path
+) -> subprocess.Popen:
+    """
+    Run cellranger multi on a single sample and block until completion
+
+    Inputs:
+     - cellranger_path: path to the cellranger executable
+     - sample_index:    sample name used as the cellranger --id and --sample arguments
+     - samplesheet:     path to formatted cellranger multi samplesheet (CSV)
+     - output_path:     directory where cellranger count outputs will be written
+     - threads:         number of local cores to allocate
+     - memory:          local memory limit in GB
+     - logpath:         path to the file where stdout/stderr will be written
+    Output:
+     - a completed subprocess.Popen object; check .returncode for exit status
+    """
+
+    # define the global process variable and create output directory
+    global proc
+    output_path = Path(output_path)
+    output_path.mkdir(exist_ok=True, parents=True)
+
+    # launch cellranger count as a child process
+    with open(logpath, "a") as logfile:
+        proc = subprocess.Popen(
+            ['time', 'stdbuf', '-oL', '-eL', cellranger_path, 'multi',
+            f'--id={sample_index}',
+            f'--csv={samplesheet}',
+            f'--localcores={threads}',
+            f'--localmem={memory}',
+            f'--jobmode=local',
+            f'--disable-ui'],
+            cwd=output_path,
+            stdout=logfile,
+            stderr=subprocess.STDOUT
+        )
+
+        proc.wait()
+
+    return proc
+
+
+def run_count() -> None:
+    """
+    Run cellranger count on samples specified in the samplesheet to generate readcount files
+    """
+
+    # read metadata file, set up output directory, and extract the species
+    count_log = LOG_PATH / "count.log"
+    COUNT_OUTS.mkdir(exist_ok=True)
+    metadata_df = pd.read_csv(SUMMARY_PATH)
+    is_flex = 'Flex' in metadata_df['Chemistry'].values
+
+    # set up run parameters
+    generate_bam = 'true' if GENERATE_BAM else 'false'
+
+    # verify reference genome folder exists
+    genome = staged_ref_dir()
+    if not genome.is_dir():
+        log_write(f'[ERROR]: reference genome directory {genome} not found')
+        log_write("Troubleshooting:")
+        log_write(f" • Check that `settings.reference_genome` ({REF_GENOME}) names a directory that exists under `paths.reference_path` ({REF_PATH})")
+        if STAGE_GCS:
+            log_write(f" • Check the reference exists in the bucket: `gcloud storage ls {gcs_uri(REF_PATH)}/{REF_GENOME}`")
+            log_write(f" • Delete the partial local copy at {genome} and re-run to stage it again")
+        else:
+            log_write(" • If the reference lives in a bucket rather than on this filesystem, pass --stage-gcs to download it")
+            log_write(" • Cellranger references are downloaded from https://www.10xgenomics.com/support/software/cell-ranger/downloads")
+        sys.exit(1)
+
+    # The FASTQ-input validation below belongs to the standard (non-Flex) count path only. Flex runs
+    # from a cellranger-multi samplesheet built (and whose GEX FASTQs are validated) in
+    # create_samplesheet, and takes its FASTQ input directory from that samplesheet.
+    if not is_flex:
+        # Where the FASTQs come from is decided by --fastqs alone, not by probing the input.
+        if FASTQ_INPUT is not None:
+            # The directory itself was already validated in config.py; check here that it actually
+            # contains every library this run needs, which requires the metadata and so can only
+            # happen once the run's samples are known. The spatial-barcode library is required only
+            # when spatial counting is part of this invocation -- a count-only run must not be
+            # blocked by FASTQs it never reads -- but when it is, checking now fails fast instead of
+            # after hours of cellranger count.
+            fastq_path = FASTQ_INPUT
+            required_modes = ('GEX', 'SB') if (args.run_all or args.spatial_count) else ('GEX',)
+            missing_samples = missing_fastqs(fastq_path, metadata_df, required_modes)
+            if missing_samples:
+                log_write(f"[ERROR]: the following FASTQ files are missing from {fastq_path}:")
+                for sample, sample_modes in missing_samples.items():
+                    log_write(f" • {sample}:")
+                    for mode, reads in sample_modes.items():
+                        log_write(f"  - {mode}: {', '.join(reads)}")
+                log_write("Troubleshooting:")
+                log_write(" • FASTQ filenames must contain the sample name plus a `GEX` (gene expression) or "
+                          "`SB` (spatial barcode) token, e.g. mysample_GEX_S1_L001_R1_001.fastq.gz")
+                log_write(" • Check that the lanes in the `Lane`/`SB Lane` metadata columns match the lanes in the filenames")
+                log_write(" • Omit --fastqs and pass --mkfastq/--run-all to demultiplex the BCLs instead")
+                sys.exit(1)
+        else:
+            # no --fastqs: the FASTQs are the ones mkfastq wrote under output/mkfastq/
+            fastq_path = MKFASTQ_OUTS
+            if not fastq_path.is_dir() or not any(fastq_path.rglob('*.fastq.gz')):
+                log_write(f"[ERROR]: no demultiplexed FASTQs found at {fastq_path}")
+                log_write("Troubleshooting:")
+                log_write(" • Run the demultiplexing stage first with --mkfastq (or the whole pipeline with --run-all)")
+                log_write(" • If the reads were demultiplexed elsewhere, pass that directory with --fastqs")
+                sys.exit(1)
+
+    # ensure count logfile exists
+    count_log.touch(exist_ok=True)
+
+    # print launch message and retrieve path to cellranger executable
+    stage_started = log_stage_start("cellranger count")
+    log_detail(f"reference → {genome}")
+
+    # run cellranger on single-cell Flex data
+    if 'Flex' in metadata_df['Chemistry'].values:
+        # create temporary output directory, read samplesheet, and print out subsamples
+        # Flex goes through `cellranger multi`, which needs a v9 release, so that -- not the standard
+        # 8.0.1 -- is the default here. The `Cellranger` metadata column still overrides it; a Flex
+        # run is a single multi invocation, so the value is taken from the first sample rather than
+        # per-sample.
+        flex_version = resolve_cellranger_version(
+            metadata_df['Cellranger'].iloc[0] if 'Cellranger' in metadata_df.columns else None,
+            default="9.0.1"
+        )
+        log_detail(f"cellranger {flex_version} (Flex / cellranger multi)", terminal=False)
+        cellranger_path = test_and_install_software('cellranger', version=flex_version)
+        tmp_dir = create_tmp_dir('flex')
+        flex_samplesheet = METADATA_PATH / "multi_samplesheet.csv"
+        log_write(f"  Processing partitioned samples (10x Flex):", terminal=False)
+        for sample_name in metadata_df['Sample Name'].astype(str).tolist():
+            log_write(f"   - {sample_name}\n", terminal=False)
+
+        # launch cellranger multi as a child process
+        with console.status(f"  Processing partitioned samples (10x Flex)..."):
+            proc = run_cellranger_multi(
+                cellranger_path,
+                BCL_ID,
+                flex_samplesheet,
+                tmp_dir,
+                NUM_THREADS,
+                MEM_SIZE,
+                count_log
+            )
+
+        # check exit status
+        if proc.returncode != 0:
+            job_crash("cellranger count", proc.returncode, count_log)
+
+        # move output files to the expect directory
+        src_dir = tmp_dir / BCL_ID / 'outs' / 'per_sample_outs'
+        dst_dir = COUNT_OUTS / 'flex'
+        dst_dir.mkdir(exist_ok=True, parents=True)
+        if not src_dir.is_dir():
+            log_write(f"\n[ERROR]: cellranger multi exited successfully but its expected per-sample output directory does not exist: {src_dir}")
+            log_write("Troubleshooting:")
+            log_write(f" • Check the tail of {count_log} for what cellranger multi actually did")
+            log_write(f" • Check the multi samplesheet is correct: `cat {flex_samplesheet}`")
+            log_write(" • A samplesheet whose `[samples]` section has no probe barcodes produces no per_sample_outs; check the `Flex Probe Barcode IDs` metadata column")
+            sys.exit(1)
+        if len(list(src_dir.iterdir())) == 0:
+            log_write(f"\n[ERROR]: cellranger multi produced an empty per-sample output directory: {src_dir}")
+            log_write("Troubleshooting:")
+            log_write(f" • Check the tail of {count_log} -- cellranger multi can finish with no per-sample outputs when no reads matched any probe barcode")
+            log_write(" • Check the probe barcode IDs in the `Flex Probe Barcode IDs` metadata column match the ones actually used in the library prep")
+            log_write(f" • Check `workflow.flex_probe_set` ({FLEX_PROBE_SET}) is the probe set for this kit")
+            sys.exit(1)
+        for item in src_dir.iterdir():
+            shutil.move(item, dst_dir / item.name)
+
+        log_ts("counted all Flex probe-barcode partitions")
+
+    else:
+        # iterate over samples and call cellranger. The executable is resolved per sample rather than
+        # once up front, because the `Cellranger` metadata column is a per-sample override and
+        # cellranger count runs one invocation per sample -- so two samples in the same run can
+        # legitimately be counted with different releases.
+        samples = metadata_df['Sample Name'].astype(str).tolist()
+
+        # Map each sample to the cellranger --sample value(s) for its gene-expression library.
+        # mkfastq names its output FASTQs after the samplesheet library, which is the sample name
+        # itself, so no discovery is needed there. A directory supplied with --fastqs was named by
+        # somebody else's demultiplexer, so the library prefixes have to be read back off the
+        # filenames -- keyed on --fastqs being set, not on guessing which case we're in.
+        true_gex_names = {}
+        if FASTQ_INPUT is not None:
+            for sample in samples:
+                sample_row = metadata_df.loc[metadata_df['Sample Name'].astype(str) == sample].iloc[0]
+                gex_fastqs = find_sample_fastqs(
+                    FASTQ_INPUT,
+                    sample,
+                    'GEX',
+                    declared_lanes(sample_row, 'Lane')
+                )
+                # missing_fastqs already guaranteed at least one R1/R2 pair per sample above; the
+                # guard is here so a logic slip can never hand cellranger an empty --sample
+                libraries = sorted({FASTQ_NAME_RE.match(f.name).group('lib') for f in gex_fastqs})
+                if not libraries:
+                    log_write(f"[ERROR]: no gene-expression FASTQs found for sample {sample} in {FASTQ_INPUT}")
+                    log_write("Troubleshooting:")
+                    log_write(f" • FASTQs passed with --fastqs must be named after the sample plus an optional `GEX` token, "
+                              f"e.g. {sample}_GEX_S1_L001_R1_001.fastq.gz or {sample}_S1_L001_R1_001.fastq.gz")
+                    log_write(" • Check that the lanes in the `Lane` metadata column match the `_L00N_` tokens in the filenames")
+                    log_write(f" • List what is actually there: `ls {FASTQ_INPUT}`")
+                    sys.exit(1)
+                # keep a single library as a plain name so the multi-library log below stays truthful
+                true_gex_names[sample] = libraries if len(libraries) > 1 else libraries[0]
+        else:
+            # FASTQs came from mkfastq, whose library names are the sample names
+            for sample in samples:
+                true_gex_names[sample] = sample
+
+        for sample_name in true_gex_names:
+            # create output directory
+            tmp_dir = create_tmp_dir('count')
+            tmp_path = tmp_dir / sample_name
+
+            # define sequencing type
+            chemistry = metadata_df['Chemistry'].values[0]
+            if chemistry.startswith(('3P', '5P')):
+                chemistry = 'SC' + chemistry
+
+            # resolve this sample's Cellranger release from the `Cellranger` metadata column
+            sample_row = metadata_df.loc[metadata_df['Sample Name'].astype(str) == sample_name].iloc[0]
+            declared_version = sample_row['Cellranger'] if 'Cellranger' in sample_row.index else None
+            cellranger_version = resolve_cellranger_version(declared_version)
+            log_detail(f"cellranger {cellranger_version} for sample {sample_name}", terminal=False)
+            cellranger_path = test_and_install_software('cellranger', version=cellranger_version)
+
+            # run cellranger on single-cell RNA data
+            with console.status(f"  Processing sample {sample_name} (scRNA-seq)... "):
+                if isinstance(true_gex_names[sample_name], list):
+                    print('   Analyzing subsamples:')
+                    for name in true_gex_names[sample_name]:
+                        print(f'    - {name}')
+
+                proc = run_cellranger_count(
+                    cellranger_path,
+                    sample_name,
+                    true_gex_names[sample_name],
+                    fastq_path,
+                    tmp_path,
+                    genome,
+                    chemistry,
+                    NUM_THREADS,
+                    MEM_SIZE,
+                    generate_bam,
+                    count_log
+                )
+
+            # check exit status
+            if proc.returncode != 0:
+                job_crash("cellranger count", proc.returncode, count_log)
+
+            # move output files to the expect directory
+            src_dir = tmp_path / 'outs'
+            dst_dir = COUNT_OUTS / sample_name
+            dst_dir.mkdir(exist_ok=True)
+            if not src_dir.is_dir():
+                log_write(f"[ERROR]: cellranger count exited successfully but its expected output directory does not exist: {src_dir}")
+                log_write("Troubleshooting:")
+                log_write(f" • Check the tail of {count_log} for what cellranger count actually did")
+                log_write(f" • Check for a cellranger failure report at {tmp_path / '_log'}")
+                log_write(" • A cellranger run interrupted part-way leaves no outs/ directory; re-run this stage with --force")
+                sys.exit(1)
+            if len(list(src_dir.iterdir())) == 0:
+                log_write(f"[ERROR]: cellranger count produced an empty output directory: {src_dir}")
+                log_write("Troubleshooting:")
+                log_write(f" • Check the tail of {count_log} -- this normally means no reads were assigned to sample {sample_name}")
+                log_write(f" • Check the FASTQs for this sample exist and are non-empty: `ls -l {fastq_path}`")
+                log_write(f" • Check the `Chemistry` metadata column ({chemistry}) matches how the library was prepared")
+                sys.exit(1)
+            for item in src_dir.iterdir():
+                shutil.move(item, dst_dir / item.name)
+
+            log_ts(f"counted {sample_name}")
+    
+    # logging the job results
+    job_success("cellranger count", count_log, COUNT_OUTS, started=stage_started)
+
+
+def run_cellbender() -> None:
+    """
+    Run cellbender on samples specified in the metadata sheet and store the outputs
+    """
+
+    # read metadata file and create cellbender logfile
+    global proc
+    metadata_df = pd.read_csv(SUMMARY_PATH)
+    CELLBENDER_OUTS.mkdir(exist_ok=True)
+    cellbender_log = LOG_PATH / "cellbender.log"
+    CUDA_BIN_PATH = None
+
+    stage_started = log_stage_start("cellbender")
+
+    # retrieve the cellbender executable installed in a conda environment
+    conda_lib = ensure_conda_env("r_env")
+    conda_bender = conda_lib / "cellbender"
+        
+    # search for GPU support to speed up cellbender training
+    env = os.environ.copy()
+    try:
+        pynvml.nvmlInit()
+            
+        # get driver version
+        driver_version = pynvml.nvmlSystemGetDriverVersion()
+        
+        # get CUDA version (supported by the driver)
+        cuda_version = pynvml.nvmlSystemGetCudaDriverVersion()
+        
+        # CUDA version is returned as an integer (e.g., 12010 for 12.1)
+        major = cuda_version // 1000
+        minor = (cuda_version % 1000) // 10
+        
+        log_write("  CUDA is available!")
+        log_write(f"  - NVIDIA driver version: {driver_version}")
+        log_write(f"  - Maximum supported CUDA: {major}.{minor}")
+        
+        pynvml.nvmlShutdown()
+        CUDA_BIN_PATH = shutil.which('nvidia-smi')
+        if not CUDA_BIN_PATH:
+            log_write("  [WARNING]: NVIDIA drivers for CUDA (nvidia-smi) not found on the system. Running on CPU (this may take a while)...")
+            log_write("   • The GPU was detected but `nvidia-smi` is not on PATH, so CellBender cannot be pointed at it")
+            log_write("   • Install the NVIDIA driver utilities, or add the directory containing nvidia-smi to PATH before running\n")
+        else:
+            # export location of CUDA drivers to PATH
+            env["PATH"] = f"{CUDA_BIN_PATH}:{env['PATH']}"
+    except Exception as e:
+        log_write(f"  [WARNING]: CUDA is not available ({e}). Running cellbender on CPU (this may take a while)...")
+        log_write("   • On GCP, pass --gpu to ./slidr to attach a GPU to the VM")
+        log_write("   • On Slurm, pass --gpu to ./slidr so the job requests one (--gres=gpu:1)")
+        log_write("   • If the machine does have a GPU, check the driver is loaded: `nvidia-smi`\n")
+        env["CUDA_VISIBLE_DEVICES"] = ""
+
+    # run cellbender for each sample in the dataset
+    for _, sample in metadata_df.iterrows():
+        sample_name = str(sample['Sample Name'])
+        log_write(f"  Processing sample {sample_name}... ", terminal=False, terminator="")
+
+        # define inputs/outputs and parameters
+        cellranger_html_path = COUNT_OUTS / sample_name / 'web_summary.html'
+        input_path = COUNT_OUTS / sample_name / 'raw_feature_bc_matrix.h5'
+        sample_path = CELLBENDER_OUTS / sample_name
+        sample_path.mkdir(exist_ok=True)
+        output_path = sample_path / 'cellbender_output'
+        expected_cells = CELLBENDER_CELLS
+        total_droplets = CELLBENDER_DROPLETS
+        if total_droplets is not None and not is_int(total_droplets):
+            log_write(f'[ERROR]: incorrect configuration file value for the `cellbender_total_droplets` field (should be an integer): {total_droplets!r}')
+            log_write("Troubleshooting:")
+            log_write(" • Set `workflow.cellbender_total_droplets` to a plain integer (no quotes, no decimal point), e.g. 25000")
+            log_write(" • Set it to `null` to have the value detected automatically from the cellranger barcode-rank plot")
+            hint = bool_value_hint(total_droplets, 'workflow.cellbender_total_droplets')
+            if hint:
+                log_write(hint)
+            sys.exit(1)
+
+        if expected_cells is not None and not is_int(expected_cells):
+            log_write(f'[ERROR]: incorrect configuration file value for the `cellbender_estimated_cells` field (should be an integer): {expected_cells!r}')
+            log_write("Troubleshooting:")
+            log_write(" • Set `workflow.cellbender_estimated_cells` to a plain integer (no quotes, no decimal point), e.g. 5000")
+            log_write(" • Set it to `null` to let CellBender estimate the cell count itself")
+            hint = bool_value_hint(expected_cells, 'workflow.cellbender_estimated_cells')
+            if hint:
+                log_write(hint)
+            sys.exit(1)
+
+        if CELLBENDER_EPOCHS is not None and not is_int(CELLBENDER_EPOCHS):
+            log_write(f'[ERROR]: incorrect configuration file value for the `cellbender_epochs` field (should be an integer): {CELLBENDER_EPOCHS!r}')
+            log_write("Troubleshooting:")
+            log_write(" • Set `workflow.cellbender_epochs` to a plain integer (no quotes, no decimal point), e.g. 160")
+            log_write(" • Remove the field to use CellBender's default of 150")
+            hint = bool_value_hint(CELLBENDER_EPOCHS, 'workflow.cellbender_epochs')
+            if hint:
+                log_write(hint)
+            sys.exit(1)
+
+        # no bool guard needed here (nor on spatial_downsampling below): bool subclasses int, not
+        # float, so isinstance(True, float) is already False and a boolean is rejected as it stands
+        if CELLBENDER_RATE is not None and not isinstance(CELLBENDER_RATE, float):
+            log_write(f'[ERROR]: incorrect configuration file value for the `cellbender_learn_rate` field (should be a float): {CELLBENDER_RATE!r}')
+            log_write("Troubleshooting:")
+            log_write(" • Set `workflow.cellbender_learn_rate` to a decimal number, e.g. 0.5 -- note that `1` parses as an integer, so write `1.0`")
+            log_write(" • Remove the field to use CellBender's default of 0.0001")
+            sys.exit(1)
+
+        # calculate the total number of droplets to include
+        if total_droplets is None or expected_cells is None:
+            msg = []
+            if total_droplets is None:
+                msg.append("total-droplets-included")
+            if expected_cells is None:
+                msg.append("expected-cells")
+            if not cellranger_html_path.is_file():
+                if len(msg) == 2:
+                    msg = f"{msg[0]} and {msg[1]} Cellbender parameters"
+                else:
+                    msg = f"{msg[0]} Cellbender parameter"
+                log_write(f"[ERROR]: {msg} not set, and {cellranger_html_path} is not present to extract these parameters automatically.")
+                log_write("Troubleshooting:")
+                log_write(f" • Run the count stage for {sample_name} first (--count, or the whole pipeline with --run-all); web_summary.html is one of its outputs")
+                log_write(" • Or set `workflow.cellbender_total_droplets` and `workflow.cellbender_estimated_cells` explicitly in the config file to skip auto-detection")
+                log_write(" • Cellbender's own guidance on choosing these values: https://cellbender.readthedocs.io/en/latest/usage/index.html")
+                sys.exit(1)
+            cellbender_params = parse_cellranger_html(cellranger_html_path)
+            if total_droplets is None:
+                total_droplets = cellbender_params['total_droplets_included']
+            if expected_cells is None:
+                expected_cells = cellbender_params['expected_cells']
+
+        # begin assembling cellbender command
+        cmd = [
+            conda_bender,
+            "remove-background"
+        ]
+
+        if CUDA_BIN_PATH:
+            cmd.append("--cuda")
+
+        msg = []
+        if total_droplets is not None:
+            msg.append(f"   - Total droplets included: {total_droplets}")
+            cmd.extend(["--total-droplets-included", str(total_droplets)])
+        if expected_cells is not None:
+            msg.append(f"   - Expected cells: {expected_cells}")
+            cmd.extend(["--expected-cells", str(expected_cells)])
+        if CELLBENDER_RATE is not None:
+            msg.append(f"   - Learning rate: {CELLBENDER_RATE}")
+            cmd.extend(["--learning-rate", str(CELLBENDER_RATE)])     
+        else:
+            msg.append(f"   - Learning rate: 0.0001 (default)")       
+        if CELLBENDER_EPOCHS is not None:
+            msg.append(f"   - Epochs: {CELLBENDER_EPOCHS} \n")
+            cmd.extend(["--epochs", str(CELLBENDER_EPOCHS)])     
+        else:
+            msg.append(f"   - Epochs: 150 (default) \n")   
+
+        with open(SUMMARY_LOG, "a") as summary:
+            summary.write(f"  Cellbender parameters:\n")
+            summary.write(f"   • Droplets included: {total_droplets}\n")
+            summary.write(f"   • Expected cells:    {expected_cells}\n")
+            summary.write(f"   • Learning rate:     {CELLBENDER_RATE}\n")
+            summary.write(f"   • Training epochs:   {CELLBENDER_EPOCHS}\n")
+
+        if len(msg) > 0:
+            log_write(msg)
+            
+        cmd.extend(["--input", input_path])
+        cmd.extend(["--output", output_path])
+
+        # run cellbender with a modified environment
+        with open(cellbender_log, "a") as logfile:
+            with console.status(f"  Processing sample {sample_name}... "):
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=logfile,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    cwd=sample_path
+                )
+
+                proc.wait()
+        
+        # check exit status
+        if proc.returncode == 0:
+            log_ts(f"denoised {sample_name}")
+        else:
+            job_crash("cellbender", proc.returncode, cellbender_log)
+    
+    # log job execution result
+    job_success("cellbender", cellbender_log, CELLBENDER_OUTS, started=stage_started)
+
+
+def run_spatial_positioning() -> None:
+    """
+    For each sample, generate a puck CSV if not already present and run spatial_count.jl
+    to produce a SBcounts.h5 file mapping cell barcodes to spatial coordinates
+    """
+
+    # retrieve path to Julia interpreter and load metadata CSV and spatial barcode scripts
+    global proc
+    julia_interp_path = test_and_install_software("julia")
+    script_base_path = SCRIPT_PATH / "spatial_barcodes"
+    spatial_barcodes_log = LOG_PATH / "spatial_barcodes.log"
+    SPATIAL_COUNT_OUTS.mkdir(exist_ok=True)
+    metadata_df = pd.read_csv(SUMMARY_PATH)
+
+    stage_started = log_stage_start("spatial barcode counting")
+
+    # verify that environment files are present and create required subdirectories
+    main_env_path = ROOT_PATH / "envs"
+    if not (main_env_path / "julia" / "Manifest.toml").is_file():
+        log_write(f"[ERROR]: envs/julia/Manifest.toml is not present in the project folder ({main_env_path / 'julia'})")
+        log_write("Troubleshooting:")
+        log_write(" • This file is checked into the repository; restore it with `git checkout envs/julia/Manifest.toml`")
+        log_write(" • Or run `git pull` to restore the whole envs/julia directory")
+        sys.exit(1)
+
+    if not (main_env_path / "julia" / "Project.toml").is_file():
+        log_write(f"[ERROR]: envs/julia/Project.toml is not present in the project folder ({main_env_path / 'julia'})")
+        log_write("Troubleshooting:")
+        log_write(" • This file is checked into the repository; restore it with `git checkout envs/julia/Project.toml`")
+        log_write(" • Or run `git pull` to restore the whole envs/julia directory")
+        sys.exit(1)
+
+    (main_env_path / 'julia' / 'packages').mkdir(exist_ok=True)
+    (main_env_path / 'julia' / 'tmp').mkdir(exist_ok=True)
+
+
+    # export environment variables
+    env = os.environ.copy()
+    env["JULIA_PACKAGES_PATH"] = str(main_env_path / 'julia' / 'packages')
+    env["JULIA_PROJECT_PATH"] = str(main_env_path / 'julia')
+    env["JULIA_DEPOT_PATH"] = str(main_env_path / 'julia' / 'tmp')
+    env["JULIA_NUM_THREADS"] = str(NUM_THREADS)
+
+    # puck_path is required by this stage but validated as optional at config load, because only here
+    # is it known that the run actually needs it (a Flex run never reaches this function). Report it
+    # now, before any puck is looked up.
+    if PUCK_PATH is None:
+        log_write("[ERROR]: `puck_path` is not set in the configuration file, but the spatial barcode counting stage needs it")
+        log_write("Troubleshooting:")
+        if STAGE_GCS:
+            log_write(" • Set `paths.puck_path` to the GCS location holding the puck CSVs (e.g. gs://my-bucket/pucks)")
+        else:
+            log_write(" • Set `paths.puck_path` to the local directory holding the puck CSVs")
+        log_write(" • The puck CSV for each sample's `Puck ID` is read from there, or generated into it from `raw_barcodes_path`")
+        log_write(" • Skip this stage instead by omitting --spatial-count/--run-all")
+        sys.exit(1)
+
+    # generate_puck_csv.jl reads raw barcode directories from LIB_PUCK_IN and *writes* the puck CSVs
+    # it builds to LIB_PUCK_PATH, so when staging from GCS both must point at writable local
+    # directories -- passing the gs:// puck_path as the output directory makes Julia try to create a
+    # literal 'gs:' directory instead.
+    if STAGE_GCS:
+        puck_dir = PUCK_DEST
+        barcodes_dir = BARCODES_DEST
+        puck_dir.mkdir(exist_ok=True, parents=True)
+        barcodes_dir.mkdir(exist_ok=True, parents=True)
+    else:
+        puck_dir = Path(PUCK_PATH)
+        barcodes_dir = Path(RAW_BARCODES_PATH) if RAW_BARCODES_PATH is not None else None
+
+    env["LIB_PUCK_PATH"] = str(puck_dir)
+    env["LIB_PUCK_IN"] = str(barcodes_dir)
+
+    # for each sample, ensure the correct puck is present and run the spatial barcode script
+    for _, sample in metadata_df.iterrows():
+        sample_name = str(sample['Sample Name'])
+        if 'Add Puck ID' in sample and not pd.isna(sample['Add Puck ID']):
+            puck_id = sanitize_path_component(sample['Add Puck ID'], "Add Puck ID")
+        else:
+            puck_id = sanitize_path_component(sample['Puck ID'], "Puck ID")
+        # Pick the spatial-barcode FASTQ directory from --fastqs, not from which stage flags were
+        # passed: `--spatial-count` on its own is a perfectly normal way to re-run this stage
+        # against FASTQs mkfastq already produced, and the old flag-based test sent that case to
+        # the BCL input directory instead.
+        if FASTQ_INPUT is not None:
+            # spatial_count.jl selects files by substring-matching the sample ID inside a directory,
+            # so a mixed --fastqs directory has to be narrowed to this sample's spatial library
+            # first or its GEX reads would be counted as spatial reads
+            fastq_dir = stage_spatial_fastqs(FASTQ_INPUT, sample_name, declared_lanes(sample, 'SB Lane'))
+        else:
+            fastq_dir = MKFASTQ_OUTS / f"{sample_name}_sb"
+            if not fastq_dir.is_dir() or not any(fastq_dir.glob('*.fastq.gz')):
+                log_write(f"[ERROR]: no spatial-barcode FASTQs found for sample {sample_name} at {fastq_dir}")
+                log_write("Troubleshooting:")
+                log_write(" • Run the demultiplexing stage first with --mkfastq (or the whole pipeline with --run-all)")
+                log_write(" • If the reads were demultiplexed elsewhere, pass that directory with --fastqs")
+                sys.exit(1)
+        log_write(f"  Processing sample {sample_name}...", terminal=False)
+
+        # create output sample directory
+        sample_output = SPATIAL_COUNT_OUTS / sample_name
+        sample_output.mkdir(parents=True, exist_ok=True)
+
+        # if a puck file already exists, copy it into the working directory
+        input_puck_file = puck_dir / f'{puck_id}.csv'
+        if STAGE_GCS and not input_puck_file.is_file():
+            # A puck map absent from the bucket is NOT fatal: fall through to generating it from raw
+            # barcodes, exactly as a local run does when the CSV is missing. Exiting here instead
+            # would make the documented fallback unreachable.
+            stage_from_gcs(
+                f'{gcs_uri(PUCK_PATH)}/{puck_id}.csv',
+                input_puck_file,
+                required=False,
+                description=f'puck map {puck_id}.csv'
+            )
+        if input_puck_file.is_file():
+            log_write(f"  Using existing puck file: {input_puck_file}\n")
+            shutil.copy(input_puck_file, sample_output / f'{puck_id}.csv')
+        else:
+            # run the corresponding script to generate the puck file
+            log_write(f"  Puck file {input_puck_file} not found. Generating from raw barcodes... ", terminal=False, terminator="")
+            if barcodes_dir is None:
+                log_write(f"\n[ERROR]: puck map {puck_id}.csv is unavailable and `raw_barcodes_path` is not set, "
+                          f"so it cannot be generated")
+                log_write("Troubleshooting:")
+                log_write(f" • Set `raw_barcodes_path` to the location of {puck_id}'s BeadBarcodes.txt/BeadLocations.txt")
+                log_write(f" • Or place a pre-built {puck_id}.csv in `puck_path`")
+                sys.exit(1)
+            if STAGE_GCS:
+                stage_from_gcs(
+                    f'{gcs_uri(RAW_BARCODES_PATH)}/{puck_id}',
+                    barcodes_dir,
+                    recursive=True,
+                    description=f'raw barcodes for puck {puck_id}'
+                )
+
+            with open(spatial_barcodes_log, "a") as barcodes_logfile:
+                with console.status(f"  Puck file {input_puck_file} not found. Generating from raw barcodes... "):
+                    proc = subprocess.Popen(
+                        [
+                            julia_interp_path,
+                            script_base_path / 'generate_puck_csv.jl'
+                        ],
+                        stdout=barcodes_logfile,
+                        stderr=subprocess.STDOUT,
+                        env=env
+                    )
+
+                    proc.wait()
+
+            if proc.returncode == 0:
+                log_ts(f"generated puck {puck_id}")
+            else:
+                job_crash("generate_puck_csv.jl", proc.returncode, spatial_barcodes_log)
+
+        # run the spatial barcode count script with modified environment
+        log_write(f"  Processing sample {sample_name}... ", terminal=False, terminator="")
+        with open(spatial_barcodes_log, "a") as barcodes_logfile:
+            with console.status(f"  Processing sample {sample_name}... "):
+                proc = subprocess.Popen(
+                    [
+                        julia_interp_path,
+                        script_base_path / 'spatial_count.jl',
+                        fastq_dir,
+                        sample_output,
+                        sample_name
+                    ],
+                    stdout=barcodes_logfile,
+                    stderr=subprocess.STDOUT,
+                    env=env
+                )
+
+                proc.wait()
+
+        # check exit status
+        if proc.returncode == 0:
+            log_ts(f"counted spatial barcodes for {sample_name}")
+        else:
+            job_crash("spatial_count.jl", proc.returncode, spatial_barcodes_log)
+    
+    # log job execution result
+    job_success("spatial barcode counting", spatial_barcodes_log, SPATIAL_COUNT_OUTS, started=stage_started)
+
+
+def run_spatial_analysis() -> None:
+    """
+    Run the spatial analysis scripts on samples in spatial_barcodes
+    """
+
+    # load metadata CSV and spatial analysis scripts and create 
+    global proc
+    script_base_path = SCRIPT_PATH / 'spatial_analysis'
+    spatial_analysis_log = LOG_PATH / "spatial_analysis.log"
+    SPATIAL_ANALYSIS_OUTS.mkdir(exist_ok=True)
+    metadata_df = pd.read_csv(SUMMARY_PATH)
+
+    # top N percent of beads (by total UMI count) to filter out as bead aggregates/contamination
+    percent_umi_filtering = PERCENT_UMI_FILTERING
+    if percent_umi_filtering is None:
+        percent_umi_filtering = 1
+    elif not is_number(percent_umi_filtering):
+        log_write(f"[WARNING]: top_n_percent_umi_filter must be numeric, but is currently set to {percent_umi_filtering!r}")
+        log_write("Defaulting to the top 1% of beads by UMI count for this run")
+        log_write(" • Set `workflow.top_n_percent_umi_filter` to a number between 0 and 100 (e.g. 1), unquoted")
+        log_write(" • Remove the field entirely to accept the default of 1 without this warning")
+        hint = bool_value_hint(percent_umi_filtering, 'workflow.top_n_percent_umi_filter')
+        if hint:
+            log_write(hint)
+        percent_umi_filtering = 1
+
+    if SPATIAL_DOWNSAMPLING is not None:
+        if not isinstance(SPATIAL_DOWNSAMPLING, float):
+            log_write(f"[WARNING]: spatial downsampling rate must be a float, but is currently set to {SPATIAL_DOWNSAMPLING!r}")
+            log_write(f"Spatial downsampling will be ignored for this run (this may cause an OOM crash if your samples are sequenced deeply)")
+            log_write(" • Set `workflow.spatial_downsampling` to a decimal fraction of reads to keep, e.g. 0.5 -- note that `1` parses as an integer, so write `1.0`")
+            log_write(" • Remove the field entirely to run on all reads without this warning")
+        else:
+            for sample in metadata_df['Sample Name'].astype(str).values:
+                downsample_spatial(
+                    SPATIAL_COUNT_OUTS / sample / "SBcounts.h5",
+                    SPATIAL_COUNT_OUTS / sample / f"SBcounts_downsampled_{str(SPATIAL_DOWNSAMPLING).replace('.', '')}.h5"
+                )
+
+    stage_started = log_stage_start("spatial analysis")
+
+    # activate conda environment and install R libraries
+    conda_lib = ensure_conda_env("r_env")
+
+    # export environment variables
+    env = os.environ.copy()
+    env["R_FUNC"] = str(SCRIPT_PATH / 'spatial_analysis' / 'functions')
+    env["R_LIBS"] = str(conda_lib)
+    env["DATA_PATH"] = str(OUTPUT_PATH.parent.parent)
+    # the R scripts take the directory *containing* reference genomes, not the genome itself
+    env["REF_PATH"] = str(staged_ref_dir().parent)
+
+    # define samples list
+    samples = metadata_df['Sample Name'].astype(str).tolist()
+    sample_list = "[" + ", ".join(samples) + "]"
+    log_write([
+        f"  Using R environment at {conda_lib}",
+        f"  Samples: {sample_list}\n"
+    ])
+
+    # check if spatial analysis script should use Cellbender or regular .h5 files
+    if not CELLBENDER_OUTS.is_dir() or len(list(CELLBENDER_OUTS.iterdir())) == 0:
+        log_write(f"  Cellbender outputs not found. Using direct cellranger count outputs in {COUNT_OUTS}\n")
+        use_cellbender = "FALSE"
+    elif not args.no_cellbender:
+        log_write(f"  Using denoised cellbender outputs at {CELLBENDER_OUTS} (provide the --no-cellbender flag to force the spatial analysis to use direct cellranger count .h5 files)\n")
+        use_cellbender = "TRUE"
+    else:
+        log_write(f"  Using direct cellranger count .h5 files at {COUNT_OUTS} (--no-cellbender flag provided)\n")
+        use_cellbender = "FALSE"
+
+    log_write("  Running spatial analysis... ", terminal=False, terminator="")
+
+    # run the spatial analysis R scripts with the modified environment
+    with open(LOG_PATH / 'spatial_analysis.log', "w") as logfile:
+        with console.status("  Running spatial analysis... "):
+            proc = subprocess.Popen(
+                [
+                    'stdbuf', '-oL', '-eL', 'mamba', 'run', '-n', 'r_env', 'Rscript',
+                    script_base_path / 'run_spatial.R',
+                    BCL_ID,
+                    sample_list,
+                    use_cellbender,
+                    str(SPATIAL_DOWNSAMPLING).replace('.', '') if SPATIAL_DOWNSAMPLING is not None else "",
+                    str(NUM_THREADS),
+                    str(percent_umi_filtering)
+                ],
+                stdout=logfile,
+                stderr=subprocess.STDOUT,
+                env=env
+            )
+
+            proc.wait()
+            log_write('Done.')
+
+    # check exit status
+    if proc.returncode == 0:
+        job_success("spatial analysis", spatial_analysis_log, SPATIAL_ANALYSIS_OUTS, started=stage_started)
+    else:
+        job_crash("run_spatial.R", proc.returncode, spatial_analysis_log)
+
+
+def run_takara_spatial_profiling() -> None:
+    """
+    Run custom scripts from Takara for 10x Flex sample processing
+    """
+
+    stage_started = log_stage_start("spatial analysis (Flex / Trekker)")
+
+    # activate Trekker conda environment, load scripts, and create required subdirectories
+    # No definition file: the Trekker environment is not built by slidr (this repository carries no
+    # trekker env spec), so it must already exist. Passing None makes a missing environment report
+    # that -- and point at ~/.condarc's envs_dirs, which is how a shared prebuilt env is picked up --
+    # rather than complaining about a definition file that was never shipped.
+    trekker_env = ensure_conda_env("trekker", environment_yml=None)
+    takara_pipeline_log = LOG_PATH / "takara_pipeline.log"
+    takara_path = SCRIPT_PATH / "takara"
+    flex_outputs_path = OUTPUT_PATH / "flex"
+    flex_puck_path = flex_outputs_path / "pucks"
+    flex_samplesheets_path = flex_outputs_path / "samplesheets"
+    flex_outputs_path.mkdir(exist_ok=True)
+    flex_puck_path.mkdir(exist_ok=True)
+    flex_samplesheets_path.mkdir(exist_ok=True)
+    metadata_df = pd.read_csv(SUMMARY_PATH)
+
+    # add the Trekker conda environment to PATH
+    env = os.environ.copy()
+    env['PATH'] = f"{trekker_env}:{env.get('PATH', '')}"
+    env.pop('PYTHONPATH', None)
+
+    # generate demux samplesheet
+    # Build parallel lists (one row per (sample, spatial barcode) pair) rather than a dict keyed on
+    # the spatial barcode. Keying on the barcode silently dropped a sample whenever the same probe
+    # barcode ID appeared under two samples; emitting every pair means a genuinely reused barcode
+    # instead surfaces as trekker_demux.py's "Duplicate barcode label" error rather than a silent
+    # drop. `demux_samples` is the ordered list of partition names reused by the loops below.
+    demux_samples = []   # column 1: TrekkerFX_<sample>_<AB> partition names
+    demux_barcodes = []  # column 2: corresponding <AB> spatial barcodes
+    for _, sample in metadata_df.iterrows():
+        barcode_group = sample['Flex Probe Barcode IDs']
+        sample_barcodes = split_probe_barcodes(barcode_group)
+        if not sample_barcodes:
+            log_write(f"[ERROR]: no value provided for the `Flex Probe Barcode IDs` metadata field for sample {sample['Sample Name']}")
+            log_write("Troubleshooting:")
+            log_write(" • Fill in the `Flex Probe Barcode IDs` column for every Flex sample -- the Trekker demultiplexer needs it to split the spatial reads")
+            log_write(" • Use the probe barcode IDs from your Flex kit (e.g. BC001), separated by ',' or '|' when a sample carries more than one")
+            log_write(" • If this sample is not actually Flex, correct its `Chemistry` column instead")
+            log_write(f" • Metadata source: {METADATA_SRC}")
+            sys.exit(1)
+        if len(sample_barcodes) == 1:
+            log_write(f"[WARNING]: only one probe barcode parsed from the `Flex Probe Barcode IDs` value for sample "
+                      f"{sample['Sample Name']} ('{barcode_group}'); treating it as a single barcode")
+            log_write(" • If this sample carries several probe barcodes, separate them with ',' or '|' (e.g. `BC001,BC002` or `BC001|BC002`)")
+        sample_name = sample['Sample Name']
+        for barcode in sample_barcodes:
+            spatial_barcode = barcode.replace('BC', 'AB')
+            demux_samples.append(f"TrekkerFX_{sample_name}_{spatial_barcode}")
+            demux_barcodes.append(spatial_barcode)
+
+    demux_samplesheet = pd.DataFrame({
+        'samples': demux_samples,
+        'barcodes': demux_barcodes
+    })
+    demux_samplesheet.to_csv(flex_samplesheets_path / 'Trekker_demux_samplesheet.csv', header=False, index=False)
+    log_write(f"  Generated Trekker demultiplexing samplesheet: {flex_samplesheets_path / 'Trekker_demux_samplesheet.csv'}")
+
+    # run trekker demultiplexer
+    log_write(f"  Running Trekker demultiplexer... ", terminal=False, terminator="")
+    with open(takara_pipeline_log, "w") as logfile:
+        with console.status("  Running Trekker demultiplexer... "):
+            proc = subprocess.Popen(
+                [
+                    'mamba', 'run', '-n', 'trekker', 'python',
+                    takara_path / 'demultiplexing' / 'trekker_demux.py',
+                    FLEX_R1_PATH,
+                    FLEX_R2_PATH,
+                    flex_samplesheets_path / 'Trekker_demux_samplesheet.csv',
+                    flex_outputs_path / 'demux'
+                ],
+                stdout=logfile,
+                stderr=subprocess.STDOUT,
+                env=env
+            )
+
+            proc.wait()
+
+    if proc.returncode == 0:
+        log_write("Done.")
+    else:
+        job_crash("trekker_demux", proc.returncode, takara_pipeline_log)
+
+    # retrieve bead barcode file
+    tile_ids = [sanitize_path_component(t, "Puck ID") for t in metadata_df['Puck ID'].tolist()]
+    puck_paths = []
+    for tile_id in tile_ids:
+        if not Path(flex_puck_path / f"{tile_id}_BeadBarcodes.csv").is_file():
+            puck_path = retrieve_takara_bead_barcode_file(tile_id, flex_puck_path)
+            with zipfile.ZipFile(puck_path, "r") as zf:
+                zf.extractall(puck_path.parent)
+            puck_path = str(puck_path).replace(".zip", ".txt")
+            puck_file = pd.read_table(puck_path)
+            puck_path = str(puck_path).replace(".txt", ".csv")
+            puck_paths.append(puck_path)
+            puck_file.to_csv(puck_path, header=False, index=False)
+            log_write(f"  Downloaded puck file {puck_path} from Takeda website")
+        else:
+            puck_path = Path(flex_puck_path / f"{tile_id}_BeadBarcodes.csv")
+            log_write(f"  Using existing puck file: {puck_path}")
+
+    # extract experiment date
+    date = BCL_ID.split('_')[0]
+    try:
+        datetime.strptime(date, "%Y%m%d")
+    except ValueError:
+        # find another workaround in the long run
+        date = datetime.now().date()
+        date = date.strftime("%Y%m%d")
+
+    # generate pipeline samplesheet
+    pipeline_samplesheet = {
+        'sample': [],
+        'sc_sample': [],
+        'experiment_date': [],
+        'barcode_file': [],
+        'fastq_1': [],
+        'fastq_2': [],
+        'sc_outdir': [],
+        'sc_platform': [],
+        'profile': [],
+        'subsample': [],
+        'cores': []
+    }
+    for sample in demux_samples:
+        spatial_barcode = sample.split('_')[-1]
+        barcode = sample.replace('TrekkerFX_', '')
+        # reset per iteration: a sample matching no metadata row must error here rather than
+        # silently inherit the previous iteration's (or the download loop's leftover) puck_path
+        puck_path = None
+        for _, row in metadata_df.iterrows():
+            if f"TrekkerFX_{row['Sample Name']}_{spatial_barcode}" == sample:
+                puck_path = flex_puck_path / f"{sanitize_path_component(row['Puck ID'], 'Puck ID')}_BeadBarcodes.csv"
+                break
+        if puck_path is None:
+            log_write(f"[ERROR]: no metadata row matches spatial barcode partition '{sample}'; cannot assign a puck file")
+            log_write("Troubleshooting:")
+            log_write(" • Partition names are built as TrekkerFX_<Sample Name>_<probe barcode with BC replaced by AB>, so this means the sample name or barcode changed mid-run")
+            log_write(f" • Check the `Sample Name` and `Flex Probe Barcode IDs` columns are unchanged since this run started: {SUMMARY_PATH}")
+            log_write(" • Re-run the spatial analysis stage so the partitions are rebuilt from the current metadata")
+            log_write(f" • Metadata source: {METADATA_SRC}")
+            sys.exit(1)
+        demux_output = flex_outputs_path / 'demux'
+        count_output = COUNT_OUTS / 'flex' / barcode.replace('AB', 'BC') / 'count' / 'sample_filtered_feature_bc_matrix'
+        pipeline_samplesheet['sample'].append(sample)
+        pipeline_samplesheet['sc_sample'].append(sample.replace('_AB', '_scRNAseq_AB'))
+        pipeline_samplesheet['experiment_date'].append(date)
+        pipeline_samplesheet['barcode_file'].append(puck_path)
+        pipeline_samplesheet['sc_outdir'].append(count_output)
+        pipeline_samplesheet['fastq_1'].append(demux_output / f"{sample}_R1.fastq.gz")
+        pipeline_samplesheet['fastq_2'].append(demux_output / f"{sample}_R2.fastq.gz")
+        pipeline_samplesheet['sc_platform'].append('TrekkerFX_FLEX')
+        pipeline_samplesheet['profile'].append('conda')
+        pipeline_samplesheet['subsample'].append('no')
+        pipeline_samplesheet['cores'].append(str(NUM_THREADS))
+
+    pipeline_samplesheet = pd.DataFrame(pipeline_samplesheet)
+    pipeline_samplesheet.to_csv(flex_samplesheets_path / 'Trekker_flex_samplesheet.csv', index=False)
+    log_write(f"Generated Trekker pipeline samplesheet: {flex_samplesheets_path / 'Trekker_flex_samplesheet.csv'}\n")
+
+    # run the Takara pipeline on each partition
+    (flex_outputs_path / 'trekker').mkdir(exist_ok=True)
+    for _, sample in pipeline_samplesheet.iterrows():
+        log_write(f"Processing sample [{sample['sample']}]... ")
+        sub_samplesheet = pd.DataFrame(
+            columns=pipeline_samplesheet.columns,
+            data = [sample.tolist()]
+        )
+
+        (flex_samplesheets_path / 'samples').mkdir(exist_ok=True)
+        sub_samplesheet_path = flex_samplesheets_path / 'samples' / f"{sample['sample']}.csv"
+        sub_samplesheet.to_csv(sub_samplesheet_path, index=False)
+
+        # run the pipeline script
+        with open(LOG_PATH / 'takara_pipeline.log', "a") as logfile:
+            proc = subprocess.Popen(
+                [
+                    'mamba', 'run', '-n', 'trekker', 'bash',
+                    takara_path / 'profiling' / 'nuclei_locator_wrapper.sh',
+                    sub_samplesheet_path,
+                    takara_path / 'profiling',
+                    flex_outputs_path / 'trekker',
+                    trekker_env.parent
+                ],
+                stdout=logfile,
+                stderr=subprocess.STDOUT,
+                env=env
+            )
+
+            proc.wait()
+
+        if proc.returncode == 0:
+            log_write("Done.\n")
+        else:
+            job_crash("trekker_flex", proc.returncode, takara_pipeline_log)
+
+    # generate the merge samplesheet
+    merge_samplesheet = {
+        'sample': [],
+        'out_dir': []
+    }
+    for sample in demux_samples:
+        merge_samplesheet['sample'].append(sample)
+        trekker_output_path = flex_outputs_path / "trekker" / f"{date}_{sample}" / f"trekker_{sample}" / "output"
+        merge_samplesheet['out_dir'].append(trekker_output_path)
+    
+    merge_samplesheet = pd.DataFrame(merge_samplesheet)
+    merge_samplesheet.to_csv(flex_samplesheets_path / "Trekker_merge_samplesheet.csv", index=False)
+    log_write(f"Generated Trekker merge samplesheet: {flex_samplesheets_path / 'Trekker_merge_samplesheet.csv'}\n")
+
+    log_write('Running Trekker merge...')
+    # merge partitions for each sample
+    for _, sample in metadata_df.iterrows():
+        log_write(f"  Processing sample [{sample['Sample Name']}]... ")
+        # run the Takara merger
+        with open(LOG_PATH / 'takara_pipeline.log', "a") as logfile:
+            proc = subprocess.Popen(
+                [
+                    'mamba', 'run', '-n', 'trekker', 'bash',
+                    takara_path / 'merging' / 'trekker_merger.sh',
+                    flex_samplesheets_path / 'Trekker_merge_samplesheet.csv',
+                    flex_outputs_path,
+                    sample['Sample Name'],
+                    'conda',
+                    takara_path / 'merging',
+                    str(trekker_env.parent)
+                ],
+                stdout=logfile,
+                stderr=subprocess.STDOUT,
+                env=env
+            )
+
+            proc.wait()
+
+        if proc.returncode == 0:
+            log_write("Done.\n")
+        else:
+            job_crash("trekker_merge", proc.returncode, takara_pipeline_log)

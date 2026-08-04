@@ -18,10 +18,15 @@ Informational (these exit immediately and need no other flags):
 
 Where inputs come from:
   Staging location is configuration, not a flag. \`settings.input_bucket\` in
-  config/config.yaml names the GCS prefix holding config.yaml, auth_key.json and
-  the <BCL_ID> data folder; the VM or compute node is handed that location and
-  downloads everything it needs itself. --gcp always stages (a fresh VM has
-  nothing else); --slurm stages only when asked with --stage-gcs.
+  config/config.yaml names the GCS prefix the run stages from; the VM or compute
+  node is handed that location and downloads what it needs itself. --gcp always
+  stages (a fresh VM has nothing else); --slurm stages only when asked with
+  --stage-gcs.
+
+  A --gcp run reads config.yaml, auth_key.json and the <BCL_ID> data folder from
+  that prefix. A --slurm run takes only the data folder (and auth_key.json if it
+  is there): it runs with config/config.yaml from this checkout, so there is no
+  config to upload and no staged copy to drift from the file you just edited.
 
 GCP VM options:
   --project  PROJECT    GCP project (required for --gcp; no default)
@@ -166,23 +171,6 @@ print_version() {
     # same wording as `workflow/main.py --version`, so both entry points report identically
     echo "slidr version ${version}"
     exit 0
-}
-
-# Download the config.yaml from a GCS prefix to a local temp file and echo its path.
-#
-# Used at submit time only, so a Slurm allocation and its staging directory can both be derived from
-# the config the job will actually run with rather than from whatever the local checkout happens to
-# hold. Fetched once and read repeatedly with read_config_scalar, rather than re-fetching per key.
-# Returns non-zero (and echoes nothing) if the object cannot be read, leaving the caller to fall back.
-fetch_remote_config() {
-    local prefix="$1" tmp
-    tmp="$(mktemp)" || return 1
-    if gcloud storage cat "${prefix}/config.yaml" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
-        printf '%s' "$tmp"
-        return 0
-    fi
-    rm -f "$tmp"
-    return 1
 }
 
 # ensure uv is installed and on PATH (installs into $HOME/.local/slidr on first use)
@@ -484,6 +472,10 @@ elif [[ "$SLURM" == true ]]; then
     SLURM_STAGE=""
     [[ "$STAGE_GCS" == true ]] && SLURM_STAGE=true
 
+    # Every value read at submit time comes from this checkout's config, staged run or not: a --slurm
+    # job always runs with config/config.yaml rather than a copy fetched from the bucket.
+    CONFIG_SOURCE="$LOCAL_CONFIG"
+
     if [[ "$SLURM_STAGE" == true ]]; then
         command -v gcloud >/dev/null 2>&1 || {
             echo "[ERROR]: --slurm --stage-gcs needs the gcloud CLI to stage inputs, but it is not on PATH" >&2
@@ -496,23 +488,12 @@ elif [[ "$SLURM" == true ]]; then
         [[ "$INPUT_GCS" == gs://* ]] || {
             echo "[ERROR]: --stage-gcs needs \`settings.input_bucket\` to be a gs:// URL, but it is: '${INPUT_GCS}'" >&2
             echo "Troubleshooting:" >&2
-            echo " • Set \`settings.input_bucket\` in ${LOCAL_CONFIG} to the prefix holding config.yaml, auth_key.json and the ${BCL_ID} data folder" >&2
+            echo " • Set \`settings.input_bucket\` in ${LOCAL_CONFIG} to the prefix holding the ${BCL_ID} data folder" >&2
             echo " • Write the full URL including the scheme, e.g. gs://my-bucket/inputs" >&2
+            echo " • A --slurm run needs no config.yaml in the bucket: it runs with ${LOCAL_CONFIG} from this checkout" >&2
             echo " • To read inputs off this cluster's own filesystem instead, drop --stage-gcs and set the paths in config/config.yaml" >&2
             exit 1
         }
-        # Fetch the config the job will run with, once. Both the allocation size and the default
-        # staging directory are derived from it, so a single copy is read rather than one per key.
-        REMOTE_CONFIG=""
-        if REMOTE_CONFIG="$(fetch_remote_config "$INPUT_GCS")"; then
-            CONFIG_SOURCE="$REMOTE_CONFIG"
-        else
-            echo "[WARNING]: could not read ${INPUT_GCS}/config.yaml; sizing the job from the local config" >&2
-            echo " • Check the object exists: \`gcloud storage ls ${INPUT_GCS}/config.yaml\`" >&2
-            echo " • Check you are authenticated: \`gcloud auth print-access-token\`" >&2
-            echo " • The job will still stage and use the bucket's config -- only the values read here fall back to the local file" >&2
-            CONFIG_SOURCE="$LOCAL_CONFIG"
-        fi
 
         # Default the staging directory from the config rather than from the checkout. `output_path`
         # is the best available hint at where this cluster keeps large storage, and its parent is the
@@ -547,16 +528,10 @@ elif [[ "$SLURM" == true ]]; then
     fi
 
     # Interpolate CPUs and memory (the same values Cellranger/Julia use) to size the allocation.
-    # sbatch needs them now, so for a staged run they come from the config in the bucket -- the one
-    # the job will actually run with -- rather than from whatever the local checkout happens to hold.
-    if [[ "$SLURM_STAGE" == true ]]; then
-        CPUS="$(read_config_scalar threads "$CONFIG_SOURCE")"
-        MEM="$(read_config_scalar memory "$CONFIG_SOURCE")"
-        [[ -n "$REMOTE_CONFIG" ]] && rm -f "$REMOTE_CONFIG"
-    else
-        CPUS="$(read_config_scalar threads)"
-        MEM="$(read_config_scalar memory)"
-    fi
+    # Both staged and unstaged runs read them from this checkout's config, which is the one the job
+    # runs with either way.
+    CPUS="$(read_config_scalar threads "$CONFIG_SOURCE")"
+    MEM="$(read_config_scalar memory "$CONFIG_SOURCE")"
     CPUS="${CPUS:-16}"
     MEM="${MEM:-50}"
     if ! [[ "$CPUS" =~ ^[0-9]+$ ]]; then
@@ -564,11 +539,7 @@ elif [[ "$SLURM" == true ]]; then
         echo "Troubleshooting:" >&2
         echo " • This value becomes sbatch's --cpus-per-task, so it has to be a bare integer" >&2
         echo " • Set \`settings.threads\` to e.g. 16, with no quotes, units or inline comment" >&2
-        if [[ "$SLURM_STAGE" == true ]]; then
-            echo " • It is read from the config in the bucket: \`gcloud storage cat ${INPUT_GCS}/config.yaml | grep threads\`" >&2
-        else
-            echo " • It is read from ${LOCAL_CONFIG}" >&2
-        fi
+        echo " • It is read from ${LOCAL_CONFIG}, which is also the config the job itself runs with" >&2
         exit 1
     fi
     # settings.memory is an integer number of GB per the config schema; append the 'G' suffix
@@ -609,9 +580,10 @@ elif [[ "$SLURM" == true ]]; then
     # independently of this shell; --parsable makes sbatch print just the job ID.
     echo "Submitting slidr to Slurm (sbatch ${SBATCH_OPTS[*]})"
     if [[ "$SLURM_STAGE" == true ]]; then
-        # Staged run: hand off to workflow/bash/slidr_slurm.sh, which downloads config.yaml,
-        # auth_key.json and the sequencing data before running the pipeline. Staging happens inside
-        # the job rather than here so hundreds of GB do not move through a shared login node.
+        # Staged run: hand off to workflow/bash/slidr_slurm.sh, which downloads the sequencing data
+        # (and auth_key.json if the bucket has one) before running the pipeline with this checkout's
+        # config. Staging happens inside the job rather than here so hundreds of GB do not move
+        # through a shared login node.
         # sbatch exports the submitting environment by default (--export=ALL), which is how these
         # reach the compute node.
         export INPUT="$INPUT_GCS"

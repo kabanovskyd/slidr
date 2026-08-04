@@ -110,7 +110,7 @@ metadata and the run summary record one canonical spelling regardless of what wa
 |---|---|---|
 | `--fastqs [PATH]` | `-fq` | Treat the input as already-demultiplexed FASTQs; skips mkfastq. PATH is optional — with no value the FASTQs are read from `paths.input_path`. Mutually exclusive with `--mkfastq` |
 | `--metadata PATH` | `-md` | Metadata `.tsv`/`.csv` path or Google Sheet URL for this run, overriding `settings.metadata_source`. Recorded in the run summary as a `Metadata override` line |
-| `--stage-gcs` | `-sg` | Fetch this run's inputs from GCS: `reference_path`/`puck_path`/`raw_barcodes_path` for the pipeline, plus — under `--slurm` — the config, auth key and sequencing data. Implied by `--gcp` |
+| `--stage-gcs` | `-sg` | Fetch this run's inputs from GCS: `reference_path`/`puck_path`/`raw_barcodes_path`, plus `software_path` when it is a `gs://` URI, plus — under `--slurm` — the sequencing data and the auth key if the bucket has one. A `--slurm` run's config is never staged. Implied by `--gcp` |
 | `--run-all` | `-ra` | Run all stages end-to-end (default if no stage flag given) |
 | `--mkfastq` | `-mf` | Run Cellranger mkfastq only |
 | `--count` | `-ct` | Run Cellranger count only |
@@ -193,7 +193,9 @@ paths:
                          # (so it is never nested twice)
   input_path:            # root dir containing BCL run folders (BCL_ID must be a subdirectory of this path)
                          # optional when running with --fastqs, which then supplies the input instead
-  software_path:         # directory scanned for Cellranger/bcl2fastq executables
+  software_path:         # directory scanned for Cellranger/bcl2fastq executables. May instead be a
+                         # full gs:// prefix, which is downloaded to output/software/ on first use;
+                         # that form requires --stage-gcs, but a local directory stays valid with it
   raw_barcodes_path:     # raw puck barcode files (BeadBarcodes.txt / BeadLocations.txt); a gs:// path when running with --gcp
   puck_path:             # processed puck CSV files (generated from raw_barcodes_path if absent); a gs:// path when running with --gcp
                          # required only by the spatial-count stage, which Flex runs never reach, so an
@@ -211,7 +213,9 @@ settings:
   metadata_source:       # Google Sheet URL (https://docs.google.com/spreadsheets/d/...#gid=...)
                          # OR absolute path to a .tsv/.csv metadata file
                          # the worksheet tab is taken from the URL's gid — no separate worksheet-name field
-  input_bucket:          # GCS prefix remote runs stage config.yaml/auth_key.json/<BCL_ID> from
+  input_bucket:          # GCS prefix remote runs stage from: config.yaml/auth_key.json/<BCL_ID> for
+                         # --gcp, but only <BCL_ID> (and auth_key.json if present) for --slurm, which
+                         # runs with the checkout's own config
   output_bucket:         # GCS bucket/prefix outputs are uploaded to after a run completes
   reference_genome:      # reference genome directory name under reference_path
   alerts: false          # send Slack alerts on errors/completion. Every alert is tagged with the
@@ -247,6 +251,22 @@ Whether `reference_path`, `puck_path` and `raw_barcodes_path` are read locally o
 | `reference_path` | used in place | `<genome>` downloaded to `output/reference/` |
 | `puck_path` | read and written in place | `<puck>.csv` downloaded to `output/pucks/`, which is also where generated pucks are written |
 | `raw_barcodes_path` | read in place | `<puck>/` downloaded to `output/barcodes/` |
+
+`paths.software_path` is stageable too, but by a deliberately narrower rule — it is the one field where
+both forms remain valid under the flag:
+
+| | Value is a local directory | Value is a full `gs://…` URI |
+|---|---|---|
+| Without `--stage-gcs` | scanned in place | hard error, naming `--stage-gcs` |
+| With `--stage-gcs`/`--gcp` | scanned in place — *not* an error | contents downloaded to `output/software/`, then scanned there |
+
+The asymmetry is intentional: Cellranger is usually preinstalled on the machine that runs the pipeline
+(the `--gcp` VM image is built that way), and since `--gcp` implies `--stage-gcs`, requiring a bucket
+would break every existing VM run. A bare `bucket/prefix` is *not* accepted here, unlike the three
+fields above — it is indistinguishable from a relative local directory, and guessing wrong costs a
+multi-GB download rather than an error message. Staging is lazy (a warm `software_cache.txt` skips it),
+happens at most once per run, is reused by later runs in the same output tree, and ends by restoring
+execute bits, which `gcloud storage cp` does not preserve.
 
 A `gs://` value without the flag is a clear error ("not a directory... pass `--stage-gcs`"), not a silent misread.
 
@@ -317,7 +337,8 @@ There is no gcsfuse-mounted data bucket anymore — BCL data, reference genomes,
 # on a cluster that already sees the lab filesystem — everything read locally
 ./slidr --bcl 20240101_RUNID --slurm --run-all
 
-# on an independent cluster — the job downloads everything it needs from GCS
+# on an independent cluster — the job downloads its data from GCS, but still
+# runs with this checkout's config/config.yaml
 ./slidr --bcl 20240101_RUNID --slurm --stage-gcs --run-all
 ```
 
@@ -331,36 +352,40 @@ Passing `--stage-gcs` is what makes a Slurm run self-staging; without it nothing
 Submit node                       Compute node (inside the batch job)
 ─────────────────                 ──────────────────────────────────────────────
 ./slidr --slurm --stage-gcs ─→   workflow/bash/slidr_slurm.sh:
-  fetches gs://…/config.yaml        1. checks gcloud is present and authenticated
-  once, to size the allocation      2. downloads config.yaml + auth_key.json → workdir
-  and derive the workdir            3. downloads <BCL_ID> data → workdir/data/<BCL_ID>
-  ensure_uv / ensure_conda          4. exports the SLIDR_* path overrides
-  uv sync                           5. uv sync
-  sbatch slidr_slurm.sh             6. main.py --config <staged> --stage-gcs …
-                                    7. main.py stages the reference genome, puck maps
-                                       and raw barcodes from the gs:// paths in the config
+  reads config/config.yaml          1. checks gcloud is present and authenticated
+  to size the allocation and        2. downloads auth_key.json → workdir, if the
+  derive the workdir                   bucket has one (absence is not an error)
+  ensure_uv / ensure_conda          3. downloads <BCL_ID> data → workdir/data/<BCL_ID>
+  uv sync                           4. exports the SLIDR_* path overrides
+  sbatch slidr_slurm.sh             5. uv sync
+                                    6. main.py --stage-gcs …  (no --config: the
+                                       checkout's config/config.yaml is used)
+                                    7. main.py stages the reference genome, puck maps,
+                                       raw barcodes and any gs:// software_path
                                     8. main.py uploads outputs → settings.output_bucket
 ```
 
 Differences from the GCP path, all because there is no VM to own: the repo is not cloned (the job runs from the checkout it was submitted from), privileges are not dropped (Slurm already runs as the submitting user), and nothing self-deletes. Staging happens inside the job, not at submit time, so hundreds of GB never move through a shared login node. Sequencing data already present in the workdir is not re-downloaded — set `RESTAGE=1` to force it.
 
+**A Slurm run never stages `config.yaml`.** It runs with `config/config.yaml` from the checkout it was submitted from, and the bucket needs no copy. The GCP path still downloads one because a fresh VM has no checkout to read; a cluster job does, and that file is the one the submitter just edited — staging a copy written for another machine on top of it only let the two disagree. Two follow-on effects: a local config change takes effect on the next `sbatch` with nothing to re-upload, and the CPUs/memory requested from Slurm are read from the same file the job runs with, so the allocation cannot be sized off a different config than the run uses.
+
 | Flag | Applies to | Description |
 |---|---|---|
-| `--stage-gcs` | `--slurm` | Opt a Slurm run into staging its config, key and data from `settings.input_bucket` (and its reference/puck/barcode paths from GCS). Implied by `--gcp` |
+| `--stage-gcs` | `--slurm` | Opt a Slurm run into staging its data (and its reference/puck/barcode/software paths) from GCS. The key is staged if the bucket holds one; the config never is. Implied by `--gcp` |
 | `--workdir PATH` | staged `--slurm` | Where to stage inputs and write outputs. Rarely needed: defaults to the parent of `paths.output_path` in the config, then `$SCRATCH/slidr`, then `<repo>/slidr-work/<BCL_ID>`. The resolved value and its origin are printed at submit time |
 
-### Making a bucket-hosted config.yaml portable
+### Pointing a config at the job's workdir
 
-A `config.yaml` staged from GCS was written for whatever machine produced it, so its host-specific paths won't exist on a foreign cluster. Four of them can be overridden from the environment (`config.py`'s `PATH_ENV_OVERRIDES`), which takes precedence over the file:
+A staged Slurm job downloads into a workdir that `config/config.yaml` cannot know at the time it was written, so those paths are overridden from the environment (`config.py`'s `PATH_ENV_OVERRIDES`) rather than by rewriting the YAML:
 
 | Config field | Environment variable | Set by `slidr_slurm.sh` to |
 |---|---|---|
 | `paths.input_path` | `SLIDR_INPUT_PATH` | `<workdir>/data` |
 | `paths.output_path` | `SLIDR_OUTPUT_PATH` | `<workdir>/outs` |
-| `paths.auth_key_path` | `SLIDR_AUTH_KEY_PATH` | `<workdir>/auth_key.json` |
-| `paths.software_path` | `SLIDR_SOFTWARE_PATH` | not set by the script — export it yourself before submitting |
+| `paths.auth_key_path` | `SLIDR_AUTH_KEY_PATH` | `<workdir>/auth_key.json` — **only if** a key was staged; otherwise the config's own value stands |
+| `paths.software_path` | `SLIDR_SOFTWARE_PATH` | not set by the script — export it yourself, or point the config at a `gs://` prefix |
 
-Overridden values are still validated normally, and the applied overrides are recorded in the run's summary log. The staged config is passed with `--config` rather than overwriting `config/config.yaml`, so concurrent jobs from one checkout don't fight over it.
+An override takes precedence over the file, is still validated normally, and is recorded in the run's summary log. Everything else — threads, memory, buckets, reference/puck/barcode locations, metadata source — comes from `config/config.yaml` as committed. The overrides are exported into the job's environment rather than written into the config, so concurrent jobs from one checkout never fight over that file.
 
 Prerequisites on the cluster: `gcloud` on `PATH` (load the module first if yours provides one) and working credentials — either `gcloud auth login`, or `gcloud auth activate-service-account --key-file=...` for a headless cluster. Both persist to `~/.config/gcloud`; if that is not shared with compute nodes, set `CLOUDSDK_CONFIG` to somewhere that is. There is no `--gcs-key` flag: slidr does not re-implement what `gcloud auth` already does persistently.
 
@@ -411,14 +436,15 @@ empty. A `.last_run` written before this (VM name only) still works — it just 
 │   ├── flex/                       # Flex only: demux/ pucks/ samplesheets/ trekker/
 │   ├── reference/                  # staged runs only: local copy of the reference genome
 │   ├── pucks/                      # staged runs only: puck CSVs, downloaded or generated
-│   └── barcodes/                   # staged runs only: raw bead barcodes
+│   ├── barcodes/                   # staged runs only: raw bead barcodes
+│   └── software/                   # only when software_path is a gs:// prefix: Cellranger/bcl2fastq
 └── tmp/                            # scratch; also holds auth/auth_key.json for a gs:// key.
                                     #   Safe to delete after a run
 ```
 
 No single run contains every entry: the `flex/`, `multi_samplesheet.csv` and `takara_pipeline.log`
-entries appear only for Flex chemistry, and `reference/`/`pucks/`/`barcodes/` only when staging from
-GCS.
+entries appear only for Flex chemistry, `reference/`/`pucks/`/`barcodes/` only when staging from
+GCS, and `software/` only when `paths.software_path` is a `gs://` prefix.
 
 ### Key output files per sample
 
@@ -477,4 +503,5 @@ On first run, slidr scans `software_path` for Cellranger, bcl2fastq, and Julia, 
 - **`gcloud is not on PATH` on a cluster**: many clusters ship the CLI as a module — `module load google-cloud-sdk` (or equivalent) before submitting. `./slidr --slurm --stage-gcs` also checks this at submit time so the job doesn't fail minutes later.
 - **Google Sheets auth failure**: verify `auth_key_path` points to a valid *service account* JSON key (an OAuth client-secret file will not work), and that the sheet is shared with the key's `client_email`. `gcloud auth login` is not a substitute — the file is read directly. A `gs://` value is downloaded to the run's `tmp/auth/` first. If the metadata is a local `.tsv`/`.csv`, the key is not needed at all.
 - **Slack alerts not arriving**: `settings.slack_token` may be a local file path, a `gs://` object or the literal token; a path-shaped value that does not resolve is a hard error rather than being tried as a token. The bot needs `users:read.email` (to map the `Email` column to a user) and `chat:write`. A token file that is group- or world-readable produces a warning.
-- **Cellranger version not found**: `test_and_install_software` matches an install directory named `cellranger[-_v]<version>` exactly, so a `V8` in the `Cellranger` column is expanded via `helpers.CELLRANGER_VERSIONS`. If your site has a different patch release, edit that table — an unmapped value is passed through as written.
+- **Cellranger version not found**: `test_and_install_software` matches an install directory named `cellranger[-_v]<version>` exactly, so a `V8` in the `Cellranger` column is expanded via `helpers.CELLRANGER_VERSIONS`. If your site has a different patch release, edit that table — an unmapped value is passed through as written. The separator between name and version may be any run of `-`, `_` or `v` (`cellranger-8.0.1`, `cellranger_8.0.1`, `cellranger-v8.0.1`), but there must be at least one: a bare `cellranger8.0.1` does not match. The match is exact at both ends, so `cellranger-8.0.11` and `cellranger-8.0.1-beta` are not picked up for `8.0.1`.
+- **Software staged from GCS but nothing found**: the scan looks under `output/software/` once `paths.software_path` is a `gs://` prefix. Check the objects exist (`gcloud storage ls <software_path>`), and that the prefix holds the install *directories* themselves — the contents of the prefix are copied in, so `<software_path>/cellranger-8.0.1/bin/cellranger` becomes `output/software/cellranger-8.0.1/bin/cellranger`. Execute bits are restored automatically after the download, since `gcloud storage cp` does not preserve them.

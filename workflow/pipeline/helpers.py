@@ -43,6 +43,12 @@ SLACK_TOKEN = cfg['slack_token']
 BCL_ID = cfg['bcl_id']
 START_TIME = cfg['start_time']
 SUMMARY_LOG = cfg['summary_log']
+STAGE_GCS = cfg['stage_gcs']
+
+# Local copy of a `gs://` software_path, once staged. Memoized because the tree is large (a single
+# cellranger release is a couple of GB) and test_and_install_software() is called once per sample per
+# tool, so the download must happen at most once per run.
+_SOFTWARE_DEST = None
 
 WARN_THRESHOLD_GB = 100
 CRITICAL_THRESHOLD_GB = 500
@@ -121,6 +127,79 @@ def resolve_cellranger_version(
     return CELLRANGER_VERSIONS.get(text, text)
 
 
+def _restore_exec_bits(root: Path) -> None:
+    """
+    Add the execute bit to everything under a staged software tree.
+
+    `gcloud storage cp` does not carry POSIX permissions unless they were recorded at upload time, so
+    a downloaded cellranger install arrives mode 644 and every executable in it is unrunnable -- which
+    also makes `find -type f -executable` (below) match nothing, so the failure would surface as a
+    misleading "software not found". Which of the thousands of files in a cellranger release are meant
+    to be executable cannot be recovered from the objects, so the bit is set on all of them. This is a
+    private, run-local copy under the output tree, so marking a data file executable has no
+    consequence beyond the cosmetic.
+
+    Inputs:
+     - root: the staged software directory to fix up
+    """
+
+    for path in root.rglob('*'):
+        try:
+            path.chmod(path.stat().st_mode | 0o111)
+        except OSError:
+            # a single unreadable entry should not abort the run; if it was one of the executables
+            # the caller needs, the search below reports it as missing
+            continue
+
+
+def software_dir() -> Path:
+    """
+    Local directory to scan for external executables.
+
+    `paths.software_path` is normally a local directory and is returned as-is. When it names a
+    `gs://` location (only permitted alongside --stage-gcs, see config.py) the tree is downloaded into
+    the run's output directory on first use and the local copy is returned instead, because the
+    executable search is a `find` over a real filesystem and cannot run against a bucket.
+
+    Staging is lazy and memoized: it happens on the first call that actually needs to scan -- which a
+    warm software_cache.txt avoids entirely -- and at most once per run.
+
+    Output:
+     - a directory that can be scanned for executables
+    """
+
+    global _SOFTWARE_DEST
+
+    if not is_gcs_path(SOFTWARE_PATH):
+        return Path(SOFTWARE_PATH)
+
+    if _SOFTWARE_DEST is not None:
+        return _SOFTWARE_DEST
+
+    dest = Path(OUTPUT_PATH) / "software"
+    # reuse a copy a previous run in this output tree already brought down; the software is far larger
+    # than the sequencing data staging bothers to skip, and it does not change between runs
+    if dest.is_dir() and any(dest.iterdir()):
+        log_write(f"  Software already staged at {dest}")
+    else:
+        dest.mkdir(parents=True, exist_ok=True)
+        log_write(f"  Staging software from {SOFTWARE_PATH} (this can take a while)... ", terminator="")
+        # copy the prefix's *contents* into dest: `cp -r gs://p dest` would nest them under
+        # dest/<last path segment>, which the executable search would still find but which makes the
+        # staged tree's shape depend on how the prefix happens to be named
+        stage_from_gcs(
+            f'{SOFTWARE_PATH}/*',
+            dest,
+            recursive=True,
+            description='software installations'
+        )
+        _restore_exec_bits(dest)
+        log_write("Done.")
+
+    _SOFTWARE_DEST = dest
+    return dest
+
+
 def test_and_install_software(
     software: str,
     version: str = ""
@@ -157,31 +236,47 @@ def test_and_install_software(
         print(f"  Using {software} at {install_path}")
         return install_path
 
+    # Resolve the directory to scan, downloading it first if `software_path` names a bucket. Deferred
+    # until here on purpose: the cache lookups above are what a warm software_cache.txt hits, and they
+    # must not pay for a multi-GB staging download to answer from a file they already have.
+    search_root = software_dir() if SOFTWARE_PATH is not None else None
+
     # format the versioned name if version is provided
     if version:
         version_escaped = re.escape(version)
-        regex = rf".*/{software}[-_v]+{version_escaped}$"
+        # `[-_v][-_v]*` rather than the more obvious `[-_v]+`: find's -regex takes a *basic* regex on
+        # BSD/macOS, where `+` is a literal plus rather than a quantifier, so `[-_v]+` silently matched
+        # nothing there while working under GNU find on Linux. `*` is a quantifier in both dialects, as
+        # is the `\.` that re.escape() puts in the version, so this form resolves on either.
+        regex = rf".*/{software}[-_v][-_v]*{version_escaped}$"
         cmd = [
             "find",
-            str(SOFTWARE_PATH),
+            str(search_root),
             "-regex",
             regex,
             "-type",
             "d"
         ]
     else:
+        # `-name` (not a bare `software`, which find would read as a second directory to search) and
+        # `-perm -u+x` rather than GNU's `-executable`, which BSD find rejects outright. Both matter
+        # more for a staged tree than a local one: everything staged out of GCS has the execute bit
+        # restored wholesale (see _restore_exec_bits), so an unfiltered search would happily return the
+        # first data file it walked past.
         cmd = [
             "find",
-            str(SOFTWARE_PATH),
+            str(search_root),
+            "-name",
             software,
             "-type",
             "f",
-            "-executable"  
+            "-perm",
+            "-u+x"
         ]
 
     # try searching the entire provided software directory for matching software (slow)
-    if SOFTWARE_PATH is not None and Path(SOFTWARE_PATH).is_dir():
-        print(f"Scanning {SOFTWARE_PATH} for {software} executable. This may take a while...")
+    if search_root is not None and Path(search_root).is_dir():
+        print(f"Scanning {search_root} for {software} executable. This may take a while...")
         try:
             result = subprocess.run(
                 cmd,
@@ -208,7 +303,7 @@ def test_and_install_software(
                 print(f"  Using {software} at {executable_path}")
                 return Path(executable_path)
         except Exception as exc:
-            log_write(f"[WARNING]: Could not search {SOFTWARE_PATH} for {software}: {exc}")
+            log_write(f"[WARNING]: Could not search {search_root} for {software}: {exc}")
 
     # software not found locally, attempting to install automatically
     match software:

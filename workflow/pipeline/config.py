@@ -579,14 +579,6 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         err_console.print(" • Or pass one for this run only with `--metadata /path/to/metadata.tsv`")
         sys.exit(1)
 
-    if SOFTWARE_PATH is None or not Path(SOFTWARE_PATH).is_dir():
-        err_console.print(f"[bold red]\\[ERROR][/bold red]: invalid entry for `software_path` in configuration file: {SOFTWARE_PATH}")
-        err_console.print("Troubleshooting:")
-        err_console.print(" • Check that `software_path` is set to a valid directory path containing cellranger/bcl2fastq executables")
-        sys.exit(1)
-    else:
-        SOFTWARE_PATH = Path(SOFTWARE_PATH)
-    
     # The service-account key is only ever read to authenticate against the Google Sheets and Drive
     # APIs (helpers.load_metadata), so it is required for a Sheet-backed run and irrelevant to one
     # driven by a local .tsv/.csv. Requiring it unconditionally forced users who never touch Sheets
@@ -697,7 +689,40 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
     if args.count or args.spatial_analysis or args.run_all:
         REF_PATH = _validate_resource_path(
             REF_PATH, 'reference_path', 'reference genome directories')
-    
+
+    # `software_path` is stageable out of GCS like the three resource paths above, but the trigger is
+    # deliberately narrower: only an explicit `gs://` URI is staged, and a local directory stays valid
+    # even under --stage-gcs.
+    #
+    # Cellranger and bcl2fastq are routinely preinstalled on whatever machine runs the pipeline -- the
+    # --gcp VM image is built exactly that way -- and --gcp implies --stage-gcs, so treating every
+    # staged run as "the software must live in a bucket" would break those runs while buying nothing.
+    # This mirrors how `auth_key_path` above is handled rather than how reference_path is: a gs:// URI
+    # is unambiguous, so it needs no flag to be recognized.
+    #
+    # The bare `bucket/prefix` form the resource paths accept is NOT honoured here. It cannot be told
+    # apart from a relative local directory, and guessing wrong means a multi-GB download instead of a
+    # clear error. --stage-gcs is still required, so a staged software tree is always something the
+    # caller asked for and never a surprise inferred from the config alone.
+    if is_gcs_path(SOFTWARE_PATH):
+        if not STAGE_GCS:
+            err_console.print(f"[bold red]\\[ERROR][/bold red]: `software_path` is a GCS location, but this run was not asked to stage from GCS: {SOFTWARE_PATH}")
+            err_console.print("Troubleshooting:")
+            err_console.print(" • Pass --stage-gcs (or --gcp) to download the software from the bucket before it is scanned")
+            err_console.print(" • Or set `software_path` to a local directory containing the cellranger/bcl2fastq executables")
+            sys.exit(1)
+        SOFTWARE_PATH = gcs_uri(SOFTWARE_PATH)
+    elif SOFTWARE_PATH is None or not Path(SOFTWARE_PATH).is_dir():
+        err_console.print(f"[bold red]\\[ERROR][/bold red]: invalid entry for `software_path` in configuration file: {SOFTWARE_PATH}")
+        err_console.print("Troubleshooting:")
+        err_console.print(" • Check that `software_path` is set to a valid directory path containing cellranger/bcl2fastq executables")
+        err_console.print(" • If the software lives in a bucket, write it as a full gs:// URL and pass --stage-gcs to download it")
+        err_console.print(f" • Or pin the executables directly by adding their paths to {SOFTWARE_CACHE_FILE}, which is consulted before this directory is scanned")
+        sys.exit(1)
+    else:
+        SOFTWARE_PATH = Path(SOFTWARE_PATH)
+
+
     if not is_int(MEM_SIZE):
         err_console.print(f"[bold red]\\[ERROR][/bold red]: invalid entry for `memory` in configuration file: {MEM_SIZE!r}")
         err_console.print("Troubleshooting:")
@@ -891,6 +916,8 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
             summary.write(f"  Reference (GCS):      {REF_PATH}\n")
             summary.write(f"  Pucks (GCS):          {PUCK_PATH}\n")
             summary.write(f"  Raw barcodes (GCS):   {RAW_BARCODES_PATH}\n")
+            if is_gcs_path(SOFTWARE_PATH):
+                summary.write(f"  Software (GCS):       {SOFTWARE_PATH}\n")
         if applied_overrides:
             summary.write(f"  Path overrides:       {', '.join(applied_overrides)}\n")
         if metadata_override:

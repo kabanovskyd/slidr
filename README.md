@@ -57,7 +57,8 @@ Edit `config/config.yaml` before running:
 paths:
   output_path: /data/slidetag           # where outputs are written
   input_path: /mnt/sequencer            # root directory containing BCL run folders
-  software_path: /mnt/lab_software      # directory scanned for Cellranger / bcl2fastq
+  software_path: /mnt/lab_software      # directory scanned for Cellranger / bcl2fastq.
+                                        # May also be a gs:// prefix, staged with --stage-gcs
   raw_barcodes_path: /mnt/barcodes      # raw puck barcode files (BeadBarcodes.txt / BeadLocations.txt)
   puck_path: /mnt/pucks                 # processed puck CSV files (generated if absent)
   reference_path: /mnt/reference        # directory containing reference genome subdirectories
@@ -95,6 +96,19 @@ as booleans, so `threads: no` is rejected rather than silently treated as `0`.
 When staging inputs from Google Cloud Storage (`--gcp`, or `--slurm --stage-gcs`), point `reference_path`,
 `puck_path` and `raw_barcodes_path` at `gs://` locations instead of local directories.
 
+`software_path` may also name a `gs://` location, in which case the Cellranger/bcl2fastq tree is
+downloaded to `output/software/` before it is scanned. Unlike the three above it is *not* required to
+be a bucket on a staged run — a local directory stays valid, because the machine running the pipeline
+usually has the software installed already (the `--gcp` VM image does). Two consequences of a staged
+software tree worth knowing:
+
+- Only a full `gs://…` URL triggers it. The bare `bucket/prefix` form the other paths accept is not
+  honoured here, since it cannot be told apart from a relative local directory and guessing wrong means
+  a multi-GB download instead of an error. `--stage-gcs` is still required.
+- The download happens once per run, lazily — a `software_cache.txt` that already pins the executables
+  skips it entirely — and is reused by later runs sharing the output tree. Because GCS does not carry
+  POSIX permissions, execute bits are restored on the staged copy afterwards.
+
 ### `settings.input_bucket`
 
 The GCS prefix a run stages its inputs from. This is the only place the location is configured —
@@ -105,10 +119,23 @@ settings:
   input_bucket: gs://slidr_data/inputs
 ```
 
-The prefix must already hold `config.yaml`, `auth_key.json` and the `<BCL_ID>/` run folder — upload
-them before launching, as the pipeline never puts them there for you. `./slidr` reads this field
-locally and hands the location to the VM or compute node, which then downloads its own config, key and
-data from it.
+What the prefix must hold depends on where the run executes, because only a VM lacks a checkout to read
+its configuration from:
+
+| Object | `--gcp` | `--slurm --stage-gcs` |
+|---|---|---|
+| `<BCL_ID>/` run folder | required | required |
+| `config.yaml` | required | **not used** — the job runs with `config/config.yaml` from the checkout it was submitted from |
+| `auth_key.json` | required | optional; staged if present, otherwise `paths.auth_key_path` from the local config applies |
+
+Upload whichever apply before launching — the pipeline never puts them there for you. `./slidr` reads
+this field locally and hands the location to the VM or compute node, which then downloads what it needs.
+
+A Slurm job runs from a real checkout on a cluster you administer, so `config/config.yaml` is already
+there and is the file you just edited; staging a copy written for another machine on top of it only
+invited the two to disagree. In practice this means a config change takes effect on your next `sbatch`
+with nothing to re-upload, and the CPU/memory `./slidr` requests from Slurm are read from the same file
+the job itself will use.
 
 `--gcp` always stages, since a fresh VM has nothing else to read. A `--slurm` run stages only when
 asked with `--stage-gcs`; without it the job reads everything off the cluster's own filesystem. Local
@@ -286,18 +313,20 @@ Two things a staged run needs are set up outside slidr rather than through flags
   `~/.config/gcloud`, which compute nodes see on a shared home. On a headless cluster use
   `gcloud auth activate-service-account --key-file=/path/to/key.json` instead, which persists the same
   way. If your home is *not* shared with compute nodes, point `CLOUDSDK_CONFIG` at somewhere that is.
-- **`software_path` for this cluster**, when the staged config names another site's Cellranger install.
-  Export the override before submitting — `sbatch` passes the environment through:
+- **`software_path` for this cluster**, if you would rather not edit `config/config.yaml`. Export the
+  override before submitting — `sbatch` passes the environment through:
   ```bash
   export SLIDR_SOFTWARE_PATH=/opt/cellranger
   ./slidr --bcl 20240101_RUNID --slurm --stage-gcs
   ```
-  The same works for any of `SLIDR_INPUT_PATH`, `SLIDR_OUTPUT_PATH` and `SLIDR_AUTH_KEY_PATH`, though
-  the staging script sets those three itself.
+  The same works for `SLIDR_INPUT_PATH` and `SLIDR_OUTPUT_PATH`, though the staging script sets those two
+  itself, and for `SLIDR_AUTH_KEY_PATH`, which it sets only when the bucket actually had a key.
+  Alternatively, point `software_path` at a `gs://` location and let the job download the software.
 
-`workflow/main.py` additionally accepts `--config PATH` to run against a config file outside
-`config/`, and `--stage-gcs` to stage `reference_path`/`puck_path`/`raw_barcodes_path` from GCS without
-using `--gcp`. Both are used by the Slurm payload script and are not exposed on `./slidr` itself.
+`workflow/main.py` additionally accepts `--config PATH` to run against a config file outside `config/`,
+and `--stage-gcs` to stage `reference_path`/`puck_path`/`raw_barcodes_path` (and a `gs://`
+`software_path`) from GCS without using `--gcp`. `--stage-gcs` is what the Slurm payload passes; neither
+is exposed on `./slidr` itself.
 
 ---
 

@@ -7,10 +7,18 @@
 # job as the submitting user) and no self-delete. Unlike the GCP script it also does not clone the
 # repo -- the job runs inside the checkout it was submitted from.
 #
+# It also does NOT stage config.yaml, which is the other place it diverges from the GCP script. A
+# Slurm job runs from a real checkout on a cluster the submitter administers, so config/config.yaml is
+# already right there and is the file they just edited; downloading a copy written for a different
+# machine on top of it only invited the two to disagree. The GCP script still needs its own copy
+# because a fresh VM has no checkout to read. Consequences: the bucket needs no config.yaml for a
+# --slurm --stage-gcs run, and settings the submitter changes locally take effect on the next
+# submission with nothing to re-upload.
+#
 # Submitted by ./slidr --slurm --stage-gcs ; not intended to be run by hand. Inputs arrive as
 # environment variables (sbatch exports the submitting environment by default):
 #
-#   INPUT           GCS prefix holding config.yaml, auth_key.json and the <BCL_ID> data folder
+#   INPUT           GCS prefix holding the <BCL_ID> data folder (and optionally auth_key.json)
 #   BCL_ID          BCL run ID
 #   SLIDR_WORKDIR   directory on cluster storage to stage inputs into and write outputs to
 #   SLIDR_REPO      path to the slidr checkout to run
@@ -93,7 +101,6 @@ log "gcloud credentials OK ($(gcloud config get-value account 2>/dev/null || ech
 #                                     stage the inputs                                    #
 # --------------------------------------------------------------------------------------- #
 
-CONFIG_FILE="${SLIDR_WORKDIR}/config.yaml"
 AUTH_KEY="${SLIDR_WORKDIR}/auth_key.json"
 DATA_DIR="${SLIDR_WORKDIR}/data"
 OUT_DIR="${SLIDR_WORKDIR}/outs"
@@ -107,20 +114,21 @@ mkdir -p "$SLIDR_WORKDIR" "$DATA_DIR" "$OUT_DIR" || die \
     "Point --workdir at scratch you own, e.g. /scratch/\${USER}/slidr/${BCL_ID}" \
     "Check your quota and the filesystem's free space: \`df -h ${SLIDR_WORKDIR}\`"
 
-log "Staging config.yaml and auth_key.json from ${INPUT}"
-gcloud storage cp "${INPUT}/config.yaml" "$CONFIG_FILE" \
-    || die "could not download ${INPUT}/config.yaml" \
-           "Check the object exists: \`gcloud storage ls ${INPUT}/\`" \
-           "config.yaml must be uploaded to the \`settings.input_bucket\` prefix by hand before submitting" \
-           "Check the active account can read the bucket: \`gcloud storage ls ${INPUT}/\`" \
-           "Check \`settings.input_bucket\` names the prefix holding config.yaml, not the bucket root"
-gcloud storage cp "${INPUT}/auth_key.json" "$AUTH_KEY" \
-    || die "could not download ${INPUT}/auth_key.json" \
-           "Check the object exists: \`gcloud storage ls ${INPUT}/\`" \
-           "auth_key.json must be uploaded to the \`settings.input_bucket\` prefix by hand before submitting" \
-           "This is the Google service-account key the pipeline reads its metadata sheet with" \
-           "Check the active account can read the bucket: \`gcloud storage ls ${INPUT}/\`"
-chmod 600 "$AUTH_KEY"
+# The service-account key is staged when the bucket has one, but its absence is not fatal: the local
+# config this job runs with may already point `auth_key_path` at a key on cluster storage or at a gs://
+# object, and a run whose metadata is a local .tsv/.csv needs no key at all. Requiring one here would
+# force those users to upload a key nothing reads. When the download does succeed it wins, on the
+# grounds that a key placed in the run's own input prefix was put there for this job.
+log "Staging auth_key.json from ${INPUT} (optional)"
+if gcloud storage cp "${INPUT}/auth_key.json" "$AUTH_KEY" 2>/dev/null; then
+    chmod 600 "$AUTH_KEY"
+    export SLIDR_AUTH_KEY_PATH="$AUTH_KEY"
+    log "  Staged the service-account key to ${AUTH_KEY}"
+else
+    rm -f "$AUTH_KEY"
+    log "  No auth_key.json at ${INPUT} -- using \`paths.auth_key_path\` from the local config"
+    log "  (a Google Sheet metadata source needs a key there; a local .tsv/.csv needs none)"
+fi
 
 # Sequencing data is the expensive part of staging (routinely hundreds of GB), so skip it when a
 # previous job in this workdir already brought it down. RESTAGE=1 forces a re-download.
@@ -143,12 +151,13 @@ fi
 #                                      run the pipeline                                   #
 # --------------------------------------------------------------------------------------- #
 
-# Point the bucket's config.yaml at this cluster's locations. The config was written for whatever
-# machine produced it and cannot know this workdir, so these four host-specific paths are overridden
-# in the environment (config.py's PATH_ENV_OVERRIDES) rather than by rewriting the YAML.
+# Point the run at the locations this job staged into. The checkout's config.yaml cannot know the
+# workdir sbatch was given, so these host-specific paths are overridden in the environment (config.py's
+# PATH_ENV_OVERRIDES) rather than by rewriting the YAML. Everything else -- threads, memory, buckets,
+# reference/puck/barcode locations, metadata source -- comes from config/config.yaml as committed.
+# SLIDR_AUTH_KEY_PATH is exported above, but only if a key was actually staged.
 export SLIDR_INPUT_PATH="$DATA_DIR"
 export SLIDR_OUTPUT_PATH="$OUT_DIR"
-export SLIDR_AUTH_KEY_PATH="$AUTH_KEY"
 # SLIDR_SOFTWARE_PATH is deliberately not set here. config.py already honours it from the environment
 # (PATH_ENV_OVERRIDES), and sbatch exports the submitting environment by default, so
 # `export SLIDR_SOFTWARE_PATH=/opt/cellranger` before submitting reaches the job untouched -- which is
@@ -168,12 +177,11 @@ uv sync || die \
     "If the lockfile is stale, refresh it on the submit node with \`uv lock\`"
 
 log "Launching the pipeline"
-# --stage-gcs makes the pipeline pull the reference genome, puck maps and raw barcodes from the
-# gs:// locations in the staged config; --config points at the staged copy so concurrent jobs never
-# fight over the repo's own config/config.yaml.
+# --stage-gcs makes the pipeline pull the reference genome, puck maps, raw barcodes and -- when
+# `software_path` is a gs:// location -- the software, from the locations named in the checkout's own
+# config/config.yaml. No --config: this job runs with the repo's config, not a staged copy of one.
 uv run python workflow/main.py \
     --bcl "$BCL_ID" \
-    --config "$CONFIG_FILE" \
     --stage-gcs \
     "$@" \
     || die "the pipeline exited with an error" \

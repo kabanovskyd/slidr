@@ -92,11 +92,9 @@ RUNNER_USER="runner"
 # with no `-c`/stdin is a no-op under a non-interactive startup script.
 # Pre-create and hand over ownership of the directories the runner-context
 # work needs to write to, then drop privileges for the rest of the run.
-# NB: create the /pipeline/data PARENT, not the /pipeline/data/${BCL_ID} leaf. `gcloud storage
-# cp -r SRC DEST` nests the source folder under DEST when DEST already exists (yielding
-# /pipeline/data/${BCL_ID}/${BCL_ID}/...); leaving the leaf uncreated makes the copy on line ~86
-# land the contents directly at /pipeline/data/${BCL_ID}/ as intended.
-mkdir -p /slidr /pipeline/data /pipeline/out /pipeline/software /pipeline/pucks /pipeline/reference /pipeline/barcodes
+# The sequencing data no longer gets its own directory here: the pipeline stages it inside its own run
+# directory (/pipeline/out/${BCL_ID}/data), the way it already stages the reference, pucks and barcodes.
+mkdir -p /slidr /pipeline/out /pipeline/software /pipeline/pucks /pipeline/reference /pipeline/barcodes
 chown -R "${RUNNER_USER}:${RUNNER_USER}" /slidr /pipeline
 
 echo "Launching slidr as ${RUNNER_USER}..."
@@ -129,24 +127,26 @@ git clone -b stable https://github.com/kabanovskyd/slidr.git /slidr || die \
     "Check the \`stable\` branch still exists in https://github.com/kabanovskyd/slidr"
 cd /slidr
 
-echo "Copying software and sequencing data from GCS..."
-gcloud storage cp -r "${INPUT}/${BCL_ID}" "/pipeline/data/${BCL_ID}" || die \
-    "could not copy the sequencing data from ${INPUT}/${BCL_ID}" \
-    "Check the folder exists: \`gcloud storage ls ${INPUT}/\`" \
-    "Check the BCL ID matches the folder name in the bucket exactly, including case" \
-    "Check the slidr-runner service account has Storage Object Viewer on that bucket" \
-    "A BCL run is routinely hundreds of GB -- relaunch with a larger --disk if the boot disk filled up"
-
+# The sequencing data is deliberately NOT copied here. Which run folders this run needs is stated by
+# the metadata -- a split-BCL sample merges reads from further BCLs via `Merge RNA/Spatial From BCL` --
+# and nothing outside the pipeline reads that metadata, so this script could only ever fetch the one
+# BCL ID it was handed. pipeline.stage_input_data does the whole job instead, out of the same ${INPUT}
+# prefix (it is `paths.input_path` in the config downloaded just below), into the run's own directory,
+# and only if a stage actually needs the reads.
+#
+# What is left here is the bootstrap that must happen before the pipeline exists: its own config, and
+# the key it reads the metadata sheet with.
 echo "Staging config and auth key..."
 mkdir -p /slidr/config
 gcloud storage cp "${INPUT}/config.yaml" /slidr/config/config.yaml || die \
     "could not download ${INPUT}/config.yaml" \
-    "config.yaml must be uploaded to the \`settings.input_bucket\` prefix by hand before launching" \
+    "config.yaml must be uploaded to the \`paths.input_path\` prefix by hand before launching" \
     "Check the object exists: \`gcloud storage ls ${INPUT}/\`" \
-    "Check \`settings.input_bucket\` names the prefix holding config.yaml, not the bucket root"
+    "Check \`paths.input_path\` names the prefix holding config.yaml, not the bucket root" \
+    "Check the slidr-runner service account has Storage Object Viewer on that bucket"
 gcloud storage cp "${INPUT}/auth_key.json" /slidr/auth_key.json || die \
     "could not download ${INPUT}/auth_key.json" \
-    "auth_key.json must be uploaded to the \`settings.input_bucket\` prefix by hand before launching" \
+    "auth_key.json must be uploaded to the \`paths.input_path\` prefix by hand before launching" \
     "This is the Google service-account key the pipeline reads its metadata sheet with" \
     "Check the object exists: \`gcloud storage ls ${INPUT}/\`"
 chmod 600 /slidr/auth_key.json

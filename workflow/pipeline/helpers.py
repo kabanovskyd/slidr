@@ -1336,23 +1336,60 @@ def stage_from_gcs(
 
 def resolve_bcl_dir(bcl_id: str) -> Path:
     """
-    Resolve the Illumina run folder for a BCL ID from the configured `input_path`.
+    Resolve the Illumina run folder for a BCL ID from the run's local input directory.
 
-    `input_path` is documented as the root directory holding BCL run folders, so the run folder is
-    normally input_path/<BCL_ID>; a path that already points at the run folder itself (its basename
-    is the BCL ID) is accepted as-is. This mirrors how run_mkfastq derives each --run argument, so
-    validating the directory returned here checks what mkfastq will actually be handed -- unlike
+    That directory is `paths.input_path` for a local run, and the `settings.gcs_download_dest` the
+    bucket was staged into for a `--stage-gcs`/`--gcp` one -- config.py re-points INPUT_PATH at the
+    latter, so this function (and everything else downstream) sees one local root either way.
+
+    It is documented as the root directory holding BCL run folders, so the run folder is normally
+    input_path/<BCL_ID>; a path that already points at the run folder itself (its basename is this
+    run's BCL ID) is accepted, in which case the root holding every run folder is its parent.
+    That second case matters for split-BCL runs: the extra run folders a sample merges reads from sit
+    beside the primary one, not inside it. This mirrors how run_mkfastq derives each --run argument,
+    so validating the directory returned here checks what mkfastq will actually be handed -- unlike
     validating `input_path` itself, which for the documented layout is a directory *of* run folders
     and so never satisfies the BCL run-folder schema.
 
     Inputs:
-     - bcl_id: BCL run ID (args.bcl)
+     - bcl_id: BCL run ID -- this run's (args.bcl) or one named by a `Merge ... From BCL` column
     Output:
      - path to the run folder for that BCL ID
     """
 
     input_path = Path(INPUT_PATH)
-    return input_path if input_path.name == bcl_id else input_path / bcl_id
+    root = input_path.parent if input_path.name == BCL_ID else input_path
+    return root / bcl_id
+
+
+def merge_bcls(metadata_df: pd.DataFrame) -> list[str]:
+    """
+    The additional BCL run IDs a split-BCL run merges reads from.
+
+    A library is sometimes sequenced across more than one run: the `Merge RNA From BCL` /
+    `Merge Spatial From BCL` columns name the extra run folder a sample's gene-expression or spatial
+    reads are topped up from. Those folders are inputs to this run exactly as the primary BCL is --
+    mkfastq demultiplexes each of them in turn -- so both the demultiplexing loop and GCS staging
+    need the same list, derived in one place.
+
+    Inputs:
+     - metadata_df: the run's metadata table
+    Output:
+     - de-duplicated merge-from BCL IDs in metadata order, excluding this run's own BCL and any
+       blank/NaN entry
+    """
+
+    bcls = []
+    for column in ('Merge RNA From BCL', 'Merge Spatial From BCL'):
+        if column not in metadata_df:
+            continue
+        for value in metadata_df[column]:
+            if value is None or pd.isna(value):
+                continue
+            bcl = str(value).strip()
+            if bcl and bcl != BCL_ID and bcl not in bcls:
+                bcls.append(bcl)
+    return bcls
 
 
 def declared_lanes(sample_row, column: str) -> list[str]:

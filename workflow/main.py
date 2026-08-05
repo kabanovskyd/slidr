@@ -16,11 +16,10 @@ from pipeline.helpers import (
     log_skipped,
     run_banner,
     run_relative,
-    format_duration,
-    resolve_bcl_dir,
-    validate_bcl_dir
+    format_duration
 )
 from pipeline.pipeline import (
+    stage_input_data,
     run_mkfastq,
     write_metadata_to_file,
     create_samplesheet,
@@ -37,7 +36,6 @@ from config import args, cfg
 START_TIME = cfg['start_time']
 ROOT_PATH = cfg['root_path']
 OUTPUT_PATH = cfg['output_path']
-INPUT_PATH = cfg['input_path']
 MKFASTQ_OUTS = cfg['mkfastq_outs']
 COUNT_OUTS = cfg['count_outs']
 CELLBENDER_OUTS = cfg['cellbender_outs']
@@ -47,6 +45,9 @@ SUMMARY_PATH = cfg['summary_path']
 SAMPLESHEET_PATH = cfg['samplesheet_path']
 SUMMARY_LOG = cfg['summary_log']
 OUTPUT_BUCKET = cfg['output_bucket']
+INPUT_BUCKET = cfg['input_bucket']
+FASTQ_INPUT = cfg['fastq_input']
+STAGE_FASTQ_INPUT = cfg['stage_fastq_input']
 BCL_ID = cfg['bcl_id']
 
 
@@ -94,22 +95,29 @@ for sample in samples:
 # --------------------------------------------------------------------------------------- #
 
 
-# Check if cellranger mkfastq needs to be run.
-#
 # Whether the input is BCLs to demultiplex or already-demultiplexed FASTQs is stated explicitly by
 # the presence of --fastqs, never inferred: --fastqs means skip mkfastq, no --fastqs means the
-# input is BCLs. That makes the BCL run-folder check below a real validation with one meaning --
+# input is BCLs. That makes run_mkfastq's BCL run-folder check a real validation with one meaning --
 # "the BCLs you asked me to demultiplex are not usable" -- so it can hard-fail instead of being
 # reinterpreted as "these must have been FASTQs after all".
-if not args.fastqs and (args.run_all or args.mkfastq):
-    bcl_dir = resolve_bcl_dir(BCL_ID)
-    if not validate_bcl_dir(bcl_dir):
-        log_write(f"[ERROR]: {bcl_dir} is not a usable Illumina BCL run directory (see the warnings above for what is missing)")
+#
+# A staged bare --fastqs skips mkfastq but still has to fetch its reads, which config.py could not do
+# (they are a several-hundred-GB download, and it only resolves paths). Do it here, before the first
+# stage that reads them, and apply the checks config.py defers for exactly this case.
+if STAGE_FASTQ_INPUT:
+    stage_input_data([BCL_ID])
+    if not FASTQ_INPUT.is_dir() or not any(FASTQ_INPUT.rglob('*.fastq.gz')):
+        log_write(f"[ERROR]: no .fastq.gz files were staged to the FASTQ directory for --fastqs: {FASTQ_INPUT}")
         log_write("Troubleshooting:")
-        log_write(f" • Check that `input_path` points at the directory containing the {BCL_ID} run folder")
-        log_write(" • Check that the BCL run finished transferring (RunInfo.xml, RunParameters.xml and Data/Intensities/BaseCalls must all be present)")
-        log_write(" • If these reads are already demultiplexed, pass the FASTQ directory with --fastqs instead")
+        log_write(f" • --fastqs was given without a directory, so the reads are expected in {INPUT_BUCKET}/{BCL_ID}")
+        log_write(f" • Check what that prefix holds: `gcloud storage ls {INPUT_BUCKET}/{BCL_ID}`")
+        log_write(" • Check the FASTQs are gzipped (cellranger requires .fastq.gz, not plain .fastq)")
+        log_write(" • Drop --fastqs if that folder holds BCLs to be demultiplexed rather than FASTQs")
+        log_write(" • Or name a directory already on this machine instead: `--fastqs /path/to/fastqs`")
         sys.exit(1)
+
+# check if cellranger mkfastq needs to be run
+if not args.fastqs and (args.run_all or args.mkfastq):
     if need_run_module("mkfastq", metadata_df) or args.force:
         run_mkfastq()
     else:

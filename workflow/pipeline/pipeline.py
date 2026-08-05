@@ -31,6 +31,9 @@ from helpers import (
     format_multi_samplesheet,
     ensure_conda_env,
     load_metadata,
+    merge_bcls,
+    resolve_bcl_dir,
+    validate_bcl_dir,
     test_and_install_software,
     create_tmp_dir,
     parse_cellranger_html,
@@ -61,6 +64,7 @@ METADATA_SRC = cfg['metadata_src']
 RAW_BARCODES_PATH = cfg['raw_barcodes_path']
 PUCK_PATH = cfg['puck_path']
 REF_PATH = cfg['ref_path']
+INPUT_BUCKET = cfg['input_bucket']
 SUMMARY_PATH = cfg['summary_path']
 SUMMARY_LOG = cfg['summary_log']
 REF_GENOME = cfg['ref_genome']
@@ -422,31 +426,37 @@ def create_samplesheet() -> list[Path]:
             new_row = {'Lane': lane, 'Sample': (str(row['Sample Name']) + '_sb'), 'Index': str(row['SB Index'])}
             samplesheet_df = pd.concat([samplesheet_df, pd.DataFrame([new_row])], ignore_index=True)
 
-    split_bcls = []
-    # identify samples with split BCLs
-    if 'Merge RNA From BCL' in metadata_df:
-        split_bcls += metadata_df['Merge RNA From BCL'].unique().tolist()
-    
-    if 'Merge Spatial From BCL' in metadata_df:
-        split_bcls += metadata_df['Merge Spatial From BCL'].unique().tolist()
+    # identify samples with split BCLs. merge_bcls() is the one place the metadata's merge columns
+    # are read into a list of BCL IDs, so the samplesheet written per BCL here is named for exactly
+    # the ID run_mkfastq later stages, demultiplexes and reads that samplesheet back for.
+    split_samplesheets = {
+        bcl: pd.DataFrame(columns=['Lane', 'Sample', 'Index'])
+        for bcl in merge_bcls(metadata_df)
+    }
 
-    split_samplesheets = {}
-    for bcl in split_bcls:
-        if bcl != "" and bcl is not None and not pd.isna(bcl):
-            split_samplesheets[bcl] = pd.DataFrame(columns=['Lane', 'Sample', 'Index'])
-    
     # create individual samplesheets for samples with split BCLs
     for _, sample in metadata_df.iterrows():
-        if 'Merge RNA From BCL' in metadata_df:
-            rna_bcl = sample['Merge RNA From BCL']
-            if rna_bcl != "" and rna_bcl is not None and not pd.isna(rna_bcl):
-                new_row = {'Lane': '*', 'Sample': (str(sample['Sample Name']) + '_split_rna'), 'Index': str(sample['Add RNA Index'])}
-                split_samplesheets[rna_bcl] = pd.concat([split_samplesheets[rna_bcl], pd.DataFrame([new_row])], ignore_index=True)
-        if 'Merge Spatial From BCL' in metadata_df:
-            spatial_bcl = sample['Merge Spatial From BCL']
-            if spatial_bcl != "" and spatial_bcl is not None and not pd.isna(spatial_bcl):
-                new_row = {'Lane': '*', 'Sample': (str(sample['Sample Name']) + '_split_sb'), 'Index': str(sample['Add SB Index'])}
-                split_samplesheets[spatial_bcl] = pd.concat([split_samplesheets[spatial_bcl], pd.DataFrame([new_row])], ignore_index=True)
+        for column, suffix, index_column in (
+            ('Merge RNA From BCL', '_split_rna', 'Add RNA Index'),
+            ('Merge Spatial From BCL', '_split_sb', 'Add SB Index'),
+        ):
+            if column not in metadata_df:
+                continue
+            bcl = sample[column]
+            if bcl is None or pd.isna(bcl) or not str(bcl).strip():
+                continue
+            bcl = str(bcl).strip()
+            if bcl not in split_samplesheets:
+                # merge_bcls() drops a merge column that names this run's own BCL, since there is no
+                # second run folder to demultiplex; its rows are already covered by the main
+                # samplesheet, and writing them to a <BCL_ID>_samplesheet.csv would only be
+                # overwritten by the main one below
+                log_write(f"[WARNING]: sample {sample['Sample Name']} sets `{column}` to {BCL_ID}, this run's own BCL; ignoring it")
+                log_write(f" • Reads from {BCL_ID} are already demultiplexed by the main samplesheet")
+                log_write(f" • To merge reads from a second sequencing run, set `{column}` to that run's BCL ID")
+                continue
+            new_row = {'Lane': '*', 'Sample': (str(sample['Sample Name']) + suffix), 'Index': str(sample[index_column])}
+            split_samplesheets[bcl] = pd.concat([split_samplesheets[bcl], pd.DataFrame([new_row])], ignore_index=True)
 
     # set up the output samplesheets list
     output_samplesheets = []
@@ -474,6 +484,60 @@ def create_samplesheet() -> list[Path]:
     SAMPLESHEET_PATH = main_samplesheet
 
     return output_samplesheets
+
+
+def stage_input_data(bcl_ids: list[str]) -> None:
+    """
+    Download this run's input folders from the `gs://` `paths.input_path` prefix into the local
+    directory `settings.gcs_download_dest` names (config.py re-points `input_path` at it when staging).
+
+    Every folder of reads a staged run needs comes through here: the primary `<BCL_ID>`, the extra run
+    folders a split-BCL run merges from (`Merge RNA From BCL` / `Merge Spatial From BCL`), and the
+    already-demultiplexed FASTQ folder of a `--fastqs` run. The launcher scripts deliberately no longer
+    copy any of it -- `slidr_gcp.sh`/`slidr_slurm.sh` know only the primary BCL ID, so leaving the whole
+    job here is what lets a split-BCL run work at all, and keeps one implementation with one
+    already-staged rule and one destination.
+
+    A no-op unless this run stages from GCS: without --stage-gcs/--gcp `input_path` is a local
+    directory of run folders, and a missing one is reported by the caller's own check rather than
+    silently downloaded.
+
+    Inputs:
+     - bcl_ids: BCL run IDs to stage
+    Output:
+     - none; each folder is left at resolve_bcl_dir(<bcl_id>)
+    """
+
+    if not STAGE_GCS or not bcl_ids:
+        return
+
+    for bcl in bcl_ids:
+        dest = resolve_bcl_dir(bcl)
+
+        # Sequencing data is the expensive part of staging (routinely hundreds of GB per run), so a
+        # folder an earlier run staged into this same destination is left alone. RESTAGE=1 forces a
+        # re-download, which is also the way out of a download that was interrupted so early that the
+        # folder looks populated.
+        if dest.is_dir() and any(dest.iterdir()) and os.environ.get('RESTAGE') != '1':
+            log_write(f"  Input data for {bcl} already staged at {dest} (set RESTAGE=1 to re-download)")
+            continue
+
+        # `gcloud storage cp -r SRC DEST` nests SRC under DEST when DEST already exists, which would
+        # land the run folder at <dest>/<bcl>/ where nothing looks for it; remove the leaf so the
+        # contents arrive directly. This also clears out a partial earlier download.
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        log_write(f"  Staging input data for {bcl} from {INPUT_BUCKET}... ", terminator="")
+        with console.status(f"  Staging input data for {bcl} (this can take a while)..."):
+            stage_from_gcs(
+                f'{INPUT_BUCKET}/{bcl}',
+                dest,
+                recursive=True,
+                description=f'the {bcl} input data'
+            )
+        log_write("Done.")
 
 
 def run_mkfastq() -> None:
@@ -511,16 +575,37 @@ def run_mkfastq() -> None:
 
     stage_started = log_stage_start("cellranger mkfastq")
 
-    # create a list of all BCL IDs used in the experiment (for RNA and spatial barcodes)
-    bcls = [BCL_ID]
-    if 'Merge RNA From BCL' in metadata_df:
-        bcls += metadata_df['Merge RNA From BCL'].unique().tolist()
-    if 'Merge Spatial From BCL' in metadata_df:
-        bcls += metadata_df['Merge Spatial From BCL'].unique().tolist()
-
-    bcls = list(dict.fromkeys(bcls))
-    bcls = [bcl for bcl in bcls if not pd.isna(bcl) and bcl is not None]
+    # every BCL ID this run demultiplexes: the primary one, plus the run folders a split-BCL sample
+    # merges extra RNA/spatial reads from
+    extra_bcls = merge_bcls(metadata_df)
+    bcls = [BCL_ID] + extra_bcls
     tmp_dirs = {}
+
+    # Bring the run folders down when this run stages from GCS. Which ones are needed depends on the
+    # metadata, so this is the earliest point it is knowable -- and doing it here rather than at
+    # startup means a re-run whose FASTQs already exist never spends the download at all.
+    stage_input_data(bcls)
+
+    # Refuse to hand cellranger a run folder that is not one. Checked after staging, since a staged
+    # folder does not exist until then, and for the primary BCL as well as the merged-in ones: this is
+    # the only place all of them are known together.
+    for bcl in bcls:
+        bcl_dir = resolve_bcl_dir(bcl)
+        if not validate_bcl_dir(bcl_dir):
+            log_write(f"[ERROR]: {bcl_dir} is not a usable Illumina BCL run directory (see the warnings above for what is missing)")
+            log_write("Troubleshooting:")
+            if bcl == BCL_ID:
+                log_write(f" • Check that `input_path` ({INPUT_PATH}) holds the {BCL_ID} run folder")
+                log_write(" • Check the BCL run finished transferring (RunInfo.xml, RunParameters.xml and Data/Intensities/BaseCalls must all be present)")
+                log_write(" • If these reads are already demultiplexed, pass them with --fastqs instead -- the pipeline will not guess this for you")
+            else:
+                log_write(f" • {bcl} is named by a `Merge RNA From BCL` / `Merge Spatial From BCL` column, so its run folder has to be demultiplexed alongside {BCL_ID}")
+                log_write(f" • Check that run folder sits beside the {BCL_ID} one, under `input_path` ({INPUT_PATH})")
+                log_write(" • Clear the column for that sample if its reads should not be merged after all")
+            if STAGE_GCS:
+                log_write(f" • Check it exists in the bucket: `gcloud storage ls {INPUT_BUCKET}/{bcl}`")
+                log_write(" • Re-download a partially staged folder by re-running with RESTAGE=1 in the environment")
+            sys.exit(1)
 
     # create output directories
     for _, sample in metadata_df.iterrows():
@@ -566,10 +651,7 @@ def run_mkfastq() -> None:
         tmp_dirs[bcl] = tmp_dir
 
         # specify data path
-        if INPUT_PATH.name == BCL_ID:
-            data_path = INPUT_PATH.parent / bcl
-        else:
-            data_path = INPUT_PATH / bcl
+        data_path = resolve_bcl_dir(bcl)
 
         # launch mkfastq
         log_write(f"  Generating FASTQs from BCLs in {bcl}...", terminal=False, terminator="")

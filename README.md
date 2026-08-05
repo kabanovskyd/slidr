@@ -56,7 +56,9 @@ Edit `config/config.yaml` before running:
 ```yaml
 paths:
   output_path: /data/slidetag           # where outputs are written
-  input_path: /mnt/sequencer            # root directory containing BCL run folders
+  input_path: /mnt/sequencer            # root directory containing BCL run folders. Under
+                                        # --stage-gcs/--gcp this is instead the gs:// prefix they
+                                        # are staged from
   software_path: /mnt/lab_software      # directory scanned for Cellranger / bcl2fastq.
                                         # May also be a gs:// prefix, staged with --stage-gcs
   raw_barcodes_path: /mnt/barcodes      # raw puck barcode files (BeadBarcodes.txt / BeadLocations.txt)
@@ -69,7 +71,8 @@ settings:
   memory: 50                            # GB allocated to Cellranger
   threads: 16                           # cores allocated to Cellranger and Julia
   metadata_source: https://docs.google.com/spreadsheets/d/...#gid=0   # Sheet URL, or a .tsv/.csv path
-  input_bucket:                         # GCS prefix remote runs stage their inputs from
+  gcs_download_dest:                    # local dir a staged run downloads into; defaults to
+                                        # <output_path>/<BCL_ID>/data
   output_bucket:                        # GCS bucket outputs are uploaded to after a run
   reference_genome: refdata-gex-GRCm39-2024-A   # directory name under reference_path
   alerts: false                         # send Slack alerts on errors/completion
@@ -93,8 +96,10 @@ workflow:
 Numeric fields must be given as plain numbers. Note that YAML reads the bare words `yes`/`no`/`on`/`off`
 as booleans, so `threads: no` is rejected rather than silently treated as `0`.
 
-When staging inputs from Google Cloud Storage (`--gcp`, or `--slurm --stage-gcs`), point `reference_path`,
-`puck_path` and `raw_barcodes_path` at `gs://` locations instead of local directories.
+When staging inputs from Google Cloud Storage (`--gcp`, or `--slurm --stage-gcs`), point `input_path`,
+`reference_path`, `puck_path` and `raw_barcodes_path` at `gs://` locations instead of local directories.
+Staged data lands in `settings.gcs_download_dest`, or — left unset — under the run's own directory at
+`<output_path>/<BCL_ID>/data`.
 
 `software_path` may also name a `gs://` location, in which case the Cellranger/bcl2fastq tree is
 downloaded to `output/software/` before it is scanned. Unlike the three above it is *not* required to
@@ -109,14 +114,22 @@ software tree worth knowing:
   skips it entirely — and is reused by later runs sharing the output tree. Because GCS does not carry
   POSIX permissions, execute bits are restored on the staged copy afterwards.
 
-### `settings.input_bucket`
+### `paths.input_path`
 
-The GCS prefix a run stages its inputs from. This is the only place the location is configured —
-there is no command-line equivalent. Include the `gs://` scheme.
+Where the run reads its reads from. It is dual-purpose, exactly like `reference_path`, `puck_path` and
+`raw_barcodes_path`: a local directory of run folders for a local run, and the GCS prefix those folders
+are staged out of when staging. Which one it is is decided by `--stage-gcs`/`--gcp`, never by the shape
+of the value — a `gs://` value without the flag, or a local path with it, is a clear error rather than a
+silent misread. This is the only place the location is configured; there is no command-line equivalent.
 
 ```yaml
-settings:
-  input_bucket: gs://slidr_data/inputs
+# local run
+paths:
+  input_path: /mnt/sequencer
+
+# staged run (--gcp, or --slurm --stage-gcs)
+paths:
+  input_path: gs://slidr_data/inputs
 ```
 
 What the prefix must hold depends on where the run executes, because only a VM lacks a checkout to read
@@ -125,11 +138,23 @@ its configuration from:
 | Object | `--gcp` | `--slurm --stage-gcs` |
 |---|---|---|
 | `<BCL_ID>/` run folder | required | required |
+| further run folders named by `Merge RNA From BCL` / `Merge Spatial From BCL` | required for a split-BCL run | required for a split-BCL run |
 | `config.yaml` | required | **not used** — the job runs with `config/config.yaml` from the checkout it was submitted from |
 | `auth_key.json` | required | optional; staged if present, otherwise `paths.auth_key_path` from the local config applies |
 
 Upload whichever apply before launching — the pipeline never puts them there for you. `./slidr` reads
 this field locally and hands the location to the VM or compute node, which then downloads what it needs.
+
+A library sequenced across more than one run needs every one of those run folders under this same
+prefix, each named exactly as the metadata spells it. The pipeline downloads them itself, once the
+metadata has been read — just before demultiplexing, and only if demultiplexing actually runs. The
+launcher scripts fetch no sequencing data at all: they know only the one BCL ID they were handed, and
+which *other* run folders a split-BCL run needs is stated nowhere but the metadata. A run folder already
+present on the compute node is left alone; set `RESTAGE=1` in the environment to re-download it.
+
+A bare `--fastqs` on a staged run needs no path either: it resolves to the staged copy of
+`<input_path>/<BCL_ID>`, so a bucket folder of already-demultiplexed FASTQs works the same way a BCL
+folder does.
 
 A Slurm job runs from a real checkout on a cluster you administer, so `config/config.yaml` is already
 there and is the file you just edited; staging a copy written for another machine on top of it only
@@ -138,8 +163,29 @@ with nothing to re-upload, and the CPU/memory `./slidr` requests from Slurm are 
 the job itself will use.
 
 `--gcp` always stages, since a fresh VM has nothing else to read. A `--slurm` run stages only when
-asked with `--stage-gcs`; without it the job reads everything off the cluster's own filesystem. Local
-runs ignore the field entirely.
+asked with `--stage-gcs`; without it the job reads everything off the cluster's own filesystem, and
+`input_path` is an ordinary local directory.
+
+### `settings.gcs_download_dest`
+
+The local directory a staged run downloads `input_path` into. Left unset it defaults to
+`<output_path>/<BCL_ID>/data`, so a staged run writes nothing outside its own run directory and needs no
+per-machine configuration — which is what a fresh VM or a cluster job can count on.
+
+It sits beside `output/` rather than inside it on purpose: `settings.output_bucket` uploads the whole of
+`output/` when a run succeeds, and this directory holds raw inputs that came *out* of a bucket. Staging
+them under `output/` would send the entire sequencing run — hundreds of GB — straight back to GCS every
+time a run finished.
+
+Set it to move that data elsewhere, typically cluster scratch:
+
+```yaml
+settings:
+  gcs_download_dest: /scratch/$USER/slidr-data
+```
+
+A per-host value can be exported as `SLIDR_GCS_DOWNLOAD_DEST` instead of edited into a shared config.
+Local runs ignore the field entirely.
 
 ### Google Sheets authentication
 
@@ -188,8 +234,8 @@ These columns are optional, and only read when non-empty:
 
 | Column | Description |
 |---|---|
-| `Merge RNA From BCL` | Additional BCL to merge RNA FASTQs from |
-| `Merge Spatial From BCL` | Additional BCL to merge spatial FASTQs from |
+| `Merge RNA From BCL` | Additional BCL to merge RNA FASTQs from. Its run folder is demultiplexed alongside the primary one, and staged from the `paths.input_path` prefix on a `--gcp`/`--stage-gcs` run |
+| `Merge Spatial From BCL` | Additional BCL to merge spatial FASTQs from, staged and demultiplexed the same way |
 | `Add RNA Index` | Index for the merged-in RNA library |
 | `Add SB Index` | Index for the merged-in spatial library |
 | `Add Puck ID` | Puck override for a merged sample |
@@ -221,7 +267,7 @@ scheduler:
 # locally
 ./slidr --bcl RUN_20240101 --run-all
 
-# on a GCP VM (streams logs back; see settings.input_bucket above)
+# on a GCP VM (streams logs back; see paths.input_path above)
 ./slidr --bcl RUN_20240101 --gcp --project my-project --run-all
 
 # as a Slurm job
@@ -277,7 +323,7 @@ Run `./slidr --help` for the authoritative list.
 |---|---|
 | `--gcp` | Run on a GCP VM, streaming logs back to your terminal |
 | `--slurm` | Submit as a Slurm batch job |
-| *(no flag)* | Where inputs are staged from is configuration, not a flag — set `settings.input_bucket` in `config/config.yaml`. `--stage-gcs` is what opts a `--slurm` run into using it; `--gcp` always does |
+| *(no flag)* | Where inputs are staged from is configuration, not a flag — set `paths.input_path` in `config/config.yaml` to the `gs://` prefix. `--stage-gcs` is what opts a `--slurm` run into reading it that way; `--gcp` always does |
 
 **GCP options** (only with `--gcp`)
 

@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Slurm batch payload: stage a run's inputs out of GCS onto cluster storage, then run the pipeline.
+# Slurm batch payload: prepare a compute node to run the pipeline against inputs held in GCS.
 #
-# This is the Slurm counterpart of workflow/bash/slidr_gcp.sh. It does the same staging work so
-# slidr can run on a cluster with no access to the lab filesystem, minus everything GCE-specific:
-# there is no VM to create, no instance metadata to read, no privilege drop (Slurm already runs the
-# job as the submitting user) and no self-delete. Unlike the GCP script it also does not clone the
-# repo -- the job runs inside the checkout it was submitted from.
+# This is the Slurm counterpart of workflow/bash/slidr_gcp.sh, minus everything GCE-specific: there is
+# no VM to create, no instance metadata to read, no privilege drop (Slurm already runs the job as the
+# submitting user) and no self-delete. Unlike the GCP script it also does not clone the repo -- the job
+# runs inside the checkout it was submitted from.
+#
+# Neither script stages the sequencing data any more: the pipeline does that itself from
+# `paths.input_path`, because only it can read the metadata that says which run folders a split-BCL run
+# needs. What is left here is the bootstrap that has to happen before the pipeline exists at all.
 #
 # It also does NOT stage config.yaml, which is the other place it diverges from the GCP script. A
 # Slurm job runs from a real checkout on a cluster the submitter administers, so config/config.yaml is
@@ -18,9 +21,10 @@
 # Submitted by ./slidr --slurm --stage-gcs ; not intended to be run by hand. Inputs arrive as
 # environment variables (sbatch exports the submitting environment by default):
 #
-#   INPUT           GCS prefix holding the <BCL_ID> data folder (and optionally auth_key.json)
+#   INPUT           GCS prefix holding auth_key.json, if the bucket has one. The sequencing data comes
+#                   from the same prefix, but the pipeline fetches that itself -- see below
 #   BCL_ID          BCL run ID
-#   SLIDR_WORKDIR   directory on cluster storage to stage inputs into and write outputs to
+#   SLIDR_WORKDIR   directory on cluster storage to write outputs to (and stage into, by default)
 #   SLIDR_REPO      path to the slidr checkout to run
 #   RESTAGE         optional; set to 1 to re-download data that is already staged
 #
@@ -102,13 +106,9 @@ log "gcloud credentials OK ($(gcloud config get-value account 2>/dev/null || ech
 # --------------------------------------------------------------------------------------- #
 
 AUTH_KEY="${SLIDR_WORKDIR}/auth_key.json"
-DATA_DIR="${SLIDR_WORKDIR}/data"
 OUT_DIR="${SLIDR_WORKDIR}/outs"
 
-# NB: create the DATA_DIR parent but NOT the ${DATA_DIR}/${BCL_ID} leaf. `gcloud storage cp -r SRC
-# DEST` nests SRC under DEST when DEST already exists, which would yield data/<BCL_ID>/<BCL_ID>/...;
-# leaving the leaf absent makes the copy land the contents directly where the pipeline expects them.
-mkdir -p "$SLIDR_WORKDIR" "$DATA_DIR" "$OUT_DIR" || die \
+mkdir -p "$SLIDR_WORKDIR" "$OUT_DIR" || die \
     "could not create the working directories under ${SLIDR_WORKDIR}" \
     "Check the parent directory exists and is writable from this node" \
     "Point --workdir at scratch you own, e.g. /scratch/\${USER}/slidr/${BCL_ID}" \
@@ -130,33 +130,28 @@ else
     log "  (a Google Sheet metadata source needs a key there; a local .tsv/.csv needs none)"
 fi
 
-# Sequencing data is the expensive part of staging (routinely hundreds of GB), so skip it when a
-# previous job in this workdir already brought it down. RESTAGE=1 forces a re-download.
-if [[ -d "${DATA_DIR}/${BCL_ID}" ]] && [[ -n "$(ls -A "${DATA_DIR}/${BCL_ID}" 2>/dev/null)" ]] \
-   && [[ "${RESTAGE:-}" != "1" ]]; then
-    log "Sequencing data already staged at ${DATA_DIR}/${BCL_ID} (set RESTAGE=1 to re-download)"
-else
-    log "Staging sequencing data from ${INPUT}/${BCL_ID} (this can take a while)"
-    rm -rf "${DATA_DIR}/${BCL_ID}"
-    gcloud storage cp -r "${INPUT}/${BCL_ID}" "${DATA_DIR}/${BCL_ID}" \
-        || die "could not download the sequencing data from ${INPUT}/${BCL_ID}" \
-               "Check the folder exists: \`gcloud storage ls ${INPUT}/\`" \
-               "Check the BCL ID matches the folder name in the bucket exactly, including case" \
-               "A BCL run is routinely hundreds of GB -- check the free space and your quota: \`df -h ${DATA_DIR}\`" \
-               "A partial download was left behind; it is removed and retried automatically on the next submission"
-    log "Sequencing data staged"
-fi
+# The sequencing data is deliberately NOT staged here. Which run folders a job needs is stated by the
+# metadata -- a split-BCL sample merges reads from further BCLs via `Merge RNA/Spatial From BCL` --
+# and nothing outside the pipeline reads that metadata, so this script could only ever fetch the one
+# BCL ID it was handed. pipeline.stage_input_data does the whole job instead, from the `paths.input_path`
+# prefix in the config below, skipping folders already present and honouring RESTAGE=1 the same way.
+# It also means the download happens only if a stage actually needs the reads.
 
 # --------------------------------------------------------------------------------------- #
 #                                      run the pipeline                                   #
 # --------------------------------------------------------------------------------------- #
 
-# Point the run at the locations this job staged into. The checkout's config.yaml cannot know the
-# workdir sbatch was given, so these host-specific paths are overridden in the environment (config.py's
-# PATH_ENV_OVERRIDES) rather than by rewriting the YAML. Everything else -- threads, memory, buckets,
-# reference/puck/barcode locations, metadata source -- comes from config/config.yaml as committed.
+# Point the run at this job's workdir. The checkout's config.yaml cannot know the workdir sbatch was
+# given, so that host-specific path is overridden in the environment (config.py's PATH_ENV_OVERRIDES)
+# rather than by rewriting the YAML. Everything else -- threads, memory, buckets, reference/puck/barcode
+# locations, metadata source -- comes from config/config.yaml as committed.
 # SLIDR_AUTH_KEY_PATH is exported above, but only if a key was actually staged.
-export SLIDR_INPUT_PATH="$DATA_DIR"
+#
+# SLIDR_INPUT_PATH is deliberately NOT set. Under --stage-gcs `paths.input_path` is the gs:// prefix to
+# stage *from*, so overriding it with a local directory would leave the job with nothing to download.
+# Where the data lands is a separate field, `settings.gcs_download_dest`, which defaults into the output
+# tree below -- so this job stages into ${OUT_DIR}/${BCL_ID}/data and needs no override either.
+# Set SLIDR_GCS_DOWNLOAD_DEST before submitting to put it on a different filesystem.
 export SLIDR_OUTPUT_PATH="$OUT_DIR"
 # SLIDR_SOFTWARE_PATH is deliberately not set here. config.py already honours it from the environment
 # (PATH_ENV_OVERRIDES), and sbatch exports the submitting environment by default, so
@@ -177,9 +172,10 @@ uv sync || die \
     "If the lockfile is stale, refresh it on the submit node with \`uv lock\`"
 
 log "Launching the pipeline"
-# --stage-gcs makes the pipeline pull the reference genome, puck maps, raw barcodes and -- when
-# `software_path` is a gs:// location -- the software, from the locations named in the checkout's own
-# config/config.yaml. No --config: this job runs with the repo's config, not a staged copy of one.
+# --stage-gcs makes the pipeline pull the run folders under `paths.input_path`, the reference genome,
+# puck maps, raw barcodes and -- when `software_path` is a gs:// location -- the software, from the
+# locations named in the checkout's own config/config.yaml. No --config: this job runs with the repo's
+# config, not a staged copy of one.
 uv run python workflow/main.py \
     --bcl "$BCL_ID" \
     --stage-gcs \

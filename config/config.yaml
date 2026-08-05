@@ -1,7 +1,9 @@
 # input and output paths
 paths:
   output_path:
-  input_path:
+  input_path:         # root dir holding the BCL run folders (or FASTQs, with --fastqs). Under
+                      # --stage-gcs/--gcp this is instead the gs:// prefix they are staged from,
+                      # which for --gcp also holds config.yaml and auth_key.json
   software_path:
   raw_barcodes_path:
   puck_path:
@@ -15,7 +17,9 @@ settings:
   memory: 50
   threads: 16
   metadata_source:
-  input_bucket:   # GCS prefix --gcp runs stage config.yaml/auth_key.json/<BCL_ID> from (--input overrides)
+  gcs_download_dest:  # local dir a staged run downloads `input_path` into. Unset, it defaults to
+                      # <output_path>/<BCL_ID>/data (kept out of output/, which is what gets
+                      # uploaded to output_bucket)
   output_bucket:
   reference_genome:
   alerts:

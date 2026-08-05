@@ -154,6 +154,26 @@ def gcs_uri(path: Path | str) -> str:
     return text
 
 
+def looks_local(value) -> bool:
+    """
+    True if a configured GCS location is unmistakably a local filesystem path instead.
+
+    A staged field accepts a bare `bucket/prefix` as well as a full `gs://` URI, and a relative
+    directory cannot be told apart from the former -- but an *absolute* path can: GCS bucket names
+    may not begin with a slash, and `~` is meaningless in one. Without this check gcs_uri() strips
+    the leading slash and quietly builds `gs:///data/runs`, which fails much later as an unreadable
+    bucket rather than as the "you forgot to point this at the bucket" it actually is.
+
+    Inputs:
+     - value: the configured field value
+    Output:
+     - True if the value can only be a local path
+    """
+
+    text = str(value).strip()
+    return text.startswith('/') or text.startswith('~')
+
+
 # Machine-local paths that an environment variable may override, taking precedence over the config
 # file. These exist so one config.yaml can be shared across machines: the remote-run setup scripts
 # (workflow/bash/slidr_gcp.sh, workflow/bash/slidr_slurm.sh) stage inputs into a working directory
@@ -171,6 +191,14 @@ PATH_ENV_OVERRIDES = {
     'output_path': 'SLIDR_OUTPUT_PATH',
     'auth_key_path': 'SLIDR_AUTH_KEY_PATH',
     'software_path': 'SLIDR_SOFTWARE_PATH',
+}
+
+# The same mechanism for the one `settings.*` field that names a machine-local location. It is in
+# `settings` rather than `paths` because it is not an input the user points at -- it is where staged
+# inputs are put -- but a cluster still needs to be able to redirect it per host without editing the
+# shared config.
+SETTINGS_ENV_OVERRIDES = {
+    'gcs_download_dest': 'SLIDR_GCS_DOWNLOAD_DEST',
 }
 
 
@@ -528,11 +556,12 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         # apply host-specific path overrides from the environment before anything reads `paths`, so
         # a config.yaml shared from a bucket can be pointed at this machine's staging directories
         applied_overrides = []
-        for field, env_var in PATH_ENV_OVERRIDES.items():
-            override = os.environ.get(env_var)
-            if override is not None and override.strip():
-                paths[field] = override.strip()
-                applied_overrides.append(f"{field} <- {env_var}")
+        for section, overrides in ((paths, PATH_ENV_OVERRIDES), (settings, SETTINGS_ENV_OVERRIDES)):
+            for field, env_var in overrides.items():
+                override = os.environ.get(env_var)
+                if override is not None and override.strip():
+                    section[field] = override.strip()
+                    applied_overrides.append(f"{field} <- {env_var}")
 
         OUT_PATH = paths.get('output_path')
         INPUT_PATH = paths.get('input_path')
@@ -545,6 +574,7 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         NUM_THREADS = settings.get('threads')
         MEM_SIZE = settings.get('memory')
         METADATA_SRC = settings.get('metadata_source')
+        GCS_DOWNLOAD_DEST = settings.get('gcs_download_dest')
         OUTPUT_BUCKET = settings.get('output_bucket')
         REF_GENOME = settings.get('reference_genome')
         ALERTS = settings.get('alerts')
@@ -633,6 +663,10 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
     # cluster pull its own inputs.
     STAGE_GCS = args.gcp or args.stage_gcs
 
+    # `input_path` is stageable too, and is resolved further down -- once the output tree is known,
+    # since that is where a staged run downloads to by default. See "resolve where this run reads its
+    # reads from" below.
+
     def _validate_resource_path(value, field: str, contents: str, required: bool = True):
         """
         Validate one of the three stageable resource paths, returning it normalized: a `gs://` URI
@@ -653,11 +687,12 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         if STAGE_GCS:
             # the bucket contents cannot be checked without a network round trip per field, so only
             # the form is validated here; a missing object is reported when it is staged
-            if not isinstance(value, str):
-                err_console.print(f"[bold red]\\[ERROR][/bold red]: `{field}` must be a GCS location string when staging from GCS, but is: {value!r}")
+            if not isinstance(value, str) or looks_local(value):
+                err_console.print(f"[bold red]\\[ERROR][/bold red]: `{field}` must be a GCS location when staging from GCS, but is: {value!r}")
                 err_console.print("Troubleshooting:")
                 err_console.print(f" • Set `{field}` to a gs:// URL (or a bare bucket/prefix -- gs:// is prepended for you)")
-                err_console.print(" • Drop --stage-gcs to read this path off the local filesystem instead")
+                err_console.print(f" • This run stages from GCS, so `{field}` names a bucket location rather than a directory on this machine")
+                err_console.print(" • Drop --stage-gcs (and --gcp) to read this path off the local filesystem instead")
                 sys.exit(1)
             return gcs_uri(value)
 
@@ -741,70 +776,23 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
             err_console.print(hint)
         sys.exit(1)
 
-    # Validate the directory of pre-demultiplexed FASTQs supplied with --fastqs.
-    #
-    # This flag exists so the pipeline never has to *guess* what kind of input it was handed.
+    # --fastqs exists so the pipeline never has to *guess* what kind of input it was handed.
     # Inferring "BCL run folder vs. already-demultiplexed FASTQ directory" by validating
     # `input_path` against the Illumina run-folder schema is ambiguous by construction: a
     # validation failure means either "these are FASTQs" or "this is a malformed BCL directory",
     # and the two demand opposite responses (silently skip mkfastq vs. abort with an error).
     # An explicit --fastqs makes the user's intent unambiguous, which in turn lets every
-    # downstream check below and in pipeline.py be strict instead of best-effort.
-    FASTQ_INPUT = args.fastqs
-    if FASTQ_INPUT is not None:
-        # --mkfastq asks for BCLs to be demultiplexed; --fastqs asserts that already happened.
-        # Refuse the combination rather than silently honouring one and dropping the other.
-        if args.mkfastq:
-            err_console.print("[bold red]\\[ERROR][/bold red]: --fastqs and --mkfastq are mutually exclusive")
-            err_console.print("Troubleshooting:")
-            err_console.print(" • Drop --fastqs to demultiplex BCLs from `input_path` with cellranger mkfastq")
-            err_console.print(" • Drop --mkfastq to run the downstream stages on the FASTQs you provided")
-            sys.exit(1)
-
-        # A bare --fastqs says the FASTQs are wherever `input_path` points, so there is nothing to
-        # resolve from the flag itself -- but that makes `input_path` the only source, and therefore
-        # mandatory. Report it here, where the reason is obvious, rather than letting the generic
-        # input_path error below suggest passing the very flag that was just used.
-        if FASTQ_INPUT == FASTQS_USE_INPUT_PATH:
-            if INPUT_PATH is None or not str(INPUT_PATH).strip():
-                err_console.print("[bold red]\\[ERROR][/bold red]: --fastqs was given without a directory, so `paths.input_path` must point at the FASTQs -- but it is not set")
-                err_console.print("Troubleshooting:")
-                err_console.print(" • Set `paths.input_path` to the directory holding the .fastq.gz files")
-                err_console.print(" • Or name the directory on the command line instead: `--fastqs /path/to/fastqs`")
-                sys.exit(1)
-            FASTQ_INPUT = INPUT_PATH
-            source = "`paths.input_path`"
-        else:
-            source = "--fastqs"
-
-        FASTQ_INPUT = Path(FASTQ_INPUT)
-        if not FASTQ_INPUT.is_dir():
-            err_console.print(f"[bold red]\\[ERROR][/bold red]: the FASTQ directory from {source} is not a directory or does not exist: {FASTQ_INPUT}")
-            err_console.print("Troubleshooting:")
-            err_console.print(" • Check the path for typos and that it is readable")
-            err_console.print(" • --fastqs expects a directory of .fastq.gz files, not an individual FASTQ file")
-            sys.exit(1)
-        if not any(FASTQ_INPUT.rglob('*.fastq.gz')):
-            err_console.print(f"[bold red]\\[ERROR][/bold red]: no .fastq.gz files found in the FASTQ directory from {source}: {FASTQ_INPUT}")
-            err_console.print("Troubleshooting:")
-            err_console.print(" • Check that the FASTQs are gzipped (cellranger requires .fastq.gz, not plain .fastq)")
-            err_console.print(" • Omit --fastqs to demultiplex BCLs from `input_path` instead")
-            sys.exit(1)
-
-    if INPUT_PATH is None or not Path(INPUT_PATH).is_dir():
-        # with --fastqs the reads are already demultiplexed, so no BCL run folder is required;
-        # point INPUT_PATH at the FASTQ directory so the remaining consumers of it (the Flex
-        # cellranger-multi samplesheet, log messages) still resolve to the real input
-        if FASTQ_INPUT is not None:
-            INPUT_PATH = FASTQ_INPUT
-        else:
-            err_console.print(f"[bold red]\\[ERROR][/bold red]: invalid entry for the `input_path` field in the configfile: {INPUT_PATH}")
-            err_console.print("Troubleshooting:")
-            err_console.print(" • Check that `input_path` is set to a valid directory path containing input BCL run folders")
-            err_console.print(" • Alternatively, pass a directory of already-demultiplexed FASTQs with --fastqs")
-            sys.exit(1)
-    else:
-        INPUT_PATH = Path(INPUT_PATH)
+    # check in the input resolution below and in pipeline.py be strict instead of best-effort.
+    #
+    # --mkfastq asks for BCLs to be demultiplexed; --fastqs asserts that already happened. Refuse the
+    # combination rather than silently honouring one and dropping the other. Checked here, ahead of
+    # everything else, because it is a pure flag conflict: no config value can make it valid.
+    if args.fastqs is not None and args.mkfastq:
+        err_console.print("[bold red]\\[ERROR][/bold red]: --fastqs and --mkfastq are mutually exclusive")
+        err_console.print("Troubleshooting:")
+        err_console.print(" • Drop --fastqs to demultiplex BCLs from `input_path` with cellranger mkfastq")
+        err_console.print(" • Drop --mkfastq to run the downstream stages on the FASTQs you provided")
+        sys.exit(1)
 
     if isinstance(ALERTS, str):
         if ALERTS.lower() in ['y', 'yes', 't', 'true']:
@@ -890,6 +878,127 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
     for path in [LOG_PATH, METADATA_PATH, TMP_PATH, OUTPUT_PATH]:
         path.mkdir(exist_ok=True)
 
+    # ------------------------------------------------------------------------------------- #
+    #                      resolve where this run reads its reads from                       #
+    # ------------------------------------------------------------------------------------- #
+    #
+    # `paths.input_path` is dual-purpose, exactly like reference_path/puck_path/raw_barcodes_path: a
+    # local directory of run folders normally, and the `gs://` prefix they are staged out of under
+    # --stage-gcs/--gcp. Which one it is comes from the flag, never from the shape of the value.
+    #
+    # When staging, the configured value is kept as INPUT_BUCKET -- what to download -- and INPUT_PATH
+    # is re-pointed at the local directory the download lands in, which is where every stage then
+    # looks. Nothing downstream has to know the difference: INPUT_PATH is always a local Path holding
+    # run folders, so resolve_bcl_dir, the Flex samplesheet and the log lines are identical either way.
+    #
+    # Resolved here, after the output tree exists, because an unset `settings.gcs_download_dest`
+    # defaults into it.
+    INPUT_BUCKET = None
+    STAGE_FASTQ_INPUT = False
+    FASTQ_INPUT = args.fastqs
+
+    if STAGE_GCS:
+        if not isinstance(INPUT_PATH, str) or not INPUT_PATH.strip() or looks_local(INPUT_PATH):
+            err_console.print(f"[bold red]\\[ERROR][/bold red]: `input_path` must be a GCS location when staging from GCS, but is: {INPUT_PATH!r}")
+            err_console.print("Troubleshooting:")
+            err_console.print(" • Set `paths.input_path` to the prefix holding this run's data folder (e.g. gs://my-bucket/inputs)")
+            err_console.print(" • A bare bucket/prefix works too -- gs:// is prepended for you")
+            err_console.print(" • Under --stage-gcs/--gcp this field is where the run folders are downloaded *from*; where they land is `settings.gcs_download_dest`")
+            err_console.print(" • Drop --stage-gcs (and --gcp) to read the run folders off this machine's filesystem instead")
+            sys.exit(1)
+        INPUT_BUCKET = gcs_uri(INPUT_PATH)
+
+        # Where the download lands. `settings.gcs_download_dest` names it explicitly; left unset it
+        # defaults inside this run's own directory, which keeps a staged run self-contained -- on a VM
+        # or a cluster that tree is the one place the pipeline is guaranteed to be able to write -- and
+        # means no machine-specific configuration is needed to stage anywhere.
+        #
+        # Deliberately a sibling of output/ rather than output/data, which is where the other staged
+        # resources live (output/reference, output/pucks, output/barcodes, output/software). main.py
+        # uploads the whole of output/ to `settings.output_bucket` on success, and these are raw inputs
+        # that came *out* of a bucket: putting them in there would re-upload the entire sequencing run,
+        # routinely hundreds of GB, every time a run finished.
+        if GCS_DOWNLOAD_DEST is None or not str(GCS_DOWNLOAD_DEST).strip():
+            GCS_DOWNLOAD_DEST = OUT_PATH / "data"
+        else:
+            GCS_DOWNLOAD_DEST = Path(str(GCS_DOWNLOAD_DEST).strip())
+        try:
+            GCS_DOWNLOAD_DEST.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            err_console.print(f"[bold red]\\[ERROR][/bold red]: could not create the staging directory `gcs_download_dest`: {GCS_DOWNLOAD_DEST} ({exc})")
+            err_console.print("Troubleshooting:")
+            err_console.print(" • Check the parent directory exists and is writable from this machine")
+            err_console.print(" • Set `settings.gcs_download_dest` to somewhere with room for the sequencing data (a BCL run is routinely hundreds of GB)")
+            err_console.print(f" • Left unset it defaults to {OUT_PATH / 'data'}, inside the run's own directory")
+            sys.exit(1)
+        INPUT_PATH = GCS_DOWNLOAD_DEST
+
+        # A bare --fastqs means "the reads are this run's input folder". Staged, that folder is
+        # <gcs_download_dest>/<BCL_ID> -- the local copy of <input_path>/<BCL_ID> -- whether it holds
+        # BCLs or FASTQs, so it resolves exactly as a run folder does. It cannot be checked here: it
+        # is downloaded when the run needs it (main.py), which is also where it is then validated.
+        if FASTQ_INPUT == FASTQS_USE_INPUT_PATH:
+            FASTQ_INPUT = INPUT_PATH / BCL_ID
+            STAGE_FASTQ_INPUT = True
+
+    else:
+        if is_gcs_path(INPUT_PATH):
+            err_console.print(f"[bold red]\\[ERROR][/bold red]: `input_path` is a GCS location, but this run was not asked to stage from GCS: {INPUT_PATH}")
+            err_console.print("Troubleshooting:")
+            err_console.print(" • Pass --stage-gcs (or --gcp) to download the run folders from the bucket before they are read")
+            err_console.print(" • Or set `paths.input_path` to a local directory containing the BCL run folders")
+            sys.exit(1)
+        # nothing is staged, so the field names nowhere; keep it out of the run's recorded config
+        GCS_DOWNLOAD_DEST = None
+
+    # Validate the FASTQ directory supplied with --fastqs. Skipped for a staged bare --fastqs, whose
+    # directory does not exist yet; everything else is checked here, before any stage runs.
+    if FASTQ_INPUT is not None and not STAGE_FASTQ_INPUT:
+        # A bare --fastqs makes `input_path` the only source of the reads, and therefore mandatory.
+        # Report it here, where the reason is obvious, rather than letting the generic input_path
+        # error below suggest passing the very flag that was just used.
+        if FASTQ_INPUT == FASTQS_USE_INPUT_PATH:
+            if INPUT_PATH is None or not str(INPUT_PATH).strip():
+                err_console.print("[bold red]\\[ERROR][/bold red]: --fastqs was given without a directory, so `paths.input_path` must point at the FASTQs -- but it is not set")
+                err_console.print("Troubleshooting:")
+                err_console.print(" • Set `paths.input_path` to the directory holding the .fastq.gz files")
+                err_console.print(" • Or name the directory on the command line instead: `--fastqs /path/to/fastqs`")
+                sys.exit(1)
+            FASTQ_INPUT = INPUT_PATH
+            source = "`paths.input_path`"
+        else:
+            source = "--fastqs"
+
+        FASTQ_INPUT = Path(FASTQ_INPUT)
+        if not FASTQ_INPUT.is_dir():
+            err_console.print(f"[bold red]\\[ERROR][/bold red]: the FASTQ directory from {source} is not a directory or does not exist: {FASTQ_INPUT}")
+            err_console.print("Troubleshooting:")
+            err_console.print(" • Check the path for typos and that it is readable")
+            err_console.print(" • --fastqs expects a directory of .fastq.gz files, not an individual FASTQ file")
+            sys.exit(1)
+        if not any(FASTQ_INPUT.rglob('*.fastq.gz')):
+            err_console.print(f"[bold red]\\[ERROR][/bold red]: no .fastq.gz files found in the FASTQ directory from {source}: {FASTQ_INPUT}")
+            err_console.print("Troubleshooting:")
+            err_console.print(" • Check that the FASTQs are gzipped (cellranger requires .fastq.gz, not plain .fastq)")
+            err_console.print(" • Omit --fastqs to demultiplex BCLs from `input_path` instead")
+            sys.exit(1)
+
+    if INPUT_PATH is None or not Path(INPUT_PATH).is_dir():
+        # with --fastqs the reads are already demultiplexed, so no BCL run folder is required;
+        # point INPUT_PATH at the FASTQ directory so the remaining consumers of it (the Flex
+        # cellranger-multi samplesheet, log messages) still resolve to the real input
+        if FASTQ_INPUT is not None:
+            INPUT_PATH = Path(FASTQ_INPUT)
+        else:
+            err_console.print(f"[bold red]\\[ERROR][/bold red]: invalid entry for the `input_path` field in the configfile: {INPUT_PATH}")
+            err_console.print("Troubleshooting:")
+            err_console.print(" • Check that `input_path` is set to a valid directory path containing input BCL run folders")
+            err_console.print(" • Alternatively, pass a directory of already-demultiplexed FASTQs with --fastqs")
+            err_console.print(" • If the run folders live in a bucket, pass --stage-gcs and set `input_path` to that prefix")
+            sys.exit(1)
+    else:
+        INPUT_PATH = Path(INPUT_PATH)
+
     # find current git branch name
     try:
         branch = subprocess.check_output(
@@ -913,13 +1022,15 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         summary.write(f"  Output bucket:        {OUTPUT_BUCKET}\n")
         summary.write(f"  Stage inputs from GCS:{'  yes' if STAGE_GCS else '  no'}\n")
         if STAGE_GCS:
+            summary.write(f"  Input (GCS):          {INPUT_BUCKET}\n")
+            summary.write(f"  Staged into:          {GCS_DOWNLOAD_DEST}\n")
             summary.write(f"  Reference (GCS):      {REF_PATH}\n")
             summary.write(f"  Pucks (GCS):          {PUCK_PATH}\n")
             summary.write(f"  Raw barcodes (GCS):   {RAW_BARCODES_PATH}\n")
             if is_gcs_path(SOFTWARE_PATH):
                 summary.write(f"  Software (GCS):       {SOFTWARE_PATH}\n")
         if applied_overrides:
-            summary.write(f"  Path overrides:       {', '.join(applied_overrides)}\n")
+            summary.write(f"  Config overrides:     {', '.join(applied_overrides)}\n")
         if metadata_override:
             summary.write(f"  Metadata override:    {metadata_override}\n")
         summary.write(f"  Metadata source:      {METADATA_SRC}\n")
@@ -974,7 +1085,7 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         logfile.write(_field("Metadata", source) + "\n")
         logfile.write(_field("Resources", f"{NUM_THREADS} cores · {MEM_SIZE} GB") + "\n")
         if STAGE_GCS:
-            logfile.write(_field("Staging", "inputs are downloaded from GCS") + "\n")
+            logfile.write(_field("Staging", f"{INPUT_BUCKET} → {GCS_DOWNLOAD_DEST}") + "\n")
         logfile.write(_field("Stages", ', '.join(REQUESTED_STAGES) or "none requested") + "\n")
         if SKIPPED_STAGES:
             logfile.write(_field("", f"(not requested: {', '.join(SKIPPED_STAGES)})") + "\n")
@@ -992,6 +1103,7 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         'output_path': OUTPUT_PATH,
         'input_path': INPUT_PATH,
         'fastq_input': FASTQ_INPUT,
+        'stage_fastq_input': STAGE_FASTQ_INPUT,
         'stage_gcs': STAGE_GCS,
         'script_path': SCRIPT_PATH,
         'metadata_path': METADATA_PATH,
@@ -1005,6 +1117,11 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         'ref_genome': REF_GENOME,
         'software_cache_file': SOFTWARE_CACHE_FILE,
         'auth_key_path': AUTH_KEY_PATH,
+        # the two halves of `paths.input_path` under --stage-gcs: the gs:// prefix to download from,
+        # and the local directory it lands in (which is what 'input_path' above is set to). Both None
+        # for a local run, where 'input_path' is the configured directory itself.
+        'input_bucket': INPUT_BUCKET,
+        'gcs_download_dest': GCS_DOWNLOAD_DEST,
         'output_bucket': OUTPUT_BUCKET,
         'num_threads': NUM_THREADS,
         'mem_size': MEM_SIZE,

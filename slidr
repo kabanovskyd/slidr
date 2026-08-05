@@ -17,16 +17,19 @@ Informational (these exit immediately and need no other flags):
   -h, --help            Print this message and exit
 
 Where inputs come from:
-  Staging location is configuration, not a flag. \`settings.input_bucket\` in
-  config/config.yaml names the GCS prefix the run stages from; the VM or compute
-  node is handed that location and downloads what it needs itself. --gcp always
-  stages (a fresh VM has nothing else); --slurm stages only when asked with
-  --stage-gcs.
+  Staging location is configuration, not a flag. \`paths.input_path\` in
+  config/config.yaml is dual-purpose: a local directory of run folders normally,
+  and the GCS prefix they are staged out of when staging. The VM or compute node
+  is handed that location and downloads what it needs itself. --gcp always stages
+  (a fresh VM has nothing else); --slurm stages only when asked with --stage-gcs.
 
   A --gcp run reads config.yaml, auth_key.json and the <BCL_ID> data folder from
   that prefix. A --slurm run takes only the data folder (and auth_key.json if it
   is there): it runs with config/config.yaml from this checkout, so there is no
   config to upload and no staged copy to drift from the file you just edited.
+
+  Staged data lands in \`settings.gcs_download_dest\`, or -- left unset -- under
+  the run's own directory at <output_path>/<BCL_ID>/data.
 
 GCP VM options:
   --project  PROJECT    GCP project (required for --gcp; no default)
@@ -70,9 +73,9 @@ Pipeline flags (passed through to workflow/main.py; short forms match its own):
                          run, overriding \`settings.metadata_source\`.
   --stage-gcs, -sg      Fetch this run's inputs from GCS rather than the local
                          filesystem: reference_path/puck_path/raw_barcodes_path
-                         for the pipeline, and -- under --slurm -- the config,
-                         auth key and sequencing data too. The location comes
-                         from \`settings.input_bucket\`. Implied by --gcp.
+                         for the pipeline, plus the run folders under
+                         \`paths.input_path\`, and -- under --slurm -- the auth
+                         key too. Implied by --gcp.
   --run-all, -ra        Run all pipeline components (default if no step flag given)
   --mkfastq, -mf        Run cellranger mkfastq only
   --count, -ct          Run cellranger count only
@@ -93,8 +96,9 @@ EOF
 
 # read a top-level scalar value for a key from config/config.yaml. Simple line-based parse
 # (first matching `key:` line, inline comment stripped, value trimmed) -- NOT a full YAML parser;
-# sufficient for slidr's flat scalar fields (input_bucket, threads, memory). Prints nothing if the
-# config file or key is absent.
+# sufficient for slidr's flat scalar fields (input_path, output_path, threads, memory). Each of those
+# names appears exactly once in the file, so which section it sits under does not have to be tracked.
+# Prints nothing if the config file or key is absent.
 read_config_scalar() {
     local key="$1" file="${2:-$LOCAL_CONFIG}" line
     [[ -f "$file" ]] || return 0
@@ -251,9 +255,10 @@ PROJECT=""
 ZONE="us-central1-a"
 MACHINE_TYPE="n1-standard-16"
 DISK_SIZE="200GB"
-# Where inputs are staged FROM always comes from `settings.input_bucket`: ./slidr only ever runs from
-# a checkout that has a config, and the VM / compute node is handed the location as a parameter. The
-# flags say *whether* to stage (--gcp implies it, --stage-gcs requests it), never where from.
+# Where inputs are staged FROM always comes from `paths.input_path`: ./slidr only ever runs from a
+# checkout that has a config, and the VM / compute node is handed the location as a parameter. The
+# flags say *whether* to stage (--gcp implies it, --stage-gcs requests it), never where from -- which
+# is also what makes it safe for that one field to mean a local directory the rest of the time.
 INPUT_GCS=""
 # set by --stage-gcs: intent to fetch this run's inputs from GCS rather than the local filesystem
 STAGE_GCS=""
@@ -358,9 +363,11 @@ fi
 # its own still runs the pipeline rather than silently doing nothing
 [[ -z "$STAGE_FLAG" ]] && SLIDR_ARGS+=(--run-all)
 
-# Resolve the GCS input prefix from the config. Trailing slashes are stripped because everything
-# downstream appends object names directly to it, and a GCS name containing '//' is a different object.
-INPUT_GCS="$(strip_trailing_slashes "$(read_config_scalar input_bucket)")"
+# Resolve the input location from the config. Under --gcp/--stage-gcs this is the GCS prefix to stage
+# from; for a local run it is a directory and nothing here reads it. Trailing slashes are stripped
+# because everything downstream appends object names directly to it, and a GCS name containing '//' is
+# a different object.
+INPUT_GCS="$(strip_trailing_slashes "$(read_config_scalar input_path)")"
 
 # Sanity-check the accelerator type before it reaches gcloud/sbatch. GCE accelerator names are
 # lowercase alphanumerics and hyphens (nvidia-tesla-t4, nvidia-l4, nvidia-a100-80gb), so anything
@@ -383,11 +390,23 @@ if [[ "$GCP" == true ]]; then
     # runs `gcloud storage cp "/config.yaml" ...` (fails), and self-deletes: a silent, costly no-op
     # instead of a clear local error.
     if [[ -z "$INPUT_GCS" ]]; then
-        echo "[ERROR]: \`settings.input_bucket\` is not set, so a --gcp run has nowhere to stage its inputs from" >&2
+        echo "[ERROR]: \`paths.input_path\` is not set, so a --gcp run has nowhere to stage its inputs from" >&2
         echo "Troubleshooting:" >&2
-        echo " • Set \`settings.input_bucket\` in ${LOCAL_CONFIG} to the GCS prefix holding this run's inputs" >&2
+        echo " • Set \`paths.input_path\` in ${LOCAL_CONFIG} to the GCS prefix holding this run's inputs" >&2
         echo " • That prefix must already hold config.yaml, auth_key.json and the ${BCL_ID} data folder -- upload them before launching" >&2
         echo " • The VM is handed this location as instance metadata and downloads everything else itself" >&2
+        exit 1
+    fi
+    # A --gcp run always stages, so this field has to be the bucket rather than a local directory --
+    # the VM has no filesystem of ours to point at. Caught here rather than on the VM, which would
+    # boot, fail to download its own config and self-delete.
+    if [[ "$INPUT_GCS" != gs://* ]]; then
+        echo "[ERROR]: --gcp needs \`paths.input_path\` to be a gs:// URL, but it is: '${INPUT_GCS}'" >&2
+        echo "Troubleshooting:" >&2
+        echo " • A fresh VM cannot see this machine's filesystem, so a --gcp run always stages from a bucket" >&2
+        echo " • Set \`paths.input_path\` in ${LOCAL_CONFIG} to the prefix holding config.yaml, auth_key.json and the ${BCL_ID} folder" >&2
+        echo " • Write the full URL including the scheme, e.g. gs://my-bucket/inputs" >&2
+        echo " • A local directory there is only valid for a run without --gcp/--stage-gcs" >&2
         exit 1
     fi
     if [[ -z "$PROJECT" ]]; then
@@ -402,11 +421,11 @@ if [[ "$GCP" == true ]]; then
     # so is --fastqs (via SLIDR_ARGS_STR); a ',' or '=' in any of them would silently split into
     # bogus metadata keys or truncate a value.
     if [[ "$BCL_ID" == *[,=]* || "$INPUT_GCS" == *[,=]* || "$FASTQ_DIR" == *[,=]* || "$METADATA_PATH" == *[,=]* ]]; then
-        echo "[ERROR]: --bcl, --fastqs, --metadata and \`settings.input_bucket\` must not contain ',' or '=' characters" >&2
+        echo "[ERROR]: --bcl, --fastqs, --metadata and \`paths.input_path\` must not contain ',' or '=' characters" >&2
         echo "Troubleshooting:" >&2
         echo " • These values are passed to the VM through GCE instance metadata, which is itself comma- and equals-delimited" >&2
         echo " • Rename the offending path or BCL folder to remove the character, then re-launch" >&2
-        echo " • Received: --bcl '${BCL_ID}' --fastqs '${FASTQ_DIR}' --metadata '${METADATA_PATH}', input_bucket '${INPUT_GCS}'" >&2
+        echo " • Received: --bcl '${BCL_ID}' --fastqs '${FASTQ_DIR}' --metadata '${METADATA_PATH}', input_path '${INPUT_GCS}'" >&2
         exit 1
     fi
 
@@ -468,7 +487,7 @@ elif [[ "$SLURM" == true ]]; then
 
     # A --slurm run stages its inputs from GCS only when --stage-gcs asks it to. Left off, the job
     # reads everything off the local filesystem exactly as before: whether a run is self-staging is
-    # stated by the flag, never guessed from whether input_bucket happens to be set in a config.
+    # stated by the flag, never guessed from whether `paths.input_path` happens to look like a bucket.
     SLURM_STAGE=""
     [[ "$STAGE_GCS" == true ]] && SLURM_STAGE=true
 
@@ -486,12 +505,12 @@ elif [[ "$SLURM" == true ]]; then
             exit 1
         }
         [[ "$INPUT_GCS" == gs://* ]] || {
-            echo "[ERROR]: --stage-gcs needs \`settings.input_bucket\` to be a gs:// URL, but it is: '${INPUT_GCS}'" >&2
+            echo "[ERROR]: --stage-gcs needs \`paths.input_path\` to be a gs:// URL, but it is: '${INPUT_GCS}'" >&2
             echo "Troubleshooting:" >&2
-            echo " • Set \`settings.input_bucket\` in ${LOCAL_CONFIG} to the prefix holding the ${BCL_ID} data folder" >&2
+            echo " • Set \`paths.input_path\` in ${LOCAL_CONFIG} to the prefix holding the ${BCL_ID} data folder" >&2
             echo " • Write the full URL including the scheme, e.g. gs://my-bucket/inputs" >&2
             echo " • A --slurm run needs no config.yaml in the bucket: it runs with ${LOCAL_CONFIG} from this checkout" >&2
-            echo " • To read inputs off this cluster's own filesystem instead, drop --stage-gcs and set the paths in config/config.yaml" >&2
+            echo " • To read inputs off this cluster's own filesystem instead, drop --stage-gcs and point \`paths.input_path\` at a local directory" >&2
             exit 1
         }
 
@@ -522,7 +541,7 @@ elif [[ "$SLURM" == true ]]; then
         echo "[ERROR]: --workdir applies to staged runs only; add --stage-gcs too" >&2
         echo "Troubleshooting:" >&2
         echo " • --workdir configures where inputs are staged *to*, so it only means something once there is something to stage" >&2
-        echo " • Add \`--stage-gcs\` to turn this into a self-staging run (the location comes from \`settings.input_bucket\`)" >&2
+        echo " • Add \`--stage-gcs\` to turn this into a self-staging run (the location comes from \`paths.input_path\`)" >&2
         echo " • Or drop it: without --stage-gcs the job reads everything off the local filesystem, as configured in config/config.yaml" >&2
         exit 1
     fi

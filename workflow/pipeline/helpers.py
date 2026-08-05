@@ -735,6 +735,46 @@ def _dir_has_read_pair(
     return any('_R1_' in n for n in names) and any('_R2_' in n for n in names)
 
 
+def _library_complete(
+    library_dir: Path,
+    sample_row,
+    index_column: str,
+    merge_column: str,
+    split_token: str
+) -> bool:
+    """
+    True if every BCL contributing one of a sample's libraries has been demultiplexed into
+    `library_dir`.
+
+    Which read pairs to expect is stated by the metadata rather than guessed from the directory: a
+    primary `index_column` means mkfastq produces a pair whose filenames lack `split_token`, and a
+    `merge_column` means it produces one carrying it. A sample may declare either or both -- a
+    library sequenced entirely on a merged-in run has a blank primary index (see
+    `Merge ... From BCL` / `Add ... Index` in the metadata reference) -- so demanding a pair the
+    metadata never asked for would leave the sample permanently incomplete, re-running mkfastq on
+    every invocation with no amount of demultiplexing able to satisfy it.
+
+    A row declaring neither has no library of this kind to demultiplex at all. That is reported as
+    nothing-to-do rather than never-satisfiable, leaving it to the required-inputs check in
+    `need_run_module` to name the missing reads against the stage that actually needs them.
+
+    Inputs:
+     - library_dir:  mkfastq output folder for this library (mkfastq/<sample>[_sb]/)
+     - sample_row:   the sample's metadata row
+     - index_column: metadata column naming the primary-BCL index ('RNA Index' / 'SB Index')
+     - merge_column: metadata column naming the merged-in BCL
+     - split_token:  filename token create_samplesheet gives the merged-in library
+    Output:
+     - True if every declared contributing BCL's read pair is present
+    """
+
+    if _row_declares(sample_row, index_column) and not _dir_has_read_pair(library_dir, exclude_token=split_token):
+        return False
+    if _row_declares(sample_row, merge_column) and not _dir_has_read_pair(library_dir, require_token=split_token):
+        return False
+    return True
+
+
 def _mkfastq_sample_complete(sample_row) -> bool:
     """
     True only if every BCL that contributes to this sample has been demultiplexed.
@@ -743,27 +783,23 @@ def _mkfastq_sample_complete(sample_row) -> bool:
     mkfastq/<sample>_sb/. When a sample merges reads from an additional BCL, create_samplesheet
     names that extra library <sample>_split_rna / <sample>_split_sb, so the merged FASTQs carry a
     '_split_rna' / '_split_sb' token in their filenames while the primary BCL's do not. Requiring
-    the primary read pair AND (when declared) each split read pair, in both the GEX and spatial
-    folders, ensures a split/multi-BCL sample is not treated as done as soon as just one BCL's
-    FASTQs appear.
+    each read pair the metadata declares, in both the GEX and spatial folders, ensures a
+    split/multi-BCL sample is not treated as done as soon as just one BCL's FASTQs appear -- see
+    _library_complete for why the primary pair is required only when a primary index is declared.
     """
     name = str(sample_row['Sample Name'])
     rna_dir = OUTPUT_PATH / 'mkfastq' / name
     sb_dir = OUTPUT_PATH / 'mkfastq' / f'{name}_sb'
 
-    # gene-expression library: primary-BCL reads always, plus the merged-in reads when declared
-    if not _dir_has_read_pair(rna_dir, exclude_token='_split_rna'):
-        return False
-    if _row_declares(sample_row, 'Merge RNA From BCL') and not _dir_has_read_pair(rna_dir, require_token='_split_rna'):
+    # gene-expression library
+    if not _library_complete(rna_dir, sample_row, 'RNA Index', 'Merge RNA From BCL', '_split_rna'):
         return False
 
     # spatial-barcode library: skipped for Flex chemistry, whose spatial barcodes are supplied as
     # external FASTQs (flex_spatial_R1/R2_path -> Trekker demux) rather than demultiplexed by
     # mkfastq, so mkfastq/<sample>_sb/ is never produced for Flex samples
     if not _is_flex(sample_row):
-        if not _dir_has_read_pair(sb_dir, exclude_token='_split_sb'):
-            return False
-        if _row_declares(sample_row, 'Merge Spatial From BCL') and not _dir_has_read_pair(sb_dir, require_token='_split_sb'):
+        if not _library_complete(sb_dir, sample_row, 'SB Index', 'Merge Spatial From BCL', '_split_sb'):
             return False
 
     return True

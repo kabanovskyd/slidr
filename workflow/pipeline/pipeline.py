@@ -524,18 +524,21 @@ def stage_input_data(bcl_ids: list[str]) -> None:
             log_write(f"  Input data for {bcl} already staged at {dest} (set RESTAGE=1 to re-download)")
             continue
 
-        # `gcloud storage cp -r SRC DEST` nests SRC under DEST when DEST already exists, which would
-        # land the run folder at <dest>/<bcl>/ where nothing looks for it; remove the leaf so the
-        # contents arrive directly. This also clears out a partial earlier download.
+        # `gcloud storage cp -r SRC DEST` requires DEST to be an existing directory and nests SRC
+        # under it as DEST/<leaf>. The source leaf here *is* <bcl>, so copying into dest.parent lands
+        # the run folder exactly at dest -- the same shape the reference genome and raw-barcode call
+        # sites rely on. Passing `dest` itself is what will not work: absent it is rejected outright
+        # ("Destination URL must name an existing directory"), and present it nests the run folder at
+        # <dest>/<bcl>/ where nothing looks for it.
         if dest.exists():
-            shutil.rmtree(dest)
+            shutil.rmtree(dest)  # clear out a partial earlier download
         dest.parent.mkdir(parents=True, exist_ok=True)
 
         log_write(f"  Staging input data for {bcl} from {INPUT_BUCKET}... ", terminator="")
         with console.status(f"  Staging input data for {bcl} (this can take a while)..."):
             stage_from_gcs(
                 f'{INPUT_BUCKET}/{bcl}',
-                dest,
+                dest.parent,
                 recursive=True,
                 description=f'the {bcl} input data'
             )

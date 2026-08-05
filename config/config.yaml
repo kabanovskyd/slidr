@@ -1,31 +1,23 @@
 # input and output paths
 paths:
   output_path:
-  input_path:         # root dir holding the BCL run folders (or FASTQs, with --fastqs). Under
-                      # --stage-gcs/--gcp this is instead the gs:// prefix they are staged from,
-                      # which for --gcp also holds config.yaml and auth_key.json
+  input_path:
   software_path:
   raw_barcodes_path:
   puck_path:
   reference_path:
-  auth_key_path:      # Google service account JSON key, needed only when metadata_source is a
-                      # Google Sheet. May be a local path or a gs:// object, which is downloaded
-                      # into the run's tmp/ directory (mode 600) when needed
+  auth_key_path:
 
 # run settings
 settings:
   memory: 50
   threads: 16
   metadata_source:
-  gcs_download_dest:  # local dir a staged run downloads `input_path` into. Unset, it defaults to
-                      # <output_path>/<BCL_ID>/data (kept out of output/, which is what gets
-                      # uploaded to output_bucket)
+  gcs_download_dest:
   output_bucket:
   reference_genome:
   alerts:
-  slack_token:    # where to find the Slack bot token: a local file path, or a gs:// object (read
-                  # straight from the bucket, never written to disk). Preferred over a literal token,
-                  # which would travel with this file as it gets copied and staged to buckets
+  slack_token:
 
 # workflow components and parameters
 workflow:

@@ -1,6 +1,5 @@
 # written by Daniel Kabanovsky at the Broad Institute with ❤️ for 🧬
 
-import subprocess
 import sys
 import time
 import pandas as pd
@@ -20,6 +19,7 @@ from pipeline.helpers import (
 )
 from pipeline.pipeline import (
     stage_input_data,
+    upload_outputs,
     run_mkfastq,
     write_metadata_to_file,
     create_samplesheet,
@@ -44,7 +44,6 @@ SPATIAL_ANALYSIS_OUTS = cfg['spatial_analysis_outs']
 SUMMARY_PATH = cfg['summary_path']
 SAMPLESHEET_PATH = cfg['samplesheet_path']
 SUMMARY_LOG = cfg['summary_log']
-OUTPUT_BUCKET = cfg['output_bucket']
 INPUT_BUCKET = cfg['input_bucket']
 FASTQ_INPUT = cfg['fastq_input']
 STAGE_FASTQ_INPUT = cfg['stage_fastq_input']
@@ -196,27 +195,8 @@ log_write([
 ])
 notify_complete(f"Analysis complete in {elapsed}! ✨")
 
-# upload outputs to GCS
-if OUTPUT_BUCKET is not None:
-    if not OUTPUT_BUCKET.startswith('gs://'):
-        OUTPUT_BUCKET = 'gs://' + OUTPUT_BUCKET
-    log_write(f'  Uploading the results to GCP: {OUTPUT_BUCKET}... ', terminator='')
-    try:
-        subprocess.run(
-            ['gcloud', 'storage', 'cp', '-r', f'{OUTPUT_PATH}', OUTPUT_BUCKET],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        log_write(' Done.')
-    except Exception as exc:
-        log_write(f'\n[WARNING]: Could not upload outputs to Google Cloud: {exc}')
-        log_write("Troubleshooting:")
-        log_write(" • Make sure gcloud is installed: `gcloud --version`")
-        log_write(f" • Make sure you are authenticated: `gcloud auth print-access-token`")
-        log_write(f" • If not, authenticate with `gcloud auth login`")
-        log_write(f" • Make sure the output bucket {OUTPUT_BUCKET.replace('gs://', '').split('/')[0]} exists: `gcloud storage buckets describe {OUTPUT_BUCKET.replace('gs://', '').split('/')[0]}`")
-        log_write(f" • Run the upload manually: `gcloud storage cp -r {OUTPUT_BUCKET}`")
+# upload outputs to GCS, into a folder named for this run rather than over an existing one
+upload_outputs()
 
 # end timer
 end_time = time.time()

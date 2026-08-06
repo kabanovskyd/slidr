@@ -593,6 +593,28 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         FLEX_R2_PATH = workflow.get('flex_spatial_R2_path')
         FLEX_GEX_FASTQS = workflow.get('flex_gex_fastqs')
 
+    # The exact bucket folder this run's results go to, when the caller has already chosen one.
+    #
+    # `settings.output_bucket` says which bucket; the folder inside it is normally decided at the end of
+    # the run by pipeline.unique_gcs_dest, which numbers around a name that is already taken. A --gcp run
+    # cannot work that way: ./slidr has to resolve the folder *before* creating the VM, because that is
+    # where it uploads the config.yaml the VM boots from. So it resolves it there and passes it down
+    # here, and the upload uses it verbatim rather than re-deciding and landing somewhere else.
+    #
+    # Environment-only and deliberately not a config field: it names one specific run's destination, so
+    # a value written into a config file would send every later run using that file to the same folder --
+    # the exact collision the numbering exists to prevent.
+    OUTPUT_DEST = os.environ.get('SLIDR_OUTPUT_DEST')
+    OUTPUT_DEST = OUTPUT_DEST.strip().rstrip('/') if OUTPUT_DEST and OUTPUT_DEST.strip() else None
+    if OUTPUT_DEST is not None:
+        if not is_gcs_path(OUTPUT_DEST):
+            err_console.print(f"[bold red]\\[ERROR][/bold red]: SLIDR_OUTPUT_DEST must be a gs:// URI naming the folder to upload results to, but is: {OUTPUT_DEST!r}")
+            err_console.print("Troubleshooting:")
+            err_console.print(" • This is normally set for you by ./slidr --gcp; unset it to let the run choose its own folder under `settings.output_bucket`")
+            err_console.print(" • Write the full URL including the scheme, e.g. gs://my-bucket/20240101_RUNID")
+            sys.exit(1)
+        applied_overrides.append("output destination <- SLIDR_OUTPUT_DEST")
+
     # --metadata overrides settings.metadata_source, so a one-off sheet or an exported TSV can be
     # used without editing the config file (and, on a --gcp/--slurm run, without re-staging it).
     # Applied before validation so the override is checked exactly like a configured value.
@@ -1020,6 +1042,8 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
             summary.write(f"  FASTQ input (--fastqs): {FASTQ_INPUT}\n")
         summary.write(f"  Output path:          {OUT_PATH}\n")
         summary.write(f"  Output bucket:        {OUTPUT_BUCKET}\n")
+        if OUTPUT_DEST is not None:
+            summary.write(f"  Upload to:            {OUTPUT_DEST}\n")
         summary.write(f"  Stage inputs from GCS:{'  yes' if STAGE_GCS else '  no'}\n")
         if STAGE_GCS:
             summary.write(f"  Input (GCS):          {INPUT_BUCKET}\n")
@@ -1123,6 +1147,9 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         'input_bucket': INPUT_BUCKET,
         'gcs_download_dest': GCS_DOWNLOAD_DEST,
         'output_bucket': OUTPUT_BUCKET,
+        # set only when the caller already chose the exact folder to upload to (./slidr --gcp); None
+        # otherwise, and the run picks a free folder under `output_bucket` itself
+        'output_dest': OUTPUT_DEST,
         'num_threads': NUM_THREADS,
         'mem_size': MEM_SIZE,
         'alerts': ALERTS,

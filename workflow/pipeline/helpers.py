@@ -380,42 +380,82 @@ def test_and_install_software(
             sys.exit(1)
 
 
-def _local_auth_key(auth_key_path) -> Path:
+def read_service_account_key(auth_key_path) -> dict:
     """
-    Return a local path to the service-account key, downloading it first if it lives in a bucket.
+    Return the parsed service-account key `paths.auth_key_path` names, without ever writing it to disk.
 
-    `paths.auth_key_path` may name a `gs://` object so the key never has to be copied onto every
-    machine that runs the pipeline (or staged alongside config.yaml for a --gcp run). The download
-    lands in the run's tmp directory with owner-only permissions and is removed with it, so the
-    credential is not left behind in the output tree.
+    A `gs://` value is read with `gcloud storage cat` and parsed in memory, so the credential exists
+    only for the life of the process. This replaces downloading it into the run's tmp directory: that
+    copy had to be created with the right mode, removed afterwards and kept out of the uploaded output
+    tree, and every one of those is a chance to leave a private key sitting on a shared filesystem or in
+    a bucket. Not writing it at all removes the class of mistake rather than guarding each instance, and
+    it is why neither launcher script stages a key file any more.
+
+    A local path is read as before -- a key already on the machine is not made safer by refusing to
+    open it.
+
+    Errors quote gcloud's stderr but never the object's contents: this function only ever handles a
+    credential, and an error message is the one place one could end up in a log that gets shared.
 
     Inputs:
      - auth_key_path: the configured value -- a local Path, or a gs:// URI string
     Output:
-     - a local Path to the key file
+     - the key as a dict, ready for Credentials.from_service_account_info
     """
 
     if not is_gcs_path(auth_key_path):
-        return Path(auth_key_path)
+        source = str(auth_key_path)
+        try:
+            payload = Path(auth_key_path).read_text()
+        except OSError as exc:
+            log_write(f"[ERROR]: could not read the service account key at {auth_key_path}: {exc}")
+            log_write("Troubleshooting:")
+            log_write(" • Check the file exists and this user can read it")
+            log_write(" • Or set `paths.auth_key_path` to a gs:// object holding the key, read without being downloaded")
+            sys.exit(1)
+    else:
+        source = str(auth_key_path)
+        cmd = ['gcloud', 'storage', 'cat', source]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+        except FileNotFoundError:
+            log_write(f"[ERROR]: `auth_key_path` is a gs:// URI but `gcloud` was not found on PATH, so the key cannot be read")
+            log_write("Troubleshooting:")
+            log_write(" • Install the Google Cloud CLI: https://cloud.google.com/sdk/docs/install")
+            log_write(" • On a cluster, check whether it needs loading first (e.g. `module load google-cloud-sdk`)")
+            log_write(" • Or point `paths.auth_key_path` at a local copy of the key instead")
+            sys.exit(1)
 
-    # 0o700 so the containing directory is no more readable than the key itself
-    dest_dir = TMP_PATH / 'auth'
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    os.chmod(dest_dir, 0o700)
-    dest = dest_dir / 'auth_key.json'
+        if proc.returncode != 0:
+            detail = (proc.stderr or '').strip().splitlines()
+            log_write(f"[ERROR]: could not read the service account key from {source} (`gcloud storage cat` exited {proc.returncode})")
+            for line in detail[-3:]:
+                log_write(f"  {line}")
+            log_write("Troubleshooting:")
+            log_write(f" • Check the object exists and is a single file, not a prefix: `gcloud storage ls {source}`")
+            log_write(" • Check the active account can read it: `gcloud auth print-access-token`")
+            log_write(" • Or point `paths.auth_key_path` at a local copy of the key instead")
+            sys.exit(1)
 
-    log_write(f"  Staging the service account key from {auth_key_path}...", terminal=False)
-    stage_from_gcs(auth_key_path, dest, description='service account key')
+        payload = proc.stdout
 
-    if not dest.is_file():
-        log_write(f"[ERROR]: the service account key was not downloaded to {dest}")
+    try:
+        info = json.loads(payload)
+    except ValueError as exc:
+        log_write(f"[ERROR]: the service account key at {source} is not valid JSON: {exc}")
         log_write("Troubleshooting:")
-        log_write(f" • Check the object is a single file, not a prefix: `gcloud storage ls {auth_key_path}`")
-        log_write(" • Or set `paths.auth_key_path` to a local copy of the key instead")
+        log_write(" • The key must be the JSON file downloaded from IAM & Admin → Service Accounts → Keys")
+        log_write(" • A .p12 key will not work here; create a JSON one instead")
         sys.exit(1)
 
-    os.chmod(dest, 0o600)
-    return dest
+    if not isinstance(info, dict) or 'client_email' not in info:
+        log_write(f"[ERROR]: the file at {source} is not a service-account key (no `client_email` field)")
+        log_write("Troubleshooting:")
+        log_write(" • An OAuth client-secret file will not work here -- the key must be a *service account* key")
+        log_write(" • Create one under IAM & Admin → Service Accounts → Keys in the Google Cloud console")
+        sys.exit(1)
+
+    return info
 
 
 def load_metadata(
@@ -449,18 +489,19 @@ def load_metadata(
             "https://www.googleapis.com/auth/drive"
         ]
 
-        # authenticate and create a Google Sheet client
-        auth_key = _local_auth_key(AUTH_KEY_PATH)
+        # Authenticate and create a Google Sheet client. The key is parsed in memory rather than read
+        # from a file gspread is handed, so a gs:// key never lands on this machine's disk.
+        key_info = read_service_account_key(AUTH_KEY_PATH)
+        service_account = key_info.get('client_email', '(unknown)')
         try:
-            creds = Credentials.from_service_account_file(auth_key, scopes=SCOPES)
+            creds = Credentials.from_service_account_info(key_info, scopes=SCOPES)
             client = gspread.Client(auth=creds)
         except Exception as exc:
             log_write(f"[ERROR]: could not authorize Google Cloud account with credentials from {AUTH_KEY_PATH}: {exc}")
             log_write("Troubleshooting:")
-            log_write(f" • Check the key is a service-account JSON key: `python -c 'import json;print(json.load(open(\"{auth_key}\"))[\"client_email\"])'`")
-            log_write(" • An OAuth client-secret file will not work here -- the key must be a *service account* key")
-            log_write(" • Create one under IAM & Admin → Service Accounts → Keys in the Google Cloud console")
-            log_write(" • For a --gcp/--slurm run, check auth_key.json was staged to the --input prefix alongside config.yaml")
+            log_write(f" • The key parsed as a service-account key for {service_account}, so it is the credential itself that was rejected")
+            log_write(" • Check the key has not been deleted or disabled under IAM & Admin → Service Accounts → Keys")
+            log_write(" • Check the Google Sheets and Google Drive APIs are enabled for the service account's project")
             sys.exit(1)
 
         # open the Google Sheet
@@ -469,7 +510,7 @@ def load_metadata(
         except Exception as exc:
             log_write(f"[ERROR]: could not open Google Sheet with provided URL ({input_source}): {exc}")
             log_write("Troubleshooting:")
-            log_write(f" • Share the sheet with the service account's email address (the `client_email` field in {auth_key}), with at least Viewer access")
+            log_write(f" • Share the sheet with the service account's email address ({service_account}), with at least Viewer access")
             log_write(" • Check `settings.metadata_source` is the full sheet URL, copied from the browser address bar")
             log_write(" • Check the Google Sheets and Google Drive APIs are enabled for the service account's project")
             sys.exit(1)

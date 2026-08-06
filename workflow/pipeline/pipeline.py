@@ -65,6 +65,8 @@ RAW_BARCODES_PATH = cfg['raw_barcodes_path']
 PUCK_PATH = cfg['puck_path']
 REF_PATH = cfg['ref_path']
 INPUT_BUCKET = cfg['input_bucket']
+OUTPUT_BUCKET = cfg['output_bucket']
+OUTPUT_DEST = cfg['output_dest']
 SUMMARY_PATH = cfg['summary_path']
 SUMMARY_LOG = cfg['summary_log']
 REF_GENOME = cfg['ref_genome']
@@ -538,6 +540,154 @@ def stage_input_data(bcl_ids: list[str]) -> None:
                 description=f'the {bcl} input data'
             )
         log_write("Done.")
+
+
+def gcs_dest_taken(uri: str) -> bool:
+    """
+    True if `uri` already names something in the bucket -- an object or a prefix with contents.
+
+    Used to keep an upload from landing on top of an earlier run's results. `gcloud storage ls` exits
+    non-zero with "matched no objects" for a free name, which is the signal wanted here; any *other*
+    failure (no such bucket, no permission, no credentials) says nothing about whether the name is
+    free, so it is reported and treated as free -- the upload that follows fails for the same reason
+    moments later, with gcloud's own diagnosis, rather than being silently renamed around a problem
+    that has nothing to do with collisions.
+
+    Inputs:
+     - uri: gs:// URI to test
+    Output:
+     - True if the name is already in use
+    """
+
+    cmd = ['gcloud', 'storage', 'ls', uri]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        log_write("[WARNING]: `gcloud` was not found on PATH, so the output bucket could not be checked for existing results")
+        return False
+
+    if proc.returncode == 0:
+        return bool((proc.stdout or '').strip())
+
+    # gcloud's wording for "nothing there", which is the one non-zero exit that is not a problem
+    stderr = (proc.stderr or '').lower()
+    if 'matched no objects' in stderr or 'not found' in stderr:
+        return False
+
+    detail = (proc.stderr or proc.stdout or '').strip().splitlines()
+    log_write(f"[WARNING]: could not check whether {uri} already exists (`{' '.join(cmd)}` exited {proc.returncode})")
+    for line in detail[-3:] or ['(no output)']:
+        log_write(f"  {line}")
+    log_write("  Uploading to that location anyway; anything already there may be overwritten")
+    return False
+
+
+def unique_gcs_dest(base: str, attempts: int = 100) -> str:
+    """
+    First unused variant of `base`: `base` itself when the bucket has nothing there, else `base_2`,
+    `base_3`, and so on.
+
+    This is what keeps a re-run of a BCL from overwriting the results of the earlier one. Numbering
+    rather than replacing is deliberate: an upload is the last thing a run does, hours of compute after
+    the point where a mistake could still be corrected, and the pipeline cannot tell a deliberate
+    re-run from an accidental second launch of the same BCL. Keeping both and letting the operator
+    delete one is recoverable; overwriting is not.
+
+    Two things it is honestly not: an exclusive claim -- two runs finishing at the same moment can
+    resolve to the same free name, since GCS offers no way to reserve a prefix -- and a merge, so a
+    re-run of a single stage uploads to a new folder holding only what that run produced rather than
+    updating the complete set next to it.
+
+    Inputs:
+     - base:     gs:// URI the results would go to if nothing were in the way
+     - attempts: how many numbered variants to try before falling back to a timestamp
+    Output:
+     - a gs:// URI that was unused when checked
+    """
+
+    if not gcs_dest_taken(base):
+        return base
+
+    for suffix in range(2, attempts + 1):
+        candidate = f'{base}_{suffix}'
+        if not gcs_dest_taken(candidate):
+            return candidate
+
+    # Reaching here means 100 numbered folders are already in the bucket, which is far likelier to be
+    # a misconfigured output_bucket than a hundredth re-run -- but the results still have to go
+    # somewhere, and a timestamp needs no further probing to be distinct.
+    return f"{base}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+
+def upload_outputs() -> None:
+    """
+    Copy this run's `output/` tree to `settings.output_bucket` once the run has succeeded.
+
+    The destination is `<output_bucket>/<BCL_ID>`, so results are identifiable in a bucket that
+    collects more than one run, and `unique_gcs_dest` moves it to `<BCL_ID>_2` (then `_3`, ...) rather
+    than writing over a folder that is already there.
+
+    A `--gcp` run is the one case where the folder is not chosen here. `./slidr` has to resolve it
+    before creating the VM, since that is where it uploads the config.yaml the VM boots from, and it
+    passes the answer down as `SLIDR_OUTPUT_DEST`. Re-deciding here would ignore that and put the
+    results somewhere other than beside their own config — and would in fact always pick the *next*
+    name, because the config sitting there makes the folder look taken.
+
+    The copy names the contents of `output/` as its sources rather than `output/` itself, with a
+    trailing slash on the destination. Both of those tell gcloud the destination is a container to place
+    the sources in; `cp -r output <dest>` would instead depend on whether `<dest>` happens to exist
+    already — writing output/'s contents as `<dest>` when it does not, and nesting them at
+    `<dest>/output/` when it does. Under `SLIDR_OUTPUT_DEST` it always does exist, since the launcher
+    just put a config.yaml there, so leaving that to chance would put the results one level deeper than
+    a locally-resolved run's.
+
+    Only `output/` is uploaded, as before: `data/` holds staged sequencing reads that came out of a
+    bucket in the first place, and `log/`, `metadata/` and `tmp/` stay on the machine that ran the job.
+
+    Output:
+     - none; a failure is a warning, since the outputs themselves are already on local disk
+    """
+
+    if OUTPUT_DEST is None and (OUTPUT_BUCKET is None or not str(OUTPUT_BUCKET).strip()):
+        return
+
+    entries = sorted(OUTPUT_PATH.iterdir()) if OUTPUT_PATH.is_dir() else []
+    if not entries:
+        log_write(f"[WARNING]: nothing to upload to {OUTPUT_DEST or OUTPUT_BUCKET} — {run_relative(OUTPUT_PATH)} is empty")
+        return
+
+    bucket = gcs_uri(OUTPUT_DEST or OUTPUT_BUCKET)
+    if OUTPUT_DEST is not None:
+        dest, base = bucket, bucket
+    else:
+        base = f'{bucket}/{BCL_ID}'
+        dest = unique_gcs_dest(base)
+    if dest != base:
+        log_write(f"  {base} already holds results, so this run is uploaded alongside them rather than over them")
+
+    log_write(f'  Uploading the results to GCP: {dest}... ', terminator='')
+
+    # sources are output/'s contents and the destination carries a trailing slash: see the docstring
+    cmd = ['gcloud', 'storage', 'cp', '-r'] + [str(entry) for entry in entries] + [f'{dest}/']
+    try:
+        with console.status("  Uploading the results (this can take a while)..."):
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            # surface gcloud's own last words rather than a bare exit code, which is undiagnosable
+            detail = (proc.stderr or proc.stdout or '').strip().splitlines()
+            raise RuntimeError(f"`gcloud storage cp` exited {proc.returncode}: {detail[-1] if detail else '(no output)'}")
+        log_write(' Done.')
+        log_write(f"  Outputs uploaded to:  {dest}", SUMMARY_LOG, terminal=False)
+    except Exception as exc:
+        bucket_name = bucket.replace('gs://', '').split('/')[0]
+        log_write(f'\n[WARNING]: Could not upload outputs to Google Cloud: {exc}')
+        log_write("Troubleshooting:")
+        log_write(" • Make sure gcloud is installed: `gcloud --version`")
+        log_write(" • Make sure you are authenticated: `gcloud auth print-access-token`")
+        log_write(" • If not, authenticate with `gcloud auth login`")
+        log_write(f" • Make sure the output bucket {bucket_name} exists: `gcloud storage buckets describe {bucket_name}`")
+        log_write(f" • The outputs are still on this machine at {OUTPUT_PATH}; run the upload manually:")
+        log_write(f"    `{' '.join(cmd)}`")
 
 
 def run_mkfastq() -> None:

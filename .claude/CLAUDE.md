@@ -18,13 +18,16 @@ Without `--gcp`, `./slidr` installs any missing local dependencies (`uv`, Minifo
 
 With `--gcp`, `./slidr` creates a GCE VM, passes your flags through as instance metadata, and streams its logs back via `watch_run.sh`.
 
-**Before running with `--gcp`**, the following must be uploaded manually to the GCS prefix named by `paths.input_path` — the pipeline never puts them there for you:
-- `config.yaml` — pipeline configuration
-- `auth_key.json` — Google service account key, needed only when `settings.metadata_source` is a Google Sheet
+**Before running with `--gcp`**, the sequencing data must be uploaded to the GCS prefix named by `paths.input_path` — the pipeline never puts it there for you:
 - `<BCL_ID>/` — the sequencing run folder
 - any further run folder named by a `Merge RNA From BCL` / `Merge Spatial From BCL` metadata column — see [Split-BCL runs](#split-bcl-runs)
 
-There is no built-in default and no command-line equivalent: set `paths.input_path` in your local `config/config.yaml` to that `gs://` prefix. `./slidr` reads it locally and passes the location to the VM as instance metadata; the VM downloads its own config and key from there, and the pipeline then downloads the run folders themselves into `settings.gcs_download_dest`.
+That is the whole list. Neither `config.yaml` nor `auth_key.json` is staged by hand any more:
+
+- **`config.yaml`** — `./slidr --gcp` uploads your local `config/config.yaml` to `<output_bucket>/<BCL_ID>/config.yaml` at launch and the VM boots from that copy, so the config a run uses is always the file you just edited. See [How the config reaches the VM](#how-the-config-reaches-the-vm).
+- **`auth_key.json`** — point `paths.auth_key_path` at a `gs://` object once. The pipeline reads it with `gcloud storage cat` at the moment it opens the metadata sheet, so the key is never written to the VM's disk. See [The service-account key](#the-service-account-key).
+
+There is no built-in default and no command-line equivalent: set `paths.input_path` in your local `config/config.yaml` to that `gs://` prefix. `./slidr` reads it locally and passes the location to the VM as instance metadata, and the pipeline downloads the run folders themselves into `settings.gcs_download_dest`.
 
 `paths.input_path` is dual-purpose, exactly like `reference_path`/`puck_path`/`raw_barcodes_path`: a local directory of run folders for a local run, and the bucket prefix they are staged out of when staging. Which one it is is decided by `--stage-gcs`/`--gcp`, never by the shape of the value — so a `gs://` value without the flag, or a local path with it, is a clear error rather than a silent misread.
 
@@ -244,7 +247,7 @@ those are. It drops blanks, this run's own BCL (there is no second run folder to
 
 ## config/config.yaml — field reference
 
-Edit this file locally and stage it to GCS (as `config.yaml`) before launching with `--gcp`.
+Edit this file locally. `--gcp` uploads it for you (see [How the config reaches the VM](#how-the-config-reaches-the-vm)); `--slurm` and local runs read it in place. There is no second copy to keep in a bucket.
 
 ```yaml
 paths:
@@ -253,7 +256,8 @@ paths:
                          # (so it is never nested twice)
   input_path:            # root dir containing BCL run folders (BCL_ID must be a subdirectory of this
                          # path), or -- under --stage-gcs/--gcp -- the gs:// prefix those folders are
-                         # staged out of, which for --gcp also holds config.yaml and auth_key.json.
+                         # staged out of. Run folders only: config.yaml and auth_key.json do not live
+                         # here (see below).
                          # Optional when running with --fastqs DIR, which then supplies the input instead
   software_path:         # directory scanned for Cellranger/bcl2fastq executables. May instead be a
                          # full gs:// prefix, which is downloaded to output/software/ on first use;
@@ -265,9 +269,10 @@ paths:
   reference_path:        # directory containing reference genome subdirectories; a gs:// path (or bare bucket name) when running with --gcp
   auth_key_path:         # Google service account JSON key. Required only when metadata_source is a
                          # Google Sheet -- a local .tsv/.csv run never reads it. May be a local path or
-                         # a gs:// object, downloaded to the run's tmp/ (mode 600) when needed.
-                         # `gcloud auth login` is NOT a substitute: the file is read directly, not
-                         # through Application Default Credentials
+                         # a gs:// object; the gs:// form is read with `gcloud storage cat` and parsed
+                         # in memory, never written to disk, and is REQUIRED under --gcp (a fresh VM has
+                         # no local key). `gcloud auth login` is NOT a substitute: the key is read
+                         # directly, not through Application Default Credentials
 
 settings:
   memory: 50             # GB allocated to Cellranger
@@ -281,7 +286,10 @@ settings:
                          # but a sibling of output/ rather than inside it, since output/ is what gets
                          # uploaded to output_bucket. Ignored by a local run.
                          # Overridable per host with SLIDR_GCS_DOWNLOAD_DEST
-  output_bucket:         # GCS bucket/prefix outputs are uploaded to after a run completes
+  output_bucket:         # GCS bucket/prefix outputs are uploaded to after a run completes. The run's
+                         # output/ tree lands in <output_bucket>/<BCL_ID>/, and a folder already there
+                         # is never overwritten -- the upload goes to <BCL_ID>_2, _3, ... instead
+                         # (`pipeline.unique_gcs_dest`). Unset, nothing is uploaded
   reference_genome:      # reference genome directory name under reference_path
   alerts: false          # send Slack alerts on errors/completion. Every alert is tagged with the
                          # run's BCL ID as a bold first line, so concurrent runs are distinguishable
@@ -377,20 +385,76 @@ Metadata must be provided as a Google Sheet or `.tsv`/`.csv` file with these col
 ```
 Local machine                  GCP
 ─────────────────              ──────────────────────────────────────────
-./slidr --gcp          ──→    creates VM from image slidr-vm-image6, passing
-  (writes .last_run)           input_path / bcl-id / flags as instance metadata
+./slidr --gcp
+  1. resolves the run folder   ──→  gs://<output_bucket>/<BCL_ID>   (or _2, _3, ...)
+  2. uploads config/config.yaml ──→  <that folder>/config.yaml
+  3. creates VM                ──→  from image slidr-vm-image6, passing input-gcs /
+     (writes .last_run)              bcl-id / config-gcs / output-dest / flags as
+                                     instance metadata
 watch_run.sh           ←──    VM runs workflow/bash/slidr_gcp.sh as startup script:
   (reads .last_run,             1. sets up the ops-agent so runtime.log reaches Cloud Logging
    streams Cloud Logging)       2. drops privileges to the `runner` user
                                 3. clones the `stable` branch of the repo
-                                4. downloads config.yaml + auth_key.json from input_path
+                                4. downloads config.yaml from config-gcs
+                                     (no auth key: a gs:// one is read with
+                                      `gcloud storage cat` when the sheet is opened)
                                 5. uv sync
                                 6. uv run python workflow/main.py --bcl ... <flags>
                                      main.py stages the run folders themselves out of
                                      paths.input_path, once the metadata says which
-                                7. gcloud storage cp results → settings.output_bucket
+                                7. gcloud storage cp results → output-dest
                                 8. self-deletes VM once idle (or on failure)
 ```
+
+### How the config reaches the VM
+
+`./slidr --gcp` uploads this checkout's `config/config.yaml` to the run's own results folder and hands
+the VM that object's URI as the `config-gcs` instance-metadata value; `slidr_gcp.sh` downloads it to
+`/slidr/config/config.yaml` before the pipeline starts. Nothing has to be put in a bucket by hand.
+
+The point is that there is only ever **one** config. Previously a copy lived at
+`<input_path>/config.yaml` and had to be re-uploaded after every edit; forget, and the VM silently ran
+with the stale copy while the local file said otherwise. Now the file the operator just edited is the
+file the VM boots from, and there is nothing to keep in sync.
+
+It goes into the results folder rather than a scratch prefix so each folder in the bucket records the
+configuration that produced it. That forces two things:
+
+- **`settings.output_bucket` is now required for `--gcp`**, and is checked at launch. It was already
+  required in practice — the VM self-deletes, so a run without it threw its results away.
+- **The results folder is resolved at launch, not at the end of the run.** `./slidr` runs the same
+  `<BCL_ID>` → `<BCL_ID>_2` → … probe as `pipeline.unique_gcs_dest` (`gcs_name_free` /
+  `unique_output_dest` in the launcher — the two must agree on what "already there" means), then passes
+  the answer down as the `output-dest` metadata value, which `slidr_gcp.sh` exports as
+  `SLIDR_OUTPUT_DEST`. `upload_outputs` uses that verbatim instead of re-deciding — by then the
+  config.yaml sitting in the folder would make it look taken, and the results would land in the *next*
+  folder, away from their own config.
+
+A side benefit: writing config.yaml into the folder claims the name, so two `--gcp` launches of one BCL
+cannot both resolve to it the way two locally-resolved runs finishing simultaneously can.
+
+Failures here cost nothing — the config upload happens *before* the VM is created, so an unwritable
+bucket is a local error rather than a booted instance that self-deletes.
+
+### The service-account key
+
+`paths.auth_key_path` may name a local file or a `gs://` object. The `gs://` form is read with
+`gcloud storage cat` and parsed in memory (`helpers.read_service_account_key`) at the moment the
+metadata sheet is opened — it is never written to disk.
+
+Neither launcher script stages a key file any more. `slidr_gcp.sh` used to download
+`<input_path>/auth_key.json` to `/slidr/auth_key.json`, and `slidr_slurm.sh` to `<workdir>/auth_key.json`
+with `SLIDR_AUTH_KEY_PATH` exported to match. Both were dropped: a downloaded key has to be created with
+the right mode, kept out of the uploaded output tree and cleaned up afterwards, and every one of those is
+a chance to leave a private key on a shared filesystem or in a bucket. Not writing it removes the class
+of mistake rather than guarding each instance.
+
+Two consequences:
+
+- **Under `--gcp` the field must be a `gs://` object** when the metadata source is a Google Sheet — a
+  fresh VM has no local key. `./slidr` checks this at launch rather than letting the VM boot and fail.
+- **A `--gcp` run with local `.tsv`/`.csv` metadata no longer needs a key at all.** The VM used to
+  `die` on a missing `<input_path>/auth_key.json` even for runs that never read one.
 
 Key GCP resources:
 - **Service account**: `slidr-runner@<project>.iam.gserviceaccount.com`
@@ -425,28 +489,26 @@ Submit node                       Compute node (inside the batch job)
 ─────────────────                 ──────────────────────────────────────────────
 ./slidr --slurm --stage-gcs ─→   workflow/bash/slidr_slurm.sh:
   reads config/config.yaml          1. checks gcloud is present and authenticated
-  to size the allocation and        2. downloads auth_key.json → workdir, if the
-  derive the workdir                   bucket has one (absence is not an error)
-  ensure_uv / ensure_conda          3. exports SLIDR_OUTPUT_PATH=<workdir>/outs
-  uv sync                           4. uv sync
-  sbatch slidr_slurm.sh             5. main.py --stage-gcs …  (no --config: the
-                                       checkout's config/config.yaml is used)
-                                    6. main.py stages every run folder the metadata
+  to size the allocation and        2. exports SLIDR_OUTPUT_PATH=<workdir>/outs
+  derive the workdir                3. uv sync
+  ensure_uv / ensure_conda          4. main.py --stage-gcs …  (no --config: the
+  uv sync                              checkout's config/config.yaml is used)
+  sbatch slidr_slurm.sh             5. main.py stages every run folder the metadata
                                        names out of paths.input_path, plus the
                                        reference genome, puck maps, raw barcodes and
                                        any gs:// software_path
-                                    7. main.py uploads outputs → settings.output_bucket
+                                    6. main.py uploads outputs → settings.output_bucket/<BCL_ID>
 ```
 
 Differences from the GCP path, all because there is no VM to own: the repo is not cloned (the job runs from the checkout it was submitted from), privileges are not dropped (Slurm already runs as the submitting user), and nothing self-deletes. Staging happens inside the job, not at submit time, so hundreds of GB never move through a shared login node. Sequencing data already staged is not re-downloaded — set `RESTAGE=1` to force it.
 
 The script itself no longer downloads the sequencing data: `paths.input_path` names the bucket prefix, and `main.py` fetches from it into `<workdir>/outs/<BCL_ID>/data`. That is what lets a split-BCL job fetch the run folders its metadata merges from — the script only ever knew the one BCL ID it was handed.
 
-**A Slurm run never stages `config.yaml`.** It runs with `config/config.yaml` from the checkout it was submitted from, and the bucket needs no copy. The GCP path still downloads one because a fresh VM has no checkout to read; a cluster job does, and that file is the one the submitter just edited — staging a copy written for another machine on top of it only let the two disagree. Two follow-on effects: a local config change takes effect on the next `sbatch` with nothing to re-upload, and the CPUs/memory requested from Slurm are read from the same file the job runs with, so the allocation cannot be sized off a different config than the run uses.
+**A Slurm run stages neither `config.yaml` nor a key.** It runs with `config/config.yaml` from the checkout it was submitted from, and the bucket needs no copy of it. The GCP path *uploads* one because a fresh VM has no checkout to read; a cluster job does, and that file is the one the submitter just edited — downloading a copy written for another machine on top of it only let the two disagree. Two follow-on effects: a local config change takes effect on the next `sbatch` with nothing to re-upload, and the CPUs/memory requested from Slurm are read from the same file the job runs with, so the allocation cannot be sized off a different config than the run uses. The key is not staged either — see [The service-account key](#the-service-account-key).
 
 | Flag | Applies to | Description |
 |---|---|---|
-| `--stage-gcs` | `--slurm` | Opt a Slurm run into reading `input_path` (and its reference/puck/barcode/software paths) as GCS locations and staging them. The key is staged if the bucket holds one; the config never is. Implied by `--gcp` |
+| `--stage-gcs` | `--slurm` | Opt a Slurm run into reading `input_path` (and its reference/puck/barcode/software paths) as GCS locations and staging them. Neither the config nor the auth key is ever staged. Implied by `--gcp` |
 | `--workdir PATH` | staged `--slurm` | Where outputs are written, and — by default — where inputs are staged beneath them. Rarely needed: defaults to the parent of `paths.output_path` in the config, then `$SCRATCH/slidr`, then `<repo>/slidr-work/<BCL_ID>`. The resolved value and its origin are printed at submit time |
 
 ### Pointing a config at the job's workdir
@@ -457,7 +519,7 @@ A staged Slurm job writes into a workdir that `config/config.yaml` cannot know a
 |---|---|---|
 | `paths.output_path` | `SLIDR_OUTPUT_PATH` | `<workdir>/outs` |
 | `settings.gcs_download_dest` | `SLIDR_GCS_DOWNLOAD_DEST` | not set by the script — the default puts staged data at `<workdir>/outs/<BCL_ID>/data`. Export it to stage onto a different filesystem |
-| `paths.auth_key_path` | `SLIDR_AUTH_KEY_PATH` | `<workdir>/auth_key.json` — **only if** a key was staged; otherwise the config's own value stands |
+| `paths.auth_key_path` | `SLIDR_AUTH_KEY_PATH` | not set by the script — nothing stages a key any more, so the config's own value always stands. Still honoured if you export it yourself |
 | `paths.software_path` | `SLIDR_SOFTWARE_PATH` | not set by the script — export it yourself, or point the config at a `gs://` prefix |
 | `paths.input_path` | `SLIDR_INPUT_PATH` | **not set by the script, and must not be**: under `--stage-gcs` this field is the `gs://` prefix to stage *from*, so pointing it at a local directory would leave the job with nothing to download. Where data lands is `gcs_download_dest`, above |
 
@@ -516,17 +578,43 @@ empty. A `.last_run` written before this (VM name only) still works — it just 
 │   └── software/                   # only when software_path is a gs:// prefix: Cellranger/bcl2fastq
 ├── data/<BCL>/                     # staged runs only: run folders downloaded from paths.input_path,
 │                                   #   one per BCL the run demultiplexes. NOT under output/ — see below
-└── tmp/                            # scratch; also holds auth/auth_key.json for a gs:// key.
-                                    #   Safe to delete after a run
+└── tmp/                            # scratch. Safe to delete after a run. Holds no credentials: a
+                                    #   gs:// auth key is read with `gcloud storage cat`, never written
 ```
 
 No single run contains every entry: the `flex/`, `multi_samplesheet.csv` and `takara_pipeline.log`
 entries appear only for Flex chemistry, `data/`/`reference/`/`pucks/`/`barcodes/` only when staging from
 GCS, and `software/` only when `paths.software_path` is a `gs://` prefix.
 
-`data/` is the only staged directory that sits outside `output/`, and the reason is the upload: on
-success `main.py` copies the whole of `output/` to `settings.output_bucket`, and `data/` holds raw inputs
-that came *out* of a bucket — hundreds of GB per run. Staging them under `output/` would send the entire
+### The upload to `settings.output_bucket`
+
+On success `pipeline.upload_outputs` copies the whole of `output/` — and nothing else — to
+`<output_bucket>/<BCL_ID>`, so a bucket collecting several runs says which is which. A folder already at
+that name is never written over: `unique_gcs_dest` asks the bucket what is there (`gcloud storage ls`)
+and moves to `<BCL_ID>_2`, `_3`, … , falling back to a timestamp suffix past 100. The upload is the last
+thing a run does, hours of compute after a mistake could still be caught, and nothing tells a deliberate
+re-run from an accidental second launch of the same BCL — deleting the folder you did not want is
+recoverable, overwriting is not.
+
+Two honest limits: it is not a lock (two runs finishing together can resolve to the same free name; GCS
+cannot reserve a prefix), and it is not a merge, so a single-stage re-run uploads a folder holding only
+that stage's outputs rather than updating the complete set beside it. The complete set is the local run
+directory.
+
+A `--gcp` run does not resolve the folder here at all — `./slidr` resolved it before creating the VM, in
+order to put config.yaml in it, and passed it down as `SLIDR_OUTPUT_DEST` (`cfg['output_dest']`), which
+is used verbatim. That also closes the first limit above for `--gcp`, since writing the config claims the
+name. See [How the config reaches the VM](#how-the-config-reaches-the-vm).
+
+The copy names the *contents* of `output/` as its sources, with a trailing slash on the destination —
+both of which tell gcloud the destination is a container to place them in. `cp -r output <dest>` would
+instead depend on whether `<dest>` exists: contents-as-`<dest>` when it does not, nested at
+`<dest>/output/` when it does (the rule `stage_input_data` relies on downloading). Under
+`SLIDR_OUTPUT_DEST` it always does exist, since the launcher just put a config.yaml there, so leaving it
+to chance would bury a `--gcp` run's results one level deeper than everyone else's.
+
+`data/` is the only staged directory that sits outside `output/`, and the reason is that upload: `data/`
+holds raw inputs that came *out* of a bucket — hundreds of GB per run. Staging them under `output/` would send the entire
 sequencing run straight back to GCS every time a run finished. Keeping them a sibling means the run is
 still self-contained (nothing is written outside its own directory, which is all a fresh VM or a cluster
 job can count on) without that cost. `settings.gcs_download_dest` moves them off this filesystem
@@ -553,7 +641,7 @@ entirely, e.g. onto cluster scratch.
 | `workflow/bash/slidr_gcp.sh` | VM startup script (runs inside the VM) |
 | `workflow/bash/slidr_slurm.sh` | Slurm batch payload: stages inputs from GCS, then runs the pipeline (runs on the compute node) |
 | `watch_run.sh` | Re-attaches to a running VM's log stream |
-| `config/config.yaml` | Pipeline configuration (must be staged to GCS as `config.yaml` before GCP runs) |
+| `config/config.yaml` | Pipeline configuration. Read in place by local and `--slurm` runs; uploaded to the run's output folder by `--gcp`, which the VM then boots from |
 | `workflow/main.py` | Top-level pipeline orchestration |
 | `workflow/pipeline/config.py` | Argument parsing + config loading |
 | `workflow/pipeline/pipeline.py` | Stage implementations (mkfastq, count, cellbender, spatial) |
@@ -589,8 +677,14 @@ On first run, slidr scans `software_path` for Cellranger, bcl2fastq, and Julia, 
 - **Missing reference genome when staging**: set `paths.reference_path` to a `gs://` location (or a bare bucket path — `gs://` is prepended automatically) — the pipeline will `gcloud storage cp` the `settings.reference_genome` subdirectory from there if it isn't already staged under `output/reference/`.
 - **Puck file not found**: when staging, `paths.puck_path` must be a `gs://` location — the pipeline downloads `<puck_id>.csv` from it; if that object is absent it falls back to copying the corresponding raw barcodes from `paths.raw_barcodes_path` and generating the puck locally, and only errors if `raw_barcodes_path` is unset too.
 - **`could not stage ... from GCS`**: `gcloud`'s own stderr is echoed under the message, along with the exact command that failed. Check the object exists (`gcloud storage ls <uri>`) and that the active account can read the bucket (`gcloud auth print-access-token`).
+- **`settings.output_bucket` is not set, so a --gcp run has nowhere to put its config or its results**: `--gcp` uploads `config/config.yaml` there for the VM to boot from, so the field is now required rather than optional. It always mattered — the VM self-deletes, so a run without it discarded everything it produced.
+- **`could not upload the config to ...`**: raised by `./slidr` before any VM exists, so it costs nothing. Usually no write access to `settings.output_bucket`; gcloud's own error is printed above the hints.
+- **Results uploaded to `<BCL_ID>_2` instead of `<BCL_ID>`**: working as intended — `<output_bucket>/<BCL_ID>` already held a folder, and the run was put beside it rather than over it. To reclaim the plain name, delete the old folder (`gcloud storage rm -r gs://<output_bucket>/<BCL_ID>`) before re-running. Note the suffixed folder holds only what *that* run produced, so a single-stage re-run does not carry the other stages' outputs with it.
+- **`could not check whether ... already exists`**: `gcloud storage ls` on the destination failed for a reason other than "nothing there" — usually no credentials or no read access to the bucket. The upload proceeds to the unsuffixed name anyway (an unreadable bucket is normally an unwritable one too, so the `cp` fails moments later with gcloud's own diagnosis), which does mean the collision check was not made: check `gcloud auth print-access-token` and the account's read access before trusting the destination.
+- **`Could not upload outputs to Google Cloud`**: a warning, not a failure — the run's outputs are on local disk and the message ends with the exact `gcloud storage cp` to re-run by hand. On a `--gcp` run that hand is on a clock: the VM self-deletes after a ~30-minute idle window (`WAIT_MINUTES` in `slidr_gcp.sh`), and takes the outputs with it.
 - **`gcloud is not on PATH` on a cluster**: many clusters ship the CLI as a module — `module load google-cloud-sdk` (or equivalent) before submitting. `./slidr --slurm --stage-gcs` also checks this at submit time so the job doesn't fail minutes later.
-- **Google Sheets auth failure**: verify `auth_key_path` points to a valid *service account* JSON key (an OAuth client-secret file will not work), and that the sheet is shared with the key's `client_email`. `gcloud auth login` is not a substitute — the file is read directly. A `gs://` value is downloaded to the run's `tmp/auth/` first. If the metadata is a local `.tsv`/`.csv`, the key is not needed at all.
+- **Google Sheets auth failure**: verify `auth_key_path` points to a valid *service account* JSON key (an OAuth client-secret file will not work — the error names the missing `client_email` field), and that the sheet is shared with the key's `client_email`, which the error quotes. `gcloud auth login` is not a substitute — the key is read directly. A `gs://` value is read with `gcloud storage cat`, so check the *active gcloud account* can read that object even though the key inside it is a different identity. If the metadata is a local `.tsv`/`.csv`, no key is needed at all.
+- **`auth_key_path` must be a gs:// object for a --gcp run**: the key is no longer copied onto the VM, so a local path names a file that does not exist there. Upload the key once, point the field at it, and the pipeline reads it straight out of the bucket when it opens the sheet. `./slidr` raises this at launch, before a VM is created.
 - **Slack alerts not arriving**: `settings.slack_token` may be a local file path, a `gs://` object or the literal token; a path-shaped value that does not resolve is a hard error rather than being tried as a token. The bot needs `users:read.email` (to map the `Email` column to a user) and `chat:write`. A token file that is group- or world-readable produces a warning.
 - **Cellranger version not found**: `test_and_install_software` matches an install directory named `cellranger[-_v]<version>` exactly, so a `V8` in the `Cellranger` column is expanded via `helpers.CELLRANGER_VERSIONS`. If your site has a different patch release, edit that table — an unmapped value is passed through as written. The separator between name and version may be any run of `-`, `_` or `v` (`cellranger-8.0.1`, `cellranger_8.0.1`, `cellranger-v8.0.1`), but there must be at least one: a bare `cellranger8.0.1` does not match. The match is exact at both ends, so `cellranger-8.0.11` and `cellranger-8.0.1-beta` are not picked up for `8.0.1`.
 - **Software staged from GCS but nothing found**: the scan looks under `output/software/` once `paths.software_path` is a `gs://` prefix. Check the objects exist (`gcloud storage ls <software_path>`), and that the prefix holds the install *directories* themselves — the contents of the prefix are copied in, so `<software_path>/cellranger-8.0.1/bin/cellranger` becomes `output/software/cellranger-8.0.1/bin/cellranger`. Execute bits are restored automatically after the download, since `gcloud storage cp` does not preserve them.

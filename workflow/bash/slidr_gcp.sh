@@ -44,6 +44,18 @@ BCL_ID=$(meta bcl-id) || die \
     "could not read the \`bcl-id\` instance metadata value" \
     "This VM was not created by ./slidr, or was created without --metadata bcl-id=..." \
     "Launch the run with \`./slidr --bcl <BCL_ID> --gcp\` rather than creating the VM by hand"
+# The config object ./slidr uploaded from its own checkout, and the bucket folder this run's results go
+# to. ./slidr resolves that folder before creating the VM -- it writes config.yaml into it, which both
+# stakes a claim on the name and puts the config beside the results it produced -- and hands it over
+# here so the pipeline uploads exactly there instead of re-deciding and picking a different folder.
+CONFIG_GCS=$(meta config-gcs) || die \
+    "could not read the \`config-gcs\` instance metadata value" \
+    "This VM was not created by ./slidr, or was created by a version that expected config.yaml to be uploaded by hand" \
+    "Launch the run with \`./slidr --bcl <BCL_ID> --gcp\` rather than creating the VM by hand"
+OUTPUT_DEST=$(meta output-dest) || die \
+    "could not read the \`output-dest\` instance metadata value" \
+    "This VM was not created by ./slidr, or was created without --metadata output-dest=..." \
+    "Launch the run with \`./slidr --bcl <BCL_ID> --gcp\` rather than creating the VM by hand"
 # `./slidr` (the producer) builds this metadata value with `printf '%q'` per
 # argument before embedding it, so every element is already shell-escaped -
 # eval here just reverses that encoding to rebuild the array, it does not
@@ -102,6 +114,8 @@ runuser -u "${RUNNER_USER}" -- env \
   HOME="/home/${RUNNER_USER}" \
   INPUT="${INPUT}" \
   BCL_ID="${BCL_ID}" \
+  CONFIG_GCS="${CONFIG_GCS}" \
+  SLIDR_OUTPUT_DEST="${OUTPUT_DEST}" \
   PATH="/home/${RUNNER_USER}/.local/bin:/opt/miniforge3/bin:/home/${RUNNER_USER}/.juliaup/bin:${PATH}" \
   bash -s -- "${SLIDR_ARGS[@]}" <<'RUNNER_SCRIPT'
 set -euo pipefail
@@ -120,7 +134,7 @@ die() {
 }
 
 echo "Cloning the slidr git repository..."
-git clone -b stable https://github.com/kabanovskyd/slidr.git /slidr || die \
+git clone https://github.com/kabanovskyd/slidr.git /slidr || die \
     "could not clone the slidr repository" \
     "The VM pulls the \`stable\` branch at boot, so it needs outbound access to github.com" \
     "Check the VM's network (vpc1 / my-subnet-central) allows egress, via Cloud NAT or an external IP" \
@@ -130,26 +144,29 @@ cd /slidr
 # The sequencing data is deliberately NOT copied here. Which run folders this run needs is stated by
 # the metadata -- a split-BCL sample merges reads from further BCLs via `Merge RNA/Spatial From BCL` --
 # and nothing outside the pipeline reads that metadata, so this script could only ever fetch the one
-# BCL ID it was handed. pipeline.stage_input_data does the whole job instead, out of the same ${INPUT}
+# BCL ID it was handed. pipeline.stage_input_data does the whole job instead, out of the ${INPUT}
 # prefix (it is `paths.input_path` in the config downloaded just below), into the run's own directory,
 # and only if a stage actually needs the reads.
 #
-# What is left here is the bootstrap that must happen before the pipeline exists: its own config, and
-# the key it reads the metadata sheet with.
-echo "Staging config and auth key..."
+# What is left here is the one bootstrap step that must happen before the pipeline exists: its config.
+# ./slidr uploaded this checkout's own config/config.yaml to ${CONFIG_GCS} at launch, so the file below
+# is the one the operator just edited rather than a second copy kept in a bucket by hand -- there is
+# nothing to keep in sync and nothing to forget to re-upload. It sits in the run's output folder, which
+# is also where this run's results are uploaded, so each folder records the config that produced it.
+#
+# The service-account key is deliberately NOT staged. `paths.auth_key_path` in that config names a
+# gs:// object, and the pipeline reads it with `gcloud storage cat` at the moment it opens the metadata
+# sheet (helpers.read_service_account_key) -- so a private key is never written to this VM's disk, and
+# a run whose metadata is a local .tsv/.csv (which needs no key at all) no longer fails here for the
+# want of a file it will not read.
+echo "Staging config..."
 mkdir -p /slidr/config
-gcloud storage cp "${INPUT}/config.yaml" /slidr/config/config.yaml || die \
-    "could not download ${INPUT}/config.yaml" \
-    "config.yaml must be uploaded to the \`paths.input_path\` prefix by hand before launching" \
-    "Check the object exists: \`gcloud storage ls ${INPUT}/\`" \
-    "Check \`paths.input_path\` names the prefix holding config.yaml, not the bucket root" \
-    "Check the slidr-runner service account has Storage Object Viewer on that bucket"
-gcloud storage cp "${INPUT}/auth_key.json" /slidr/auth_key.json || die \
-    "could not download ${INPUT}/auth_key.json" \
-    "auth_key.json must be uploaded to the \`paths.input_path\` prefix by hand before launching" \
-    "This is the Google service-account key the pipeline reads its metadata sheet with" \
-    "Check the object exists: \`gcloud storage ls ${INPUT}/\`"
-chmod 600 /slidr/auth_key.json
+gcloud storage cp "${CONFIG_GCS}" /slidr/config/config.yaml || die \
+    "could not download ${CONFIG_GCS}" \
+    "./slidr uploads config/config.yaml here at launch, so this normally means the object was deleted since" \
+    "Check the object exists: \`gcloud storage ls ${CONFIG_GCS}\`" \
+    "Check the slidr-runner service account has Storage Object Viewer on that bucket" \
+    "Re-launch with \`./slidr --bcl ${BCL_ID} --gcp\` to upload it again"
 
 echo "Launching slidr..."
 uv sync || die \

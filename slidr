@@ -23,10 +23,13 @@ Where inputs come from:
   is handed that location and downloads what it needs itself. --gcp always stages
   (a fresh VM has nothing else); --slurm stages only when asked with --stage-gcs.
 
-  A --gcp run reads config.yaml, auth_key.json and the <BCL_ID> data folder from
-  that prefix. A --slurm run takes only the data folder (and auth_key.json if it
-  is there): it runs with config/config.yaml from this checkout, so there is no
-  config to upload and no staged copy to drift from the file you just edited.
+  Both read the <BCL_ID> data folder from that prefix, and nothing else: no
+  config.yaml or auth_key.json has to be put in a bucket by hand. A --slurm run
+  uses config/config.yaml from this checkout directly; a --gcp run uploads that
+  same file to <output_bucket>/<BCL_ID>/config.yaml and the VM boots from it, so
+  the config a run uses is always the one you just edited. A gs:// value for
+  \`paths.auth_key_path\` is read straight out of the bucket when the metadata
+  sheet is opened, never written to the machine's disk.
 
   Staged data lands in \`settings.gcs_download_dest\`, or -- left unset -- under
   the run's own directory at <output_path>/<BCL_ID>/data.
@@ -135,8 +138,8 @@ canonical_flag() {
 # Strip every trailing slash from a GCS prefix.
 #
 # Everything downstream builds object URIs by appending directly to this prefix
-# ("${INPUT}/config.yaml", "${INPUT}/${BCL_ID}"), and GCS object names are literal strings: the name
-# `in//config.yaml` is a *different* object than `in/config.yaml`, so a trailing slash would make
+# ("${INPUT}/${BCL_ID}", "${OUTPUT_BUCKET}/${BCL_ID}/config.yaml"), and GCS object names are literal
+# strings: `in//run1` is a *different* object than `in/run1`, so a trailing slash would make
 # every staging copy fail to find its input. This mirrors the normalization gcs_uri() applies to the
 # `paths.*` fields on the Python side. A loop rather than "${value%/}" because that removes only one
 # slash, leaving `inputs//` -- the very form that breaks -- still broken.
@@ -369,6 +372,61 @@ fi
 # a different object.
 INPUT_GCS="$(strip_trailing_slashes "$(read_config_scalar input_path)")"
 
+# Where results go, and -- for --gcp -- where this checkout's config.yaml is uploaded so the VM can boot
+# from it. Only --gcp reads this; a local or Slurm run leaves the whole question to the pipeline.
+OUTPUT_BUCKET="$(strip_trailing_slashes "$(read_config_scalar output_bucket)")"
+
+# Report whether a gs:// name is unused. Mirrors pipeline.gcs_dest_taken, which the pipeline itself uses
+# at the end of a run; both have to agree on what "already there" means or a --gcp run would resolve its
+# results folder differently from a local or Slurm one.
+#
+# Exit 0 = free. A non-zero `gcloud storage ls` is only good news when it says "nothing there"; any
+# other failure (no credentials, no read access) says nothing about whether the name is free, so it is
+# reported and the name is treated as free. Nothing is lost by that here: the very next thing the caller
+# does is write the config into this folder, which fails loudly for the same reason.
+gcs_name_free() {
+    local uri="$1" out rc=0
+    out="$(gcloud storage ls "$uri" 2>&1)" || rc=$?
+
+    # A zero exit with output means the name is in use; a zero exit with none means an empty listing,
+    # which only a placeholder object produces. Written as explicit returns rather than falling through
+    # on the `[[ ]]` status so `set -e` cannot act on it if this is ever called outside an `if`.
+    if [[ $rc -eq 0 ]]; then
+        [[ -z "${out//[[:space:]]/}" ]] && return 0
+        return 1
+    fi
+    case "$out" in
+        *"matched no objects"*|*"not found"*) return 0 ;;
+    esac
+
+    echo "[WARNING]: could not check whether ${uri} already exists (\`gcloud storage ls\` exited ${rc})" >&2
+    echo "${out}" | tail -3 | sed 's/^/  /' >&2
+    echo "  Treating the name as unused; the config upload below will fail if the bucket is unreadable" >&2
+    return 0
+}
+
+# First unused folder for a run's results: <bucket>/<BCL_ID>, else <BCL_ID>_2, _3, ... This is the same
+# rule as pipeline.unique_gcs_dest, applied here because a --gcp run needs the answer *before* the VM
+# exists -- the config the VM boots from is uploaded into that folder, which both puts it beside the
+# results it produced and stakes a claim on the name.
+unique_output_dest() {
+    local base="$1" candidate suffix
+    if gcs_name_free "$base"; then
+        printf '%s' "$base"
+        return
+    fi
+    for (( suffix = 2; suffix <= 100; suffix++ )); do
+        candidate="${base}_${suffix}"
+        if gcs_name_free "$candidate"; then
+            printf '%s' "$candidate"
+            return
+        fi
+    done
+    # 100 numbered folders already present is far likelier to be a misconfigured output_bucket than a
+    # hundredth re-run, but the run still needs somewhere to go and a timestamp needs no further probing
+    printf '%s_%s' "$base" "$(date +%Y%m%d_%H%M%S)"
+}
+
 # Sanity-check the accelerator type before it reaches gcloud/sbatch. GCE accelerator names are
 # lowercase alphanumerics and hyphens (nvidia-tesla-t4, nvidia-l4, nvidia-a100-80gb), so anything
 # else is a typo -- and catching it here beats a VM-creation failure minutes later, or (on Slurm) a
@@ -384,17 +442,27 @@ fi
 
 if [[ "$GCP" == true ]]; then
 
-    # Fail fast, before creating a billable VM, if the inputs it needs are missing. A fresh VM has no
+    # Fail fast, before creating a billable VM, if the locations it needs are missing. A fresh VM has no
     # filesystem of ours at all, so --gcp always stages -- there is no non-staging mode to fall back to
-    # and hence no flag to opt in with. Without this check an empty prefix produces a VM that boots,
-    # runs `gcloud storage cp "/config.yaml" ...` (fails), and self-deletes: a silent, costly no-op
-    # instead of a clear local error.
+    # and hence no flag to opt in with. Without these checks a bad config produces a VM that boots, fails
+    # to find its own inputs, and self-deletes: a silent, costly no-op instead of a clear local error.
+    #
+    # The config file comes first because every check below reads it: a --gcp run no longer merely
+    # consults it for a few values, it uploads the file itself for the VM to boot from.
+    if [[ ! -f "$LOCAL_CONFIG" ]]; then
+        echo "[ERROR]: no config file at ${LOCAL_CONFIG}, and a --gcp run uploads that file for the VM to boot from" >&2
+        echo "Troubleshooting:" >&2
+        echo " • Restore it from the repository (\`git checkout config/config.yaml\`) and fill in the fields for your site" >&2
+        echo " • It is read here for \`paths.input_path\` and \`settings.output_bucket\`, then uploaded as-is" >&2
+        exit 1
+    fi
     if [[ -z "$INPUT_GCS" ]]; then
         echo "[ERROR]: \`paths.input_path\` is not set, so a --gcp run has nowhere to stage its inputs from" >&2
         echo "Troubleshooting:" >&2
         echo " • Set \`paths.input_path\` in ${LOCAL_CONFIG} to the GCS prefix holding this run's inputs" >&2
-        echo " • That prefix must already hold config.yaml, auth_key.json and the ${BCL_ID} data folder -- upload them before launching" >&2
-        echo " • The VM is handed this location as instance metadata and downloads everything else itself" >&2
+        echo " • That prefix must already hold the ${BCL_ID} data folder -- upload it before launching" >&2
+        echo " • config.yaml is not uploaded by hand any more: ${LOCAL_CONFIG} is copied to the run's output folder at launch" >&2
+        echo " • The VM is handed these locations as instance metadata and downloads everything else itself" >&2
         exit 1
     fi
     # A --gcp run always stages, so this field has to be the bucket rather than a local directory --
@@ -404,9 +472,45 @@ if [[ "$GCP" == true ]]; then
         echo "[ERROR]: --gcp needs \`paths.input_path\` to be a gs:// URL, but it is: '${INPUT_GCS}'" >&2
         echo "Troubleshooting:" >&2
         echo " • A fresh VM cannot see this machine's filesystem, so a --gcp run always stages from a bucket" >&2
-        echo " • Set \`paths.input_path\` in ${LOCAL_CONFIG} to the prefix holding config.yaml, auth_key.json and the ${BCL_ID} folder" >&2
+        echo " • Set \`paths.input_path\` in ${LOCAL_CONFIG} to the prefix holding the ${BCL_ID} run folder" >&2
         echo " • Write the full URL including the scheme, e.g. gs://my-bucket/inputs" >&2
         echo " • A local directory there is only valid for a run without --gcp/--stage-gcs" >&2
+        exit 1
+    fi
+    # The config the VM boots from is this checkout's own, uploaded into the folder the run's results go
+    # to -- so `settings.output_bucket` is what a --gcp run is launched *from*, not just where it ends up.
+    # It was already required in practice: the VM self-deletes, so without it a run threw its results away.
+    if [[ -z "$OUTPUT_BUCKET" ]]; then
+        echo "[ERROR]: \`settings.output_bucket\` is not set, so a --gcp run has nowhere to put its config or its results" >&2
+        echo "Troubleshooting:" >&2
+        echo " • Set \`settings.output_bucket\` in ${LOCAL_CONFIG} to a GCS bucket or prefix you can write to" >&2
+        echo " • ${LOCAL_CONFIG} is uploaded to <output_bucket>/${BCL_ID}/config.yaml at launch, and the VM boots from that copy" >&2
+        echo " • The VM self-deletes when it finishes, so this is also the only place its results survive" >&2
+        exit 1
+    fi
+    if [[ "$OUTPUT_BUCKET" == /* || "$OUTPUT_BUCKET" == '~'* ]]; then
+        echo "[ERROR]: --gcp needs \`settings.output_bucket\` to be a GCS location, but it is a local path: '${OUTPUT_BUCKET}'" >&2
+        echo "Troubleshooting:" >&2
+        echo " • A fresh VM cannot see this machine's filesystem, and it self-deletes when it finishes" >&2
+        echo " • Write it as gs://my-bucket/results, or as a bare my-bucket/results" >&2
+        exit 1
+    fi
+    # A Google Sheet metadata source needs the service-account key, and the VM reads it straight out of
+    # the bucket rather than having one staged onto its disk -- so a local path here names a file that
+    # will not exist there. Caught now because the alternative is a VM that boots, fails to open the
+    # sheet and self-deletes. `--metadata` can override the source, so only complain when the config's
+    # own value is a sheet and no override was passed.
+    CONFIG_METADATA_SRC="$(read_config_scalar metadata_source)"
+    CONFIG_AUTH_KEY="$(read_config_scalar auth_key_path)"
+    EFFECTIVE_METADATA_SRC="${METADATA_PATH:-$CONFIG_METADATA_SRC}"
+    if [[ "$EFFECTIVE_METADATA_SRC" == *docs.google.com/spreadsheets* && -n "$CONFIG_AUTH_KEY" \
+          && "$CONFIG_AUTH_KEY" != gs://* ]]; then
+        echo "[ERROR]: \`paths.auth_key_path\` must be a gs:// object for a --gcp run reading its metadata from a Google Sheet, but is: '${CONFIG_AUTH_KEY}'" >&2
+        echo "Troubleshooting:" >&2
+        echo " • Upload the key once and point the field at it: \`auth_key_path: gs://my-bucket/secrets/auth_key.json\`" >&2
+        echo " • The pipeline reads it with \`gcloud storage cat\` when it opens the sheet, so it is never written to the VM's disk" >&2
+        echo " • A local path cannot work: the VM is created fresh and has no copy of this machine's filesystem" >&2
+        echo " • Or export the metadata to a .tsv/.csv in the bucket and pass it with --metadata, which needs no key at all" >&2
         exit 1
     fi
     if [[ -z "$PROJECT" ]]; then
@@ -417,20 +521,65 @@ if [[ "$GCP" == true ]]; then
         echo " • The project must have a \`slidr-runner\` service account and the slidr-vm-image6 VM image" >&2
         exit 1
     fi
-    # BCL_ID/INPUT_GCS are embedded into gcloud's comma/equals-delimited --metadata value below, and
-    # so is --fastqs (via SLIDR_ARGS_STR); a ',' or '=' in any of them would silently split into
-    # bogus metadata keys or truncate a value.
-    if [[ "$BCL_ID" == *[,=]* || "$INPUT_GCS" == *[,=]* || "$FASTQ_DIR" == *[,=]* || "$METADATA_PATH" == *[,=]* ]]; then
-        echo "[ERROR]: --bcl, --fastqs, --metadata and \`paths.input_path\` must not contain ',' or '=' characters" >&2
+    # BCL_ID/INPUT_GCS/OUTPUT_BUCKET are embedded into gcloud's comma/equals-delimited --metadata value
+    # below, and so is --fastqs (via SLIDR_ARGS_STR); a ',' or '=' in any of them would silently split
+    # into bogus metadata keys or truncate a value.
+    if [[ "$BCL_ID" == *[,=]* || "$INPUT_GCS" == *[,=]* || "$OUTPUT_BUCKET" == *[,=]* || "$FASTQ_DIR" == *[,=]* || "$METADATA_PATH" == *[,=]* ]]; then
+        echo "[ERROR]: --bcl, --fastqs, --metadata, \`paths.input_path\` and \`settings.output_bucket\` must not contain ',' or '=' characters" >&2
         echo "Troubleshooting:" >&2
         echo " • These values are passed to the VM through GCE instance metadata, which is itself comma- and equals-delimited" >&2
         echo " • Rename the offending path or BCL folder to remove the character, then re-launch" >&2
-        echo " • Received: --bcl '${BCL_ID}' --fastqs '${FASTQ_DIR}' --metadata '${METADATA_PATH}', input_path '${INPUT_GCS}'" >&2
+        echo " • Received: --bcl '${BCL_ID}' --fastqs '${FASTQ_DIR}' --metadata '${METADATA_PATH}', input_path '${INPUT_GCS}', output_bucket '${OUTPUT_BUCKET}'" >&2
         exit 1
     fi
 
+    command -v gcloud >/dev/null 2>&1 || {
+        echo "[ERROR]: --gcp needs the gcloud CLI, but it is not on PATH" >&2
+        echo "Troubleshooting:" >&2
+        echo " • Install the Google Cloud CLI: https://cloud.google.com/sdk/docs/install" >&2
+        echo " • It is needed to upload the config, create the VM and stream its logs back" >&2
+        exit 1
+    }
+
     SERVICE_ACCOUNT="slidr-runner@${PROJECT}.iam.gserviceaccount.com"
     VM_NAME="slidr-run-$(date +%s)-${RANDOM}"
+
+    # --------------------------------------------------------------------------------------- #
+    #        resolve the run's output folder, and seed it with the config the VM boots from     #
+    # --------------------------------------------------------------------------------------- #
+    #
+    # This is what removes the old manual step. config.yaml used to have to be uploaded to
+    # `paths.input_path` by hand, which meant a second copy of the file living in a bucket: edit the
+    # local one and the VM silently ran with the stale bucket copy, and the two had no reason to ever
+    # agree. Now the file the operator just edited *is* the file the VM boots from.
+    #
+    # It goes into the run's own results folder rather than a launch-staging area, so each folder in the
+    # bucket records the configuration that produced it. Resolving that folder here rather than letting
+    # the run do it at the end has two further effects worth knowing:
+    #   - writing config.yaml into it claims the name, so two --gcp launches of one BCL cannot both
+    #     resolve to the same folder the way two locally-resolved runs finishing together can
+    #   - the pipeline must be told the answer (SLIDR_OUTPUT_DEST, via instance metadata) instead of
+    #     re-deciding, since by then the config sitting there makes the folder look taken
+    OUTPUT_BUCKET_URI="$OUTPUT_BUCKET"
+    [[ "$OUTPUT_BUCKET_URI" == gs://* ]] || OUTPUT_BUCKET_URI="gs://${OUTPUT_BUCKET_URI}"
+    OUTPUT_DEST="$(unique_output_dest "${OUTPUT_BUCKET_URI}/${BCL_ID}")"
+    CONFIG_GCS="${OUTPUT_DEST}/config.yaml"
+
+    if [[ "$OUTPUT_DEST" != "${OUTPUT_BUCKET_URI}/${BCL_ID}" ]]; then
+        echo "${OUTPUT_BUCKET_URI}/${BCL_ID} already holds results; this run will use ${OUTPUT_DEST}"
+    fi
+
+    echo "Uploading ${LOCAL_CONFIG} to ${CONFIG_GCS}..."
+    gcloud storage cp "$LOCAL_CONFIG" "$CONFIG_GCS" || {
+        echo "[ERROR]: could not upload the config to ${CONFIG_GCS}, so the VM would have nothing to boot from" >&2
+        echo "Troubleshooting:" >&2
+        echo " • gcloud's own error is above -- it names the real cause" >&2
+        echo " • Check you are authenticated: \`gcloud auth print-access-token\`" >&2
+        echo " • Check the bucket exists and you can write to it: \`gcloud storage ls ${OUTPUT_BUCKET_URI}\`" >&2
+        echo " • Check \`settings.output_bucket\` in ${LOCAL_CONFIG} names a bucket you have Storage Object Admin on" >&2
+        echo " • No VM was created, so this costs nothing to retry" >&2
+        exit 1
+    }
 
     # Serialize the SLIDR_ARGS array into a single shell-quoted string so it
     # survives the round-trip through GCE instance metadata (a flat string)
@@ -455,7 +604,7 @@ if [[ "$GCP" == true ]]; then
         # this just stops a minted token from also carrying access to every
         # other API (BigQuery, Pub/Sub, IAM, etc.) that account could reach.
         --scopes=storage-rw,compute-rw,logging-write,monitoring-write
-        --metadata=input-gcs="${INPUT_GCS}",bcl-id="${BCL_ID}",slidr-args="${SLIDR_ARGS_STR}"
+        --metadata=input-gcs="${INPUT_GCS}",bcl-id="${BCL_ID}",config-gcs="${CONFIG_GCS}",output-dest="${OUTPUT_DEST}",slidr-args="${SLIDR_ARGS_STR}"
         --metadata-from-file=startup-script="${SCRIPT_DIR}/workflow/bash/slidr_gcp.sh"
     )
 
@@ -476,6 +625,8 @@ if [[ "$GCP" == true ]]; then
 
     echo ""
     echo "VM launched: ${VM_NAME}"
+    echo "Config:      ${CONFIG_GCS}"
+    echo "Results:     ${OUTPUT_DEST}"
     echo "Pipeline continues running if you disconnect. Reattach with: ./watch_run.sh"
     echo ""
 
@@ -599,10 +750,9 @@ elif [[ "$SLURM" == true ]]; then
     # independently of this shell; --parsable makes sbatch print just the job ID.
     echo "Submitting slidr to Slurm (sbatch ${SBATCH_OPTS[*]})"
     if [[ "$SLURM_STAGE" == true ]]; then
-        # Staged run: hand off to workflow/bash/slidr_slurm.sh, which downloads the sequencing data
-        # (and auth_key.json if the bucket has one) before running the pipeline with this checkout's
-        # config. Staging happens inside the job rather than here so hundreds of GB do not move
-        # through a shared login node.
+        # Staged run: hand off to workflow/bash/slidr_slurm.sh, which runs the pipeline with this
+        # checkout's config and lets it fetch its own inputs. Staging happens inside the job rather than
+        # here so hundreds of GB do not move through a shared login node.
         # sbatch exports the submitting environment by default (--export=ALL), which is how these
         # reach the compute node.
         export INPUT="$INPUT_GCS"

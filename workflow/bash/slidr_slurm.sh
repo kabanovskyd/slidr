@@ -21,8 +21,9 @@
 # Submitted by ./slidr --slurm --stage-gcs ; not intended to be run by hand. Inputs arrive as
 # environment variables (sbatch exports the submitting environment by default):
 #
-#   INPUT           GCS prefix holding auth_key.json, if the bucket has one. The sequencing data comes
-#                   from the same prefix, but the pipeline fetches that itself -- see below
+#   INPUT           GCS prefix the run's inputs come from (`paths.input_path`). Logged for the record
+#                   only: nothing here downloads from it, because the pipeline reads the same field out
+#                   of the config and fetches its own inputs -- see below
 #   BCL_ID          BCL run ID
 #   SLIDR_WORKDIR   directory on cluster storage to write outputs to (and stage into, by default)
 #   SLIDR_REPO      path to the slidr checkout to run
@@ -105,7 +106,6 @@ log "gcloud credentials OK ($(gcloud config get-value account 2>/dev/null || ech
 #                                     stage the inputs                                    #
 # --------------------------------------------------------------------------------------- #
 
-AUTH_KEY="${SLIDR_WORKDIR}/auth_key.json"
 OUT_DIR="${SLIDR_WORKDIR}/outs"
 
 mkdir -p "$SLIDR_WORKDIR" "$OUT_DIR" || die \
@@ -114,21 +114,13 @@ mkdir -p "$SLIDR_WORKDIR" "$OUT_DIR" || die \
     "Point --workdir at scratch you own, e.g. /scratch/\${USER}/slidr/${BCL_ID}" \
     "Check your quota and the filesystem's free space: \`df -h ${SLIDR_WORKDIR}\`"
 
-# The service-account key is staged when the bucket has one, but its absence is not fatal: the local
-# config this job runs with may already point `auth_key_path` at a key on cluster storage or at a gs://
-# object, and a run whose metadata is a local .tsv/.csv needs no key at all. Requiring one here would
-# force those users to upload a key nothing reads. When the download does succeed it wins, on the
-# grounds that a key placed in the run's own input prefix was put there for this job.
-log "Staging auth_key.json from ${INPUT} (optional)"
-if gcloud storage cp "${INPUT}/auth_key.json" "$AUTH_KEY" 2>/dev/null; then
-    chmod 600 "$AUTH_KEY"
-    export SLIDR_AUTH_KEY_PATH="$AUTH_KEY"
-    log "  Staged the service-account key to ${AUTH_KEY}"
-else
-    rm -f "$AUTH_KEY"
-    log "  No auth_key.json at ${INPUT} -- using \`paths.auth_key_path\` from the local config"
-    log "  (a Google Sheet metadata source needs a key there; a local .tsv/.csv needs none)"
-fi
+# The service-account key is deliberately NOT staged. `paths.auth_key_path` in the config this job runs
+# with points at either a key on cluster storage or a gs:// object, and the pipeline reads whichever it
+# is at the moment it opens the metadata sheet (helpers.read_service_account_key) -- a gs:// one with
+# `gcloud storage cat`, straight into memory. Downloading it here instead put a private key in the
+# workdir, which then had to be created with the right mode, kept out of the uploaded outputs and
+# cleaned up afterwards; not writing it at all removes all three. A run whose metadata is a local
+# .tsv/.csv needs no key and never reads the field.
 
 # The sequencing data is deliberately NOT staged here. Which run folders a job needs is stated by the
 # metadata -- a split-BCL sample merges reads from further BCLs via `Merge RNA/Spatial From BCL` --
@@ -144,8 +136,8 @@ fi
 # Point the run at this job's workdir. The checkout's config.yaml cannot know the workdir sbatch was
 # given, so that host-specific path is overridden in the environment (config.py's PATH_ENV_OVERRIDES)
 # rather than by rewriting the YAML. Everything else -- threads, memory, buckets, reference/puck/barcode
-# locations, metadata source -- comes from config/config.yaml as committed.
-# SLIDR_AUTH_KEY_PATH is exported above, but only if a key was actually staged.
+# locations, metadata source -- comes from config/config.yaml as committed. That includes
+# `paths.auth_key_path`: nothing is exported for it here, because nothing stages a key any more.
 #
 # SLIDR_INPUT_PATH is deliberately NOT set. Under --stage-gcs `paths.input_path` is the gs:// prefix to
 # stage *from*, so overriding it with a local directory would leave the job with nothing to download.

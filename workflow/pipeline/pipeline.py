@@ -32,6 +32,7 @@ from helpers import (
     ensure_conda_env,
     load_metadata,
     merge_bcls,
+    row_declares,
     resolve_bcl_dir,
     validate_bcl_dir,
     test_and_install_software,
@@ -405,9 +406,30 @@ def create_samplesheet() -> list[Path]:
     if metadata_df['Chemistry'].values[0] == 'Flex':
         return []
 
-    # format a samplesheet for cellranger mkfastq
+    # Format a samplesheet for cellranger mkfastq.
+    #
+    # A blank `RNA Index` is legitimate in exactly one case: a library sequenced entirely on a merged-in
+    # run declares no primary index and carries `Merge RNA From BCL` + `Add RNA Index` instead, so its
+    # one library belongs to that BCL's samplesheet further down rather than to this one. Writing a row
+    # here anyway would hand mkfastq an indexless line for the primary BCL, which bcl2fastq rejects. The
+    # same blank is why `_library_complete` does not require a primary read pair for such a sample, so
+    # `row_declares` is shared with it: the writer and the completeness check must agree on which
+    # libraries this samplesheet is expected to produce.
+    #
+    # A blank index with no merge column to explain it is a metadata mistake, and is worth stopping for
+    # rather than filtering: the row names no index in any run folder, so there is no gene-expression
+    # library to demultiplex at all. Skipping it quietly is the worse failure of the two -- the
+    # completeness check has no read pair to require either, so the sample counts as done, mkfastq is
+    # skipped, and cellranger fails hours later with nothing pointing back at the metadata. A --fastqs
+    # run is exempt: it never demultiplexes, and reads its library names off the FASTQ filenames.
     samplesheet_rows = []
+    indexless = []
     for _, row in metadata_df.iterrows():
+        if not row_declares(row, 'RNA Index'):
+            if FASTQ_INPUT is None and not row_declares(row, 'Merge RNA From BCL'):
+                indexless.append(str(row['Sample Name']))
+            # merge-only: written to the merged-in BCL's samplesheet below, not this one
+            continue
         lanes = str(row['Lane']).split(',')
         for lane in lanes:
             if lane == '':
@@ -415,12 +437,42 @@ def create_samplesheet() -> list[Path]:
             samplesheet_rows.append(row[['Lane', 'Sample Name', 'RNA Index']])
             samplesheet_rows[len(samplesheet_rows) - 1]['Lane'] = lane
 
-    samplesheet_df = pd.DataFrame(samplesheet_rows)
-    samplesheet_df.columns=['Lane', 'Sample', 'Index']
+    if indexless:
+        log_write("[ERROR]: these samples declare no gene-expression library to demultiplex — `RNA Index` is empty and no `Merge RNA From BCL` names another run to take the reads from:")
+        for name in indexless:
+            log_write(f"  • {name}")
+        log_write("Troubleshooting:")
+        log_write(" • Set `RNA Index` to the cellranger index the sample's RNA library carries in this run")
+        log_write(" • If that library was sequenced on a different run, leave `RNA Index` empty and set `Merge RNA From BCL` to that run's BCL ID and `Add RNA Index` to the index it carries there")
+        log_write(f" • Check the row belongs to this run at all — `Run` should be YES only for samples sequenced in {BCL_ID}")
+        log_write(" • If these reads are already demultiplexed, pass them with --fastqs, which needs no index")
+        sys.exit(1)
 
-    # check that every sample has an associated spatial barcodes field
-    spatial_barcodes = metadata_df[['Sample Name', 'SB Index', 'SB Lane']]
-    spatial_barcodes = spatial_barcodes[spatial_barcodes['SB Index'].notna() & (spatial_barcodes['SB Index'] != '')]
+    if samplesheet_rows:
+        samplesheet_df = pd.DataFrame(samplesheet_rows)
+        samplesheet_df.columns=['Lane', 'Sample', 'Index']
+    else:
+        # every gene-expression library is merge-only, so the primary BCL has no RNA row. Built with
+        # explicit columns because an empty DataFrame has none to rename, and mkfastq still needs the
+        # header -- the spatial libraries below, or the split samplesheets, carry the actual work.
+        samplesheet_df = pd.DataFrame(columns=['Lane', 'Sample', 'Index'])
+
+    # The spatial-barcode libraries, selected with the same predicate for the same reason. A blank
+    # `SB Index` is filtered rather than fatal: a merge-only spatial library legitimately has none, and
+    # the spatial stages are skippable in a way the gene-expression side is not. It is still named,
+    # since a typo looks identical here and would otherwise surface only when spatial-count found
+    # nothing to count.
+    declares_sb = [row_declares(row, 'SB Index') for _, row in metadata_df.iterrows()]
+    spatial_barcodes = metadata_df.loc[declares_sb, ['Sample Name', 'SB Index', 'SB Lane']]
+
+    no_spatial = [str(row['Sample Name']) for _, row in metadata_df.iterrows()
+                  if not row_declares(row, 'SB Index') and not row_declares(row, 'Merge Spatial From BCL')]
+    if no_spatial:
+        log_write("[WARNING]: these samples declare no spatial-barcode library — `SB Index` and `Merge Spatial From BCL` are both empty, so none will be demultiplexed for them:")
+        for name in no_spatial:
+            log_write(f"  • {name}")
+        log_write(" • The spatial-count and spatial-analysis stages will have nothing to run on for these samples")
+        log_write(" • Set `SB Index`, or `Merge Spatial From BCL` + `Add SB Index` if the library was sequenced on another run")
 
     # add spatial barcode samples to the samplesheet
     for _, row in spatial_barcodes.iterrows():
@@ -437,6 +489,7 @@ def create_samplesheet() -> list[Path]:
     }
 
     # create individual samplesheets for samples with split BCLs
+    missing_add_index = []
     for _, sample in metadata_df.iterrows():
         for column, suffix, index_column in (
             ('Merge RNA From BCL', '_split_rna', 'Add RNA Index'),
@@ -457,8 +510,27 @@ def create_samplesheet() -> list[Path]:
                 log_write(f" • Reads from {BCL_ID} are already demultiplexed by the main samplesheet")
                 log_write(f" • To merge reads from a second sequencing run, set `{column}` to that run's BCL ID")
                 continue
+            # A merge column names the run to demultiplex; `Add ... Index` names the index that library
+            # carries there. Without the second, the row below writes a blank index -- the same line
+            # bcl2fastq rejects that the primary-index check above exists to prevent, and one the
+            # completeness check would then wait on forever. Checked after the own-BCL guard, since a
+            # merge column pointing at this run is ignored anyway and needs no index. Collected rather
+            # than raised on the spot so a single pass names every offending sample.
+            if not row_declares(sample, index_column):
+                missing_add_index.append((str(sample['Sample Name']), column, bcl, index_column))
+                continue
             new_row = {'Lane': '*', 'Sample': (str(sample['Sample Name']) + suffix), 'Index': str(sample[index_column])}
             split_samplesheets[bcl] = pd.concat([split_samplesheets[bcl], pd.DataFrame([new_row])], ignore_index=True)
+
+    if missing_add_index:
+        log_write("[ERROR]: these samples merge reads from another run but do not say which index that library carries there:")
+        for name, column, bcl, index_column in missing_add_index:
+            log_write(f"  • {name}: `{column}` is {bcl}, but `{index_column}` is empty")
+        log_write("Troubleshooting:")
+        log_write(" • Set the `Add ... Index` column to the cellranger index the library was sequenced with in that run")
+        log_write(" • It is usually a different index than the primary one; the same index in both runs produces identically named FASTQs")
+        log_write(" • Clear the `Merge ... From BCL` column instead if the sample does not in fact merge reads from another run")
+        sys.exit(1)
 
     # set up the output samplesheets list
     output_samplesheets = []

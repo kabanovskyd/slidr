@@ -744,8 +744,17 @@ def _relevant_sample_names(module: str, metadata_df: pd.DataFrame) -> list[str]:
     return names
 
 
-def _row_declares(sample_row, column: str) -> bool:
-    """True if the metadata row carries a non-empty value in `column` (optional columns may be absent)."""
+def row_declares(sample_row, column: str) -> bool:
+    """
+    True if the metadata row carries a non-empty value in `column` (optional columns may be absent).
+
+    Public because `create_samplesheet` decides which libraries to write from the same columns this
+    file's completeness check reads them back with. Both have to agree on what a declared library is:
+    a blank primary index means the samplesheet writer emits no primary library, and so the
+    completeness check must not require its read pair (see `_library_complete`). One predicate rather
+    than two keeps a blank, a NaN and a whitespace-only cell from counting as declared in one place and
+    not the other.
+    """
     return (column in sample_row.index
             and pd.notna(sample_row[column])
             and str(sample_row[column]).strip() != '')
@@ -795,9 +804,13 @@ def _library_complete(
     metadata never asked for would leave the sample permanently incomplete, re-running mkfastq on
     every invocation with no amount of demultiplexing able to satisfy it.
 
-    A row declaring neither has no library of this kind to demultiplex at all. That is reported as
-    nothing-to-do rather than never-satisfiable, leaving it to the required-inputs check in
-    `need_run_module` to name the missing reads against the stage that actually needs them.
+    A row declaring neither has no library of this kind to demultiplex at all, and is reported as
+    nothing-to-do rather than never-satisfiable. Nothing downstream would name it: no module lists
+    `mkfastq` in its `required_inputs`, and run_count's own guard only checks that the mkfastq tree is
+    non-empty overall, not that a given sample has reads in it. So the case is rejected up front instead
+    -- `create_samplesheet` refuses a blank `RNA Index` with no `Merge RNA From BCL` to explain it, and
+    warns for the spatial equivalent, both against the metadata that caused it. By the time a row
+    reaches here it therefore declares at least one library, and the two branches above cover it.
 
     Inputs:
      - library_dir:  mkfastq output folder for this library (mkfastq/<sample>[_sb]/)
@@ -809,9 +822,9 @@ def _library_complete(
      - True if every declared contributing BCL's read pair is present
     """
 
-    if _row_declares(sample_row, index_column) and not _dir_has_read_pair(library_dir, exclude_token=split_token):
+    if row_declares(sample_row, index_column) and not _dir_has_read_pair(library_dir, exclude_token=split_token):
         return False
-    if _row_declares(sample_row, merge_column) and not _dir_has_read_pair(library_dir, require_token=split_token):
+    if row_declares(sample_row, merge_column) and not _dir_has_read_pair(library_dir, require_token=split_token):
         return False
     return True
 

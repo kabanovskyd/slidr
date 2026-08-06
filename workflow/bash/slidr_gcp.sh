@@ -133,12 +133,15 @@ die() {
     exit 1
 }
 
+# No `-b`, so this is the repository's default branch (`main`). The VM therefore runs whatever `main`
+# holds at the moment it boots, which is also why a local commit has to be pushed before a --gcp run
+# will pick it up -- the launcher sends this script and the config, not the checkout.
 echo "Cloning the slidr git repository..."
 git clone https://github.com/kabanovskyd/slidr.git /slidr || die \
     "could not clone the slidr repository" \
-    "The VM pulls the \`stable\` branch at boot, so it needs outbound access to github.com" \
+    "The VM pulls the default branch (\`main\`) at boot, so it needs outbound access to github.com" \
     "Check the VM's network (vpc1 / my-subnet-central) allows egress, via Cloud NAT or an external IP" \
-    "Check the \`stable\` branch still exists in https://github.com/kabanovskyd/slidr"
+    "Check the repository is reachable and \`main\` still exists: https://github.com/kabanovskyd/slidr"
 cd /slidr
 
 # The sequencing data is deliberately NOT copied here. Which run folders this run needs is stated by

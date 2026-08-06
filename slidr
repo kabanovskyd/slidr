@@ -496,20 +496,25 @@ if [[ "$GCP" == true ]]; then
         exit 1
     fi
     # A Google Sheet metadata source needs the service-account key, and the VM reads it straight out of
-    # the bucket rather than having one staged onto its disk -- so a local path here names a file that
-    # will not exist there. Caught now because the alternative is a VM that boots, fails to open the
-    # sheet and self-deletes. `--metadata` can override the source, so only complain when the config's
-    # own value is a sheet and no override was passed.
+    # the bucket rather than having one staged onto its disk -- so anything here that is not a gs:// object
+    # names a key the VM will not have. An unset field is rejected for exactly the same reason a local
+    # path is, and is the likelier of the two mistakes: both leave a VM that boots, fails to open the
+    # sheet and self-deletes, which is the outcome this check exists to prevent, so guarding only the
+    # non-empty case would let the worse one through. `--metadata` can override the source, so only
+    # complain when the source this run will actually read is a sheet.
     CONFIG_METADATA_SRC="$(read_config_scalar metadata_source)"
     CONFIG_AUTH_KEY="$(read_config_scalar auth_key_path)"
     EFFECTIVE_METADATA_SRC="${METADATA_PATH:-$CONFIG_METADATA_SRC}"
-    if [[ "$EFFECTIVE_METADATA_SRC" == *docs.google.com/spreadsheets* && -n "$CONFIG_AUTH_KEY" \
-          && "$CONFIG_AUTH_KEY" != gs://* ]]; then
-        echo "[ERROR]: \`paths.auth_key_path\` must be a gs:// object for a --gcp run reading its metadata from a Google Sheet, but is: '${CONFIG_AUTH_KEY}'" >&2
+    if [[ "$EFFECTIVE_METADATA_SRC" == *docs.google.com/spreadsheets* && "$CONFIG_AUTH_KEY" != gs://* ]]; then
+        if [[ -z "$CONFIG_AUTH_KEY" ]]; then
+            echo "[ERROR]: \`paths.auth_key_path\` is not set, and a --gcp run reading its metadata from a Google Sheet needs the key as a gs:// object" >&2
+        else
+            echo "[ERROR]: \`paths.auth_key_path\` must be a gs:// object for a --gcp run reading its metadata from a Google Sheet, but is: '${CONFIG_AUTH_KEY}'" >&2
+        fi
         echo "Troubleshooting:" >&2
         echo " • Upload the key once and point the field at it: \`auth_key_path: gs://my-bucket/secrets/auth_key.json\`" >&2
         echo " • The pipeline reads it with \`gcloud storage cat\` when it opens the sheet, so it is never written to the VM's disk" >&2
-        echo " • A local path cannot work: the VM is created fresh and has no copy of this machine's filesystem" >&2
+        echo " • Nothing local can work: the VM is created fresh, with no key of its own and no copy of this machine's filesystem" >&2
         echo " • Or export the metadata to a .tsv/.csv in the bucket and pass it with --metadata, which needs no key at all" >&2
         exit 1
     fi

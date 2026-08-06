@@ -363,15 +363,15 @@ Metadata must be provided as a Google Sheet or `.tsv`/`.csv` file with these col
 | `BCL` | BCL run ID (matched to `--bcl`); the BCL directory is resolved as `input_path/<BCL>` — there is no separate "BCL Path" column |
 | `Species` | `Human` or `Mouse` (auto-selects reference genome) |
 | `Chemistry` | e.g. `3Pv3`, `5P`, `Flex` |
-| `RNA Index` | Cellranger index for the RNA library |
+| `RNA Index` | Cellranger index for the RNA library. May be left empty **only** when `Merge RNA From BCL` + `Add RNA Index` supply the library instead (a library sequenced entirely on another run); empty with neither is an error |
 | `Lane` | Sequencing lane(s), comma-separated |
-| `SB Index` | Cellranger index for the spatial barcode library |
+| `SB Index` | Cellranger index for the spatial barcode library. May be left empty when `Merge Spatial From BCL` + `Add SB Index` supply it, or for a sample with no spatial library at all — the latter warns and skips the spatial stages for that sample |
 | `SB Lane` | Lane(s) for spatial barcode library, comma-separated |
 | `Puck ID` | Identifier matching a puck CSV in `puck_path` |
 | `Merge RNA From BCL` | BCL ID to merge RNA FASTQs from (optional). Its run folder is demultiplexed alongside the primary one, and staged from the `paths.input_path` prefix on a `--gcp`/`--stage-gcs` run — see [Split-BCL runs](#split-bcl-runs) |
 | `Merge Spatial From BCL` | BCL ID to merge spatial FASTQs from (optional), staged and demultiplexed the same way |
-| `Add RNA Index` | Index for merged RNA library (optional) |
-| `Add SB Index` | Index for merged spatial library (optional) |
+| `Add RNA Index` | Index for merged RNA library. Optional, but **required** once `Merge RNA From BCL` is set |
+| `Add SB Index` | Index for merged spatial library. Optional, but **required** once `Merge Spatial From BCL` is set |
 | `Add Puck ID` | Puck override for a merged sample (optional) |
 | `Cellranger` | Per-sample Cellranger version override (optional). Accepts `V8`/`v8`/`8` shorthand, expanded to a full release via `helpers.CELLRANGER_VERSIONS`, or a full version (`8.0.1`) used as written. Defaults to `8.0.1` (`9.0.1` for Flex, which needs `cellranger multi`). Honoured per sample by `count`; mkfastq is one invocation for the whole run, so it uses the single declared version and warns if samples disagree |
 | `Flex Probe Barcode IDs` | Probe barcode IDs for Flex chemistry (required for `Flex`). Separated by `,` or `\|`, or a mixture — parsed by `helpers.split_probe_barcodes` |
@@ -394,7 +394,8 @@ Local machine                  GCP
 watch_run.sh           ←──    VM runs workflow/bash/slidr_gcp.sh as startup script:
   (reads .last_run,             1. sets up the ops-agent so runtime.log reaches Cloud Logging
    streams Cloud Logging)       2. drops privileges to the `runner` user
-                                3. clones the `stable` branch of the repo
+                                3. clones the repo's default branch (`main`), so a
+                                     local commit must be pushed to be picked up
                                 4. downloads config.yaml from config-gcs
                                      (no auth key: a gs:// one is read with
                                       `gcloud storage cat` when the sheet is opened)
@@ -670,6 +671,9 @@ On first run, slidr scans `software_path` for Cellranger, bcl2fastq, and Julia, 
 
 - **Cellranger refuses to run on re-run**: manually delete `output/mkfastq/` and/or `output/count/` — Cellranger will not overwrite existing outputs. Use `--force` to have slidr handle this.
 - **`... is not a usable Illumina BCL run directory`**: a run folder failed the run-folder check; the preceding log lines list exactly what's missing. If the reads are in fact already demultiplexed, pass them with `--fastqs` instead — the pipeline will not guess this for you. The check covers every BCL the run demultiplexes, so for a merged-in one the fix is usually that the `Merge ... From BCL` value does not match the folder name under `paths.input_path`. On a staged run, a partial download is re-fetched with `RESTAGE=1`.
+- **`these samples declare no gene-expression library to demultiplex`**: a row has an empty `RNA Index` and no `Merge RNA From BCL`, so it names no index in any run folder. Set `RNA Index`, or — if that library was sequenced on another run — leave it empty and set `Merge RNA From BCL` + `Add RNA Index`. Raised by `create_samplesheet` before any BCL is staged, because such a row is invisible later: the mkfastq-completeness check has no read pair to require for it, so it counts as done and the run fails much later inside cellranger. A `--fastqs` run is exempt, since it never demultiplexes and reads library names off the filenames.
+- **`these samples merge reads from another run but do not say which index that library carries there`**: `Merge RNA From BCL` / `Merge Spatial From BCL` is set but the matching `Add RNA Index` / `Add SB Index` is empty, which would write an index-less row into that BCL's samplesheet. A merge column naming *this* run's own BCL is exempt — it is ignored with a warning and needs no index.
+- **`these samples declare no spatial-barcode library`**: a warning, not an error — `SB Index` and `Merge Spatial From BCL` are both empty, so no `<sample>_sb` library is demultiplexed and the spatial stages have nothing to run on for that sample. Intended for a gene-expression-only sample; otherwise a missing `SB Index`.
 - **`input_path must be a GCS location when staging from GCS`**: `--stage-gcs`/`--gcp` reads `paths.input_path` as a bucket prefix, and this one is a local path. Point it at the `gs://` prefix holding the run folders; where they are downloaded *to* is `settings.gcs_download_dest`, not this field. The same error names `reference_path`/`puck_path`/`raw_barcodes_path` for the same mistake.
 - **`input_path is a GCS location, but this run was not asked to stage from GCS`**: the converse — add `--stage-gcs` (or `--gcp`), or point the field at a local directory.
 - **`no .fastq.gz files were staged to the FASTQ directory for --fastqs`**: a staged bare `--fastqs` downloaded `<input_path>/<BCL_ID>` and found no FASTQs in it. Usually that folder holds BCLs, in which case drop `--fastqs`.

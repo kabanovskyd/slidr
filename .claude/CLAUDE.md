@@ -394,7 +394,8 @@ Local machine                  GCP
 watch_run.sh           ←──    VM runs workflow/bash/slidr_gcp.sh as startup script:
   (reads .last_run,             1. sets up the ops-agent so runtime.log reaches Cloud Logging
    streams Cloud Logging)       2. drops privileges to the `runner` user
-                                3. clones the `stable` branch of the repo
+                                3. clones the repo's default branch (`main`), so a
+                                     local commit must be pushed to be picked up
                                 4. downloads config.yaml from config-gcs
                                      (no auth key: a gs:// one is read with
                                       `gcloud storage cat` when the sheet is opened)

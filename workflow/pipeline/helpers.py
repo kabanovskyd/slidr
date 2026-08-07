@@ -200,6 +200,63 @@ def software_dir() -> Path:
     return dest
 
 
+def _julia_version_key(binary: Path) -> tuple:
+    """
+    Sort key ordering juliaup's versioned install directories newest-first.
+
+    The directory is named `julia-<major>.<minor>.<patch>+<build>.<platform>`, so a plain string sort
+    puts 1.9.0 after 1.12.0. Anything unparseable sorts last rather than raising -- an unrecognized
+    directory name is a reason to prefer another install, not to fail the run.
+    """
+    match = re.search(r'julia-(\d+)\.(\d+)\.(\d+)', binary.parent.parent.name)
+    return (1, tuple(int(g) for g in match.groups())) if match else (0, ())
+
+
+def _resolve_julia_binary(depot: Path) -> Path | None:
+    """
+    Return the `julia` executable juliaup installed into `depot`, or None if there is none.
+
+    juliaup does not lay a depot out as `<depot>/bin/julia`. Driven by JULIAUP_DEPOT_PATH it unpacks
+    each release to `<depot>/juliaup/julia-<version>.<platform>/bin/julia`, and the `julia` command it
+    puts on PATH is a *launcher* installed outside the depot entirely (`~/.juliaup/bin/julia`). Assuming
+    the former layout is what wrote a path that never existed into the software cache, so it is globbed
+    for rather than constructed.
+
+    The versioned binary is cached in preference to the launcher because the launcher resolves its
+    depot from JULIAUP_DEPOT_PATH at run time. That variable is set only for the install below, so a
+    later run invoking the launcher would look in the default depot instead and find nothing there. A
+    versioned install locates its own stdlib relative to its bin directory and needs no such variable.
+
+    Inputs:
+     - depot: the directory passed to juliaup as JULIAUP_DEPOT_PATH
+    Output:
+     - the newest executable julia found under it, or None
+    """
+
+    candidates = [
+        candidate for candidate in depot.glob('juliaup/julia-*/bin/julia')
+        if candidate.is_file() and os.access(candidate, os.X_OK)
+    ]
+    return max(candidates, key=_julia_version_key) if candidates else None
+
+
+def _binary_runs(binary: Path) -> bool:
+    """
+    True if `binary` can actually be executed, checked by running it with `--version`.
+
+    Worth the one subprocess: a path is written to the software cache once and then trusted by every
+    later run, so a wrong one is not discovered until the stage that needs it dies on
+    FileNotFoundError -- for Julia, after mkfastq and count have already run. Executing it here fails
+    at the point the path is chosen, where the error can still say which install was tried.
+    """
+
+    try:
+        proc = subprocess.run([str(binary), '--version'], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
 def test_and_install_software(
     software: str,
     version: str = ""
@@ -327,9 +384,21 @@ def test_and_install_software(
             if julia_path is not None:
                 with open(SOFTWARE_CACHE_FILE, 'a') as file:
                     file.write(str(julia_path) + '\n')
-                
+
                 print(f'Using Julia at {julia_path}')
                 return Path(julia_path)
+
+            # `install_path` is a *binary* path everywhere above, but juliaup is handed it as its depot
+            # *directory* below, so the "installed automatically before" check further up -- which asks
+            # whether that path is a file -- can never fire for Julia. Ask the depot instead, or every
+            # run re-downloads and re-runs the installer over an install that is already there.
+            depot = install_path
+            installed = _resolve_julia_binary(depot)
+            if installed is not None:
+                with open(SOFTWARE_CACHE_FILE, 'a') as file:
+                    file.write(str(installed) + '\n')
+                print(f"  Using {software} at {installed}")
+                return installed
 
             # installing Julia automatically
             install_path.mkdir(parents=True, exist_ok=True)
@@ -352,11 +421,27 @@ def test_and_install_software(
                 )
                 # verify the result
                 if sh_result.returncode == 0:
-                    julia_path = install_path / "bin" / "julia"
+                    # Ask the depot where the binary landed rather than assuming <depot>/bin/julia,
+                    # which juliaup never creates (see _resolve_julia_binary), then run it before
+                    # caching: the cache is trusted verbatim by every later run, so a path written
+                    # here that does not execute resurfaces as a FileNotFoundError in the middle of
+                    # spatial counting, hours later and nowhere near its cause.
+                    julia_path = _resolve_julia_binary(depot)
+                    if julia_path is None or not _binary_runs(julia_path):
+                        log_write(f"[ERROR]: the Julia installer reported success, but no working `julia` binary was found under {depot}")
+                        if julia_path is not None:
+                            log_write(f"  Found {julia_path}, but it did not run")
+                        log_write("Troubleshooting:")
+                        log_write(f" • Look for the binary yourself: `find {depot} -name julia -type f -perm -u+x`")
+                        log_write(f" • juliaup unpacks each release to {depot}/juliaup/julia-<version>/bin/julia; the `julia` on PATH is a launcher outside the depot and is not used here")
+                        log_write(" • A binary that is present but does not run is usually a glibc or architecture mismatch; check `julia --version` by hand")
+                        log_write(" • Install Julia yourself with juliaup: https://julialang.org/downloads/")
+                        log_write(f" • Then add the path to the `julia` binary to {SOFTWARE_CACHE_FILE} so slidr uses it directly")
+                        sys.exit(1)
                     with open(SOFTWARE_CACHE_FILE, 'a') as file:
                         file.write(str(julia_path) + '\n')
                     print(f"Installation successful - using {software} at {julia_path}")
-                    return Path(julia_path)
+                    return julia_path
                 else:
                     log_write(f"[ERROR]: the Julia installer exited with code {sh_result.returncode}")
                     log_write("Troubleshooting:")

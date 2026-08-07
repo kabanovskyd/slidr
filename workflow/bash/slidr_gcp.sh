@@ -109,6 +109,16 @@ RUNNER_USER="runner"
 mkdir -p /slidr /pipeline/out /pipeline/software /pipeline/pucks /pipeline/reference /pipeline/barcodes
 chown -R "${RUNNER_USER}:${RUNNER_USER}" /slidr /pipeline
 
+# The conda root is handed over too, because `helpers.ensure_conda_env` builds a missing environment
+# with `mamba env create`, which writes into ${CONDA_ROOT}/envs. The VM image ships that tree owned by
+# root, so as `runner` the create fails with "critical libmamba filesystem error: cannot create
+# directories: Permission denied" -- after solving and downloading the whole environment -- and takes
+# cellbender and spatial analysis (both `r_env`) down with it. Prebuilt environments in the image make
+# this a no-op, since an environment that already exists is only read; this is what keeps an image
+# without them, or a later addition to envs/conda.yml, from being a hard failure.
+CONDA_ROOT="/opt/miniforge3"
+[[ -d "${CONDA_ROOT}" ]] && chown -R "${RUNNER_USER}:${RUNNER_USER}" "${CONDA_ROOT}"
+
 echo "Launching slidr as ${RUNNER_USER}..."
 runuser -u "${RUNNER_USER}" -- env \
   HOME="/home/${RUNNER_USER}" \

@@ -523,7 +523,7 @@ if [[ "$GCP" == true ]]; then
         echo "Troubleshooting:" >&2
         echo " • Pass your GCP project ID: \`--project my-project-id\`" >&2
         echo " • List the projects you can use: \`gcloud projects list\`" >&2
-        echo " • The project must have a \`slidr-runner\` service account and the slidr-vm-image6 VM image" >&2
+        echo " • The project must have a \`slidr-runner\` service account and the slidr-vm-image7 VM image" >&2
         exit 1
     fi
     # BCL_ID/INPUT_GCS/OUTPUT_BUCKET are embedded into gcloud's comma/equals-delimited --metadata value
@@ -594,7 +594,7 @@ if [[ "$GCP" == true ]]; then
     CMD=(
         gcloud compute instances create "${VM_NAME}"
         --zone="${ZONE}"
-        --image=slidr-vm-image6
+        --image=slidr-vm-image7
         --machine-type="${MACHINE_TYPE}"
         --network=vpc1
         --subnet=my-subnet-central

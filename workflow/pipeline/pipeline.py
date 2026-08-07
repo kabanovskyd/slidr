@@ -789,6 +789,67 @@ def upload_outputs() -> None:
         log_write(f"    `{' '.join(cmd)}`")
 
 
+def upload_diagnostics() -> None:
+    """
+    Copy this run's `log/` and `metadata/` to the results folder, however the run ended.
+
+    `upload_outputs` uploads `output/`, and only once the run has succeeded, which leaves a `--gcp`
+    run with no record of itself in either outcome: the VM self-deletes when the startup script exits,
+    taking runtime.log, the run summary and every per-stage tool log (mkfastq.log, count.log,
+    cellbender.log, ...) with it. A failure is then undiagnosable in precisely the case where the
+    machine cannot be inspected afterwards -- `job_failure` names `log/<stage>.log` as the place the
+    real cause is written, and by the time anyone reads that sentence the file is gone with the disk --
+    and a success loses its own provenance.
+
+    Registered with `atexit` by main.py rather than called at the end of it, so that it also runs on
+    the paths that leave through `sys.exit` instead of reaching the bottom of the script: every tool
+    crash (`helpers.job_failure`) and every validation error. It cannot cover a hard kill -- SIGKILL
+    from the OOM killer, a preempted VM -- because nothing runs then.
+
+    Deliberately not `output/`: that tree holds the FASTQs mkfastq wrote, routinely tens of GB, and
+    pushing it to a bucket on every crash would cost far more than it saves. Preserving a failed run's
+    partial results is a separate problem, and one that would need the pipeline to fetch them back at
+    the start of the next attempt to be worth anything.
+
+    A no-op unless `SLIDR_OUTPUT_DEST` names the folder to upload to, which is the `--gcp` case: local
+    and Slurm runs keep their logs on a filesystem that outlives the run, and re-resolving a
+    destination here could pick a different `<BCL_ID>_N` folder than `upload_outputs` settled on,
+    scattering one run's artifacts across two.
+
+    Output:
+     - none; every failure is swallowed, because this runs while the process is already on its way out
+       and must not replace the error the user actually needs to read
+    """
+
+    try:
+        if OUTPUT_DEST is None:
+            return
+
+        entries = [
+            Path(p) for p in (LOG_PATH, METADATA_PATH)
+            if Path(p).is_dir() and any(Path(p).iterdir())
+        ]
+        if not entries:
+            return
+
+        dest = gcs_uri(OUTPUT_DEST)
+        cmd = ['gcloud', 'storage', 'cp', '-r'] + [str(entry) for entry in entries] + [f'{dest}/']
+
+        # same reasoning as upload_outputs: a bulk `gcloud storage cp` must not be read through a
+        # pipe, or an orphaned worker holding the write end can block the call forever. Here that
+        # would hang a process that is already exiting, which is worse -- the VM's self-delete trap
+        # never fires and the instance bills until someone notices.
+        proc = run_gcloud_transfer(cmd, timeout=GCS_METADATA_TIMEOUT)
+        if proc.returncode == 0:
+            log_write(f"  Logs uploaded to: {dest}")
+        else:
+            detail = (proc.stderr or proc.stdout or '').strip().splitlines()
+            log_write(f"[WARNING]: could not upload this run's logs to {dest}: {detail[-1] if detail else '(no output)'}")
+    except Exception:
+        # bookkeeping must never mask the failure that brought us here
+        pass
+
+
 def run_mkfastq() -> None:
     """
     Run cellranger mkfastq on samples specified in the samplesheet to generate FASTQ files from BCLs in DATA_PATH

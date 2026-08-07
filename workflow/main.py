@@ -2,6 +2,7 @@
 
 import sys
 import time
+import atexit
 import pandas as pd
 
 from datetime import datetime
@@ -20,6 +21,7 @@ from pipeline.helpers import (
 from pipeline.pipeline import (
     stage_input_data,
     upload_outputs,
+    upload_diagnostics,
     run_mkfastq,
     write_metadata_to_file,
     create_samplesheet,
@@ -53,6 +55,13 @@ BCL_ID = cfg['bcl_id']
 # --------------------------------------------------------------------------------------- #
 #                               load experimental metadata                                #
 # --------------------------------------------------------------------------------------- #
+
+# Preserve this run's logs however it ends. Registered here, before the first stage can fail, because
+# a --gcp VM self-deletes as soon as this process exits: without it a crash takes runtime.log and the
+# per-stage tool logs down with the disk, and the "see log/<stage>.log for the tool's own output"
+# that job_failure prints points at a file nobody can ever read. atexit rather than a call at the
+# bottom of this script, since the failing paths leave through sys.exit and never reach it.
+atexit.register(upload_diagnostics)
 
 # one Slack "started" alert per run, rather than the one-per-stage stream the old
 # "<stage> started" messages produced

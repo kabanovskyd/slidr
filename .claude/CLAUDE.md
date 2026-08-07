@@ -665,6 +665,15 @@ On first run, slidr scans `software_path` for Cellranger, bcl2fastq, and Julia, 
 /home/runner/.juliaup/bin/julia
 ```
 
+Julia is the one entry slidr can install for itself when neither `software_path` nor `PATH` has it: it
+runs the juliaup installer with the depot pointed at `~/.local/slidr/bin/julia`, which lands the real
+interpreter at `<depot>/juliaup/julia-<version>.<platform>/bin/julia`. That versioned binary is what
+gets cached, not the `~/.juliaup/bin/julia` launcher the installer also creates — the launcher finds its
+depot through `JULIAUP_DEPOT_PATH`, which is set only while installing, so a later run would send it
+looking in the default depot instead. The path is executed once before it is cached, since everything
+afterwards trusts the cache file verbatim. A later run reuses the depot rather than re-running the
+installer.
+
 ---
 
 ## Troubleshooting
@@ -690,5 +699,7 @@ On first run, slidr scans `software_path` for Cellranger, bcl2fastq, and Julia, 
 - **Google Sheets auth failure**: verify `auth_key_path` points to a valid *service account* JSON key (an OAuth client-secret file will not work — the error names the missing `client_email` field), and that the sheet is shared with the key's `client_email`, which the error quotes. `gcloud auth login` is not a substitute — the key is read directly. A `gs://` value is read with `gcloud storage cat`, so check the *active gcloud account* can read that object even though the key inside it is a different identity. If the metadata is a local `.tsv`/`.csv`, no key is needed at all.
 - **`auth_key_path` must be a gs:// object for a --gcp run**: the key is no longer copied onto the VM, so a local path names a file that does not exist there. Upload the key once, point the field at it, and the pipeline reads it straight out of the bucket when it opens the sheet. `./slidr` raises this at launch, before a VM is created.
 - **Slack alerts not arriving**: `settings.slack_token` may be a local file path, a `gs://` object or the literal token; a path-shaped value that does not resolve is a hard error rather than being tried as a token. The bot needs `users:read.email` (to map the `Email` column to a user) and `chat:write`. A token file that is group- or world-readable produces a warning.
+- **`FileNotFoundError` / exit 127 for `julia` when spatial counting starts**: a path in `software_cache.txt` that does not exist or does not run. Auto-installed Julia used to be cached as `<depot>/bin/julia`, a layout juliaup never creates, so the failure surfaced only once the spatial stage tried to launch it. Fixed by globbing the depot and executing the binary before caching it; a stale line from an earlier run is skipped automatically, and can be deleted from `software_cache.txt` if you would rather not look at it.
+- **`the Julia installer reported success, but no working julia binary was found`**: juliaup exited 0 but left nothing runnable under `~/.local/slidr/bin/julia`. The message names the exact `find` to run; a binary that is present but will not execute is usually a glibc or architecture mismatch, in which case install Julia yourself and pin it in `software_cache.txt`.
 - **Cellranger version not found**: `test_and_install_software` matches an install directory named `cellranger[-_v]<version>` exactly, so a `V8` in the `Cellranger` column is expanded via `helpers.CELLRANGER_VERSIONS`. If your site has a different patch release, edit that table — an unmapped value is passed through as written. The separator between name and version may be any run of `-`, `_` or `v` (`cellranger-8.0.1`, `cellranger_8.0.1`, `cellranger-v8.0.1`), but there must be at least one: a bare `cellranger8.0.1` does not match. The match is exact at both ends, so `cellranger-8.0.11` and `cellranger-8.0.1-beta` are not picked up for `8.0.1`.
 - **Software staged from GCS but nothing found**: the scan looks under `output/software/` once `paths.software_path` is a `gs://` prefix. Check the objects exist (`gcloud storage ls <software_path>`), and that the prefix holds the install *directories* themselves — the contents of the prefix are copied in, so `<software_path>/cellranger-8.0.1/bin/cellranger` becomes `output/software/cellranger-8.0.1/bin/cellranger`. Execute bits are restored automatically after the download, since `gcloud storage cp` does not preserve them.

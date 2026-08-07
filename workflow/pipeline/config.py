@@ -17,6 +17,54 @@ err_console = Console(stderr=True)
 console = Console()
 
 
+# Timeouts for the `gcloud` subprocesses the pipeline shells out to. `subprocess.run` waits forever
+# by default, which is how one wedged transfer could hang a whole run until the scheduler's wall
+# clock killed it -- a failure mode that cost a 24h Slurm allocation with the analysis already
+# finished and only the upload left to do.
+#
+# Two tiers, because the two kinds of call have honest durations orders of magnitude apart:
+#  - metadata: `gcloud storage cat`/`ls` against a single small object. These take seconds, so a few
+#    minutes is already pathological; failing fast turns a silent stall into a real error message.
+#  - transfer: `gcloud storage cp` of a reference genome, a software tree or a whole BCL run folder,
+#    routinely hundreds of GB. Hours here are legitimate, so this is deliberately generous. It is a
+#    backstop against a process that will never finish, NOT a performance budget -- set it too tight
+#    and it kills transfers that were going to succeed.
+#
+# Both are overridable, since link speed and run size vary enormously between sites.
+def _timeout_from_env(name: str, default: int) -> int:
+    """
+    Read a positive-integer timeout (in seconds) from the environment, falling back to `default`.
+
+    A malformed or non-positive value falls back rather than failing the run: these are backstops,
+    and refusing to start over a typo in an optional tuning knob would be worse than ignoring it.
+    """
+
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        err_console.print(f"[yellow]\\[WARNING][/yellow]: {name} is not an integer ('{raw.strip()}'); using the default of {default}s")
+        return default
+    if value <= 0:
+        err_console.print(f"[yellow]\\[WARNING][/yellow]: {name} must be a positive number of seconds (got {value}); using the default of {default}s")
+        return default
+    return value
+
+
+GCS_METADATA_TIMEOUT = _timeout_from_env('SLIDR_GCS_METADATA_TIMEOUT', 5 * 60)
+GCS_TRANSFER_TIMEOUT = _timeout_from_env('SLIDR_GCS_TRANSFER_TIMEOUT', 12 * 60 * 60)
+
+# The same reasoning for the Julia toolchain slidr installs for itself when the software directory
+# has no julia. Both steps reach the network and neither had a limit, so a dead proxy or a black-holed
+# route left the run wedged before spatial counting rather than failing with something actionable.
+# Split for the same reason as the GCS pair: fetching the installer is a few KB, while running it
+# downloads and unpacks a whole toolchain.
+INSTALLER_FETCH_TIMEOUT = _timeout_from_env('SLIDR_INSTALLER_FETCH_TIMEOUT', 5 * 60)
+INSTALLER_RUN_TIMEOUT = _timeout_from_env('SLIDR_INSTALLER_RUN_TIMEOUT', 30 * 60)
+
+
 def get_version():
     """
     Retrieve project version
@@ -233,12 +281,20 @@ def _read_gcs_token(uri: str) -> str:
 
     cmd = ['gcloud', 'storage', 'cat', uri]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=GCS_METADATA_TIMEOUT)
     except FileNotFoundError:
         err_console.print(f"[bold red]\\[ERROR][/bold red]: `slack_token` is a gs:// URI but `gcloud` was not found on PATH, so it cannot be read")
         err_console.print("Troubleshooting:")
         err_console.print(" • Install the Google Cloud CLI: https://cloud.google.com/sdk/docs/install")
         err_console.print(" • On a cluster, check whether it needs loading first (e.g. `module load google-cloud-sdk`)")
+        err_console.print(" • Or point `slack_token` at a local file, or disable alerts by setting `alerts` to `false`/`no`")
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        err_console.print(f"[bold red]\\[ERROR][/bold red]: reading the Slack token from {uri} timed out after {GCS_METADATA_TIMEOUT}s")
+        err_console.print("Troubleshooting:")
+        err_console.print(" • Reading one small object should take seconds, so this usually means gcloud cannot reach the network at all")
+        err_console.print(f" • Check the object is reachable by hand: `gcloud storage cat {uri}`")
+        err_console.print(" • Raise the limit with SLIDR_GCS_METADATA_TIMEOUT=<seconds> if the link is genuinely this slow")
         err_console.print(" • Or point `slack_token` at a local file, or disable alerts by setting `alerts` to `false`/`no`")
         sys.exit(1)
 

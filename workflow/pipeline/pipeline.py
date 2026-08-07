@@ -16,7 +16,16 @@ from pathlib import Path
 from rich.console import Console
 
 sys.path.append(str(Path(__file__).parent))
-from config import args, cfg, gcs_uri, is_int, is_number, bool_value_hint
+from config import (
+    args,
+    cfg,
+    gcs_uri,
+    is_int,
+    is_number,
+    bool_value_hint,
+    GCS_METADATA_TIMEOUT,
+    GCS_TRANSFER_TIMEOUT,
+)
 
 from helpers import (
     log_write,
@@ -26,6 +35,7 @@ from helpers import (
     format_duration,
     run_relative,
     stage_from_gcs,
+    run_gcloud_transfer,
     job_crash,
     job_success,
     format_multi_samplesheet,
@@ -636,9 +646,16 @@ def gcs_dest_taken(uri: str) -> bool:
 
     cmd = ['gcloud', 'storage', 'ls', uri]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=GCS_METADATA_TIMEOUT)
     except FileNotFoundError:
         log_write("[WARNING]: `gcloud` was not found on PATH, so the output bucket could not be checked for existing results")
+        return False
+    except subprocess.TimeoutExpired:
+        # Non-fatal, like every other failure here: the results exist on local disk either way, and
+        # refusing to upload them because a name check timed out would be the worse outcome. Reported
+        # as "not in use", so the caller uploads to `uri` -- which is why the overwrite risk is named.
+        log_write(f"[WARNING]: checking whether {uri} already exists timed out after {GCS_METADATA_TIMEOUT}s")
+        log_write("  Uploading to that location anyway; anything already there may be overwritten")
         return False
 
     if proc.returncode == 0:
@@ -745,8 +762,12 @@ def upload_outputs() -> None:
     # sources are output/'s contents and the destination carries a trailing slash: see the docstring
     cmd = ['gcloud', 'storage', 'cp', '-r'] + [str(entry) for entry in entries] + [f'{dest}/']
     try:
+        # run_gcloud_transfer, not subprocess.run(capture_output=True): this exact call is the one
+        # that deadlocked for 3h45m when a gcloud worker outlived its parent still holding the
+        # stdout pipe, and it is the worst place in the pipeline to hang -- the analysis is already
+        # finished by the time it runs. See run_gcloud_transfer's docstring for the mechanism.
         with console.status("  Uploading the results (this can take a while)..."):
-            proc = subprocess.run(cmd, capture_output=True, text=True)
+            proc = run_gcloud_transfer(cmd)
         if proc.returncode != 0:
             # surface gcloud's own last words rather than a bare exit code, which is undiagnosable
             detail = (proc.stderr or proc.stdout or '').strip().splitlines()
@@ -761,6 +782,9 @@ def upload_outputs() -> None:
         log_write(" • Make sure you are authenticated: `gcloud auth print-access-token`")
         log_write(" • If not, authenticate with `gcloud auth login`")
         log_write(f" • Make sure the output bucket {bucket_name} exists: `gcloud storage buckets describe {bucket_name}`")
+        if isinstance(exc, subprocess.TimeoutExpired):
+            log_write(f" • The transfer was killed after {GCS_TRANSFER_TIMEOUT}s; raise the limit with SLIDR_GCS_TRANSFER_TIMEOUT=<seconds>")
+            log_write(" • `gcloud storage rsync -r` resumes a partial upload, where `cp -r` restarts it")
         log_write(f" • The outputs are still on this machine at {OUTPUT_PATH}; run the upload manually:")
         log_write(f"    `{' '.join(cmd)}`")
 

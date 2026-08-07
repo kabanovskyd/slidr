@@ -8,6 +8,7 @@ import sys
 import csv
 import h5py
 import subprocess
+import tempfile
 import numpy as np
 import pandas as pd
 import xml.etree.ElementTree as ET
@@ -20,7 +21,15 @@ from urllib.parse import urlparse, parse_qs
 
 # import from sibling directories
 sys.path.append(str(Path(__file__).parent))
-from config import cfg, is_gcs_path, is_google_sheet
+from config import (
+    cfg,
+    is_gcs_path,
+    is_google_sheet,
+    GCS_METADATA_TIMEOUT,
+    GCS_TRANSFER_TIMEOUT,
+    INSTALLER_FETCH_TIMEOUT,
+    INSTALLER_RUN_TIMEOUT,
+)
 
 
 # unpack globals from config dictionary
@@ -412,12 +421,14 @@ def test_and_install_software(
                     ["curl", "-fsSL", "https://install.julialang.org"],
                     capture_output=True,
                     check=True,
-                    env=env
+                    env=env,
+                    timeout=INSTALLER_FETCH_TIMEOUT
                 )
                 sh_result = subprocess.run(
                     ["sh", "-s", "--", "-y"],
                     input=curl_proc.stdout,
-                    env=env
+                    env=env,
+                    timeout=INSTALLER_RUN_TIMEOUT
                 )
                 # verify the result
                 if sh_result.returncode == 0:
@@ -449,6 +460,28 @@ def test_and_install_software(
                     log_write(f" • Then add the path to the `julia` binary to {SOFTWARE_CACHE_FILE} so slidr uses it directly")
                     log_write(f" • Check there is free space and write permission on {install_path}")
                     sys.exit(1)
+            # Ahead of the generic handler below, which would otherwise report a timeout as a bare
+            # "Julia installation failed: Command ... timed out" and offer only the curl advice. The
+            # two phases fail for different reasons and have different knobs, so they are told apart
+            # here by which command the exception names.
+            except subprocess.TimeoutExpired as exc:
+                fetching = bool(exc.cmd) and str(exc.cmd[0]) == 'curl'
+                if fetching:
+                    log_write(f"[ERROR]: downloading the Julia installer timed out after {INSTALLER_FETCH_TIMEOUT}s")
+                    log_write("Troubleshooting:")
+                    log_write(" • The installer script is a few KB, so this almost always means no network access or a proxy blocking https://install.julialang.org")
+                    log_write(" • Check it by hand: `curl -fsSL https://install.julialang.org | head`")
+                    log_write(" • Raise the limit with SLIDR_INSTALLER_FETCH_TIMEOUT=<seconds> if the link really is this slow")
+                else:
+                    log_write(f"[ERROR]: the Julia installer did not finish within {INSTALLER_RUN_TIMEOUT}s and was killed")
+                    log_write("Troubleshooting:")
+                    log_write(f" • It downloads and unpacks a full Julia toolchain into {install_path}, which can be slow on a shared or quota-limited filesystem")
+                    log_write(" • Raise the limit with SLIDR_INSTALLER_RUN_TIMEOUT=<seconds>")
+                    log_write(f" • A half-written install may be left behind; remove {install_path} before retrying")
+                    log_write(f" • Check there is free space and write permission on {install_path}")
+                log_write(" • Install Julia yourself with juliaup: https://julialang.org/downloads/")
+                log_write(f" • Then add the path to the `julia` binary to {SOFTWARE_CACHE_FILE} so slidr uses it directly")
+                sys.exit(1)
             except Exception as e:
                 log_write(f"[ERROR]: Julia installation failed: {e}")
                 log_write("Troubleshooting:")
@@ -502,12 +535,20 @@ def read_service_account_key(auth_key_path) -> dict:
         source = str(auth_key_path)
         cmd = ['gcloud', 'storage', 'cat', source]
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=GCS_METADATA_TIMEOUT)
         except FileNotFoundError:
             log_write(f"[ERROR]: `auth_key_path` is a gs:// URI but `gcloud` was not found on PATH, so the key cannot be read")
             log_write("Troubleshooting:")
             log_write(" • Install the Google Cloud CLI: https://cloud.google.com/sdk/docs/install")
             log_write(" • On a cluster, check whether it needs loading first (e.g. `module load google-cloud-sdk`)")
+            log_write(" • Or point `paths.auth_key_path` at a local copy of the key instead")
+            sys.exit(1)
+        except subprocess.TimeoutExpired:
+            log_write(f"[ERROR]: reading the service account key from {source} timed out after {GCS_METADATA_TIMEOUT}s")
+            log_write("Troubleshooting:")
+            log_write(" • Reading one small object should take seconds, so this usually means gcloud cannot reach the network at all")
+            log_write(f" • Check the object is reachable by hand: `gcloud storage cat {source}`")
+            log_write(" • Raise the limit with SLIDR_GCS_METADATA_TIMEOUT=<seconds> if the link is genuinely this slow")
             log_write(" • Or point `paths.auth_key_path` at a local copy of the key instead")
             sys.exit(1)
 
@@ -1448,6 +1489,64 @@ def validate_bcl_dir(bcl_path: Path | str) -> bool:
     return True
 
 
+def run_gcloud_transfer(cmd: list[str], timeout: int | None = None) -> subprocess.CompletedProcess:
+    """
+    Run a bulk `gcloud storage` transfer, collecting its output through a temporary FILE rather than
+    a pipe, and killing it if it exceeds `timeout`.
+
+    The file matters, and is the whole point of this function. `subprocess.run(capture_output=True)`
+    wires the child's stdout/stderr to pipes and then calls communicate(), which reads them until
+    EOF *before* it so much as checks whether the child exited. `gcloud storage cp` forks parallel
+    worker processes that inherit those pipe write ends. If gcloud's top-level process dies while a
+    worker is still alive, the worker is re-parented to init and keeps the write end open forever --
+    so EOF never arrives, communicate() blocks for good, and the exited gcloud sits there as an
+    unreaped zombie because wait() is never reached. That deadlock is not theoretical: it hung a run
+    for 3h45m with the analysis already complete and only the results upload outstanding, and it
+    would have burned the remaining 19h of the allocation had it not been killed by hand.
+
+    Redirecting to a real file removes the dependency entirely: nothing has to reach EOF for
+    subprocess.run to return, so the call ends when gcloud's own process ends, whatever its orphans
+    are doing. The timeout is then a second, independent backstop for a gcloud that never exits at
+    all.
+
+    Inputs:
+     - cmd:     the full `gcloud storage ...` argv to run
+     - timeout: seconds before the transfer is killed; defaults to GCS_TRANSFER_TIMEOUT
+    Output:
+     - a CompletedProcess whose .stdout/.stderr hold what gcloud wrote, so callers can quote it in
+       an error exactly as they did when it came from a pipe
+    Raises:
+     - FileNotFoundError:              gcloud is not on PATH
+     - subprocess.TimeoutExpired:      the transfer exceeded `timeout` and was killed
+    """
+
+    if timeout is None:
+        timeout = GCS_TRANSFER_TIMEOUT
+
+    # delete=False plus an explicit unlink: the file is reopened for reading below, and on the
+    # NamedTemporaryFile contract that is only portable once the handle is closed
+    stream = tempfile.NamedTemporaryFile(
+        mode='w', suffix='.gcloud.log', prefix='slidr_', delete=False
+    )
+    try:
+        with stream:
+            # stderr into the same file: gcloud interleaves progress and diagnostics across both, and
+            # a single stream keeps them in the order they were written
+            proc = subprocess.run(cmd, stdout=stream, stderr=subprocess.STDOUT, timeout=timeout)
+        try:
+            output = Path(stream.name).read_text(errors='replace')
+        except OSError:
+            output = ''
+        # Callers quote .stderr for diagnostics; both streams landed in one file, so present that
+        # file as stderr and leave stdout empty rather than guessing how to split it back apart.
+        return subprocess.CompletedProcess(proc.args, proc.returncode, stdout='', stderr=output)
+    finally:
+        try:
+            os.unlink(stream.name)
+        except OSError:
+            pass
+
+
 def stage_from_gcs(
     source: str,
     dest: Path | str,
@@ -1478,13 +1577,20 @@ def stage_from_gcs(
     cmd = ['gcloud', 'storage', 'cp'] + (['-r'] if recursive else []) + [source, str(dest)]
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = run_gcloud_transfer(cmd)
     except FileNotFoundError:
         log_write("[ERROR]: `gcloud` was not found on PATH, so inputs cannot be staged from GCS")
         log_write("Troubleshooting:")
         log_write(" • Install the Google Cloud CLI: https://cloud.google.com/sdk/docs/install")
         log_write(" • On a cluster, check whether it needs loading first (e.g. `module load google-cloud-sdk`)")
         log_write(" • Drop --stage-gcs to read these inputs off the local filesystem instead")
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        log_write(f"[ERROR]: staging {label} from GCS timed out after {GCS_TRANSFER_TIMEOUT}s and was killed")
+        log_write("Troubleshooting:")
+        log_write(f" • The partial download is left at {dest}; re-running resumes rather than restarting it")
+        log_write(" • Raise the limit with SLIDR_GCS_TRANSFER_TIMEOUT=<seconds> if this transfer genuinely needs longer")
+        log_write(f" • Check the transfer by hand to see whether it progresses at all: `{' '.join(cmd)}`")
         sys.exit(1)
 
     if proc.returncode == 0:

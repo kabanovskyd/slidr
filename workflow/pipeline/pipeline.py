@@ -119,6 +119,20 @@ REF_DEST = None
 PUCK_DEST = OUTPUT_PATH / "pucks"
 BARCODES_DEST = OUTPUT_PATH / "barcodes"
 
+# Directories under output/ that upload_outputs does not send to `settings.output_bucket`.
+#
+# Both are staging destinations for a --stage-gcs/--gcp run's own *inputs*, not results: `reference`
+# is where the `settings.reference_genome` subdirectory of `paths.reference_path` is downloaded
+# (assigned to REF_DEST below), and `software` is where a gs:// `paths.software_path` is unpacked
+# (helpers.test_and_install_software). They live under output/ only because a staged run needs a
+# local, writable place to put them, and uploading them again returns bytes to the bucket they were
+# just read out of -- 14 GiB of reference genome and 2.5 GiB of Cellranger on a mouse run, against
+# roughly 5 GiB of actual analysis output.
+#
+# `pucks` and `barcodes` are deliberately NOT here: puck CSVs can be *generated* during a run from
+# raw barcodes, so that directory holds real output for the runs that produce it, and both are small.
+UPLOAD_SKIP = frozenset({'reference', 'software'})
+
 
 def conda_subprocess_env() -> dict:
     """
@@ -767,6 +781,11 @@ def upload_outputs() -> None:
     Only `output/` is uploaded, as before: `data/` holds staged sequencing reads that came out of a
     bucket in the first place, and `log/`, `metadata/` and `tmp/` stay on the machine that ran the job.
 
+    Within `output/`, the directories a staged run downloads its *inputs* into are skipped as well --
+    see UPLOAD_SKIP. They sit there only because a staged run needs somewhere local to put them, and
+    sending them back is pure cost: on a mouse run that is the 14 GiB reference genome and 2.5 GiB of
+    Cellranger, re-uploaded into the results folder they were copied out of moments earlier.
+
     Output:
      - none; a failure is a warning, since the outputs themselves are already on local disk
     """
@@ -774,7 +793,10 @@ def upload_outputs() -> None:
     if OUTPUT_DEST is None and (OUTPUT_BUCKET is None or not str(OUTPUT_BUCKET).strip()):
         return
 
-    entries = sorted(OUTPUT_PATH.iterdir()) if OUTPUT_PATH.is_dir() else []
+    entries = sorted(
+        entry for entry in (OUTPUT_PATH.iterdir() if OUTPUT_PATH.is_dir() else [])
+        if entry.name not in UPLOAD_SKIP
+    )
     if not entries:
         log_write(f"[WARNING]: nothing to upload to {OUTPUT_DEST or OUTPUT_BUCKET} — {run_relative(OUTPUT_PATH)} is empty")
         return

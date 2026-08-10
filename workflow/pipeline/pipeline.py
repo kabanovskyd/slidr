@@ -120,6 +120,37 @@ PUCK_DEST = OUTPUT_PATH / "pucks"
 BARCODES_DEST = OUTPUT_PATH / "barcodes"
 
 
+def conda_subprocess_env() -> dict:
+    """
+    This process's environment, with the per-user site directory switched off, for running a tool out
+    of a conda environment `ensure_conda_env` just resolved.
+
+    Python puts `~/.local/lib/pythonX.Y/site-packages` on sys.path ahead of the interpreter's own
+    site-packages whenever the two version tags match. A conda environment is therefore only as
+    isolated as the invoking user's home directory is empty: `<env>/bin/cellbender` is the entry
+    point, but `import cellbender` (and `torch`, and `pyro`) can resolve to a completely different
+    pip install under ~/.local. The environment slidr carefully built or found is then not the one
+    the tool actually runs against, and nothing says so.
+
+    That is not hypothetical. The `--gcp` VM image carries a stale user-site install, so cellbender
+    trained all 150 epochs against ~/.local's torch and then failed to save its checkpoint with
+    "TypeError: cannot pickle 'weakref.ReferenceType' object" -- a torch/pyro version
+    incompatibility that does not exist in the r_env the image also ships. The stage died on the
+    assertion that follows, since the posterior step requires the checkpoint that was never written.
+
+    PYTHONNOUSERSITE drops the user directory from sys.path, so the environment resolved is the
+    environment used. Applied to every tool slidr launches from a conda env, rather than only the one
+    that broke, because the failure mode is silent everywhere else too.
+
+    Output:
+     - an environment mapping suitable for passing as subprocess `env=`
+    """
+
+    env = os.environ.copy()
+    env['PYTHONNOUSERSITE'] = '1'
+    return env
+
+
 def staged_ref_dir() -> Path:
     """
     Directory holding the reference genome for this run: the local copy when staging from GCS, the
@@ -1428,7 +1459,7 @@ def run_cellbender() -> None:
     conda_bender = conda_lib / "cellbender"
         
     # search for GPU support to speed up cellbender training
-    env = os.environ.copy()
+    env = conda_subprocess_env()
     try:
         pynvml.nvmlInit()
             
@@ -1830,7 +1861,7 @@ def run_spatial_analysis() -> None:
     conda_lib = ensure_conda_env("r_env")
 
     # export environment variables
-    env = os.environ.copy()
+    env = conda_subprocess_env()
     env["R_FUNC"] = str(SCRIPT_PATH / 'spatial_analysis' / 'functions')
     env["R_LIBS"] = str(conda_lib)
     env["DATA_PATH"] = str(OUTPUT_PATH.parent.parent)
@@ -1911,7 +1942,7 @@ def run_takara_spatial_profiling() -> None:
     metadata_df = pd.read_csv(SUMMARY_PATH)
 
     # add the Trekker conda environment to PATH
-    env = os.environ.copy()
+    env = conda_subprocess_env()
     env['PATH'] = f"{trekker_env}:{env.get('PATH', '')}"
     env.pop('PYTHONPATH', None)
 

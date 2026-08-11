@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import csv
 import subprocess
 import signal
 import types
@@ -132,6 +133,67 @@ BARCODES_DEST = OUTPUT_PATH / "barcodes"
 # `pucks` and `barcodes` are deliberately NOT here: puck CSVs can be *generated* during a run from
 # raw barcodes, so that directory holds real output for the runs that produce it, and both are small.
 UPLOAD_SKIP = frozenset({'reference', 'software'})
+
+
+def check_barcode_validity(
+    sample_name: str,
+    count_dir: Path,
+    chemistry: str,
+    threshold: float = 50.0
+) -> None:
+    """
+    Warn when a sample's cell-barcode validity is too low to be explained by anything but the wrong
+    `Chemistry`.
+
+    Cellranger reports `Valid Barcodes` -- the share of reads whose cell barcode is in the whitelist
+    for the chemistry it was told to assume. A healthy library sits at 85-95%. A chemistry mismatch
+    puts it near the rate at which random 16-mers happen to collide with the *other* whitelist, which
+    is a few percent, because 3' and 5' v3 use different whitelists.
+
+    Cellranger treats this as a metric, not an error: it exits 0, writes a full output directory, and
+    the pipeline carries on. The damage surfaces two stages later and in a form that names nothing
+    useful -- with almost no cells called, CellBender finds no empty droplets to learn an ambient
+    profile from and dies inside scipy with "ZeroDivisionError: float division by zero". Diagnosing
+    that from the traceback means testing barcodes against candidate whitelists by hand.
+
+    So this is a warning, not a failure: the run is almost certainly wrong, but cellranger's own
+    output is intact and the operator may have a reason to continue. It says the one thing the
+    traceback two stages later will not -- look at the `Chemistry` column.
+
+    Inputs:
+     - sample_name: sample being checked, for the message
+     - count_dir:   this sample's count output directory, holding metrics_summary.csv
+     - chemistry:   chemistry string handed to cellranger, quoted back in the warning
+     - threshold:   percent below which the rate is treated as implausible
+    Output:
+     - none; a missing or unparseable metrics file is silently ignored, since this is a diagnostic
+       and must never be the reason a successful run fails
+    """
+
+    metrics = Path(count_dir) / 'metrics_summary.csv'
+    if not metrics.is_file():
+        return
+
+    try:
+        with open(metrics, newline='') as handle:
+            row = next(csv.DictReader(handle), None)
+        if not row or 'Valid Barcodes' not in row:
+            return
+        # cellranger writes this as a percentage string, e.g. "85.7%"
+        rate = float(str(row['Valid Barcodes']).strip().rstrip('%'))
+    except (OSError, StopIteration, TypeError, ValueError):
+        return
+
+    if rate >= threshold:
+        return
+
+    log_write(f"[WARNING]: only {rate:.1f}% of {sample_name}'s reads carry a valid cell barcode, which normally means `Chemistry` is wrong")
+    log_write("Troubleshooting:")
+    log_write(f" • cellranger was told this library is {chemistry}; a correct chemistry gives 85-95% here")
+    log_write(" • 3' and 5' 10x kits use different cell-barcode whitelists, so the wrong one leaves only a few percent matching by chance")
+    log_write(f" • Check the `Chemistry` metadata column for {sample_name} against how the library was actually prepared")
+    log_write(f" • Full metrics are in {run_relative(metrics)}, and the barcode-rank plot in {run_relative(Path(count_dir) / 'web_summary.html')}")
+    log_write(" • Left uncorrected, cellbender fails later with an unrelated-looking error, having found no empty droplets")
 
 
 def conda_subprocess_env() -> dict:
@@ -1457,6 +1519,7 @@ def run_count() -> None:
                 shutil.move(item, dst_dir / item.name)
 
             log_ts(f"counted {sample_name}")
+            check_barcode_validity(sample_name, dst_dir, chemistry)
     
     # logging the job results
     job_success("cellranger count", count_log, COUNT_OUTS, started=stage_started)

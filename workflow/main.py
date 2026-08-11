@@ -63,12 +63,21 @@ BCL_ID = cfg['bcl_id']
 # bottom of this script, since the failing paths leave through sys.exit and never reach it.
 atexit.register(upload_diagnostics)
 
-# one Slack "started" alert per run, rather than the one-per-stage stream the old
-# "<stage> started" messages produced
-log_run_started(f"run {BCL_ID} started")
-
 # save sample metadata locally
 write_metadata_to_file()
+
+# One Slack "started" alert per run, rather than the one-per-stage stream the old "<stage> started"
+# messages produced.
+#
+# Ordered after write_metadata_to_file, not before it: slack_message resolves the recipient by reading
+# the `Email` column out of metadata_summary.csv at send time, and that file is what
+# write_metadata_to_file writes. Announcing the run first meant the alert either found no file at all
+# -- a first run into a fresh output directory, where it gave up with "User email could not be
+# extracted, so Slack alerts have been disabled" and no start alert was ever delivered to anyone -- or,
+# re-running into a directory that already had one, found the *previous* run's metadata and delivered
+# this run's start alert to whoever that run belonged to. The second case is the reason for the
+# ordering: a corrected `Email` could not take effect until after the one message it was meant to fix.
+log_run_started(f"run {BCL_ID} started")
 
 # generate samplesheet from metadata
 samplesheet_paths = create_samplesheet()

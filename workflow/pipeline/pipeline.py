@@ -1515,8 +1515,20 @@ def run_count() -> None:
                 log_write(f" • Check the FASTQs for this sample exist and are non-empty: `ls -l {fastq_path}`")
                 log_write(f" • Check the `Chemistry` metadata column ({chemistry}) matches how the library was prepared")
                 sys.exit(1)
+            # Clear each destination before moving onto it. `shutil.move` onto an existing *directory*
+            # does not replace it -- it moves the source inside it -- so a re-run (--force, or a
+            # corrected chemistry) silently produced count/<sample>/filtered_feature_bc_matrix/
+            # filtered_feature_bc_matrix/ the first time and then died with "Destination path already
+            # exists" the second, having already spent the full cellranger run. Files were never
+            # affected, which is why only the matrix directories nested and the .h5 outputs downstream
+            # still looked right.
             for item in src_dir.iterdir():
-                shutil.move(item, dst_dir / item.name)
+                target = dst_dir / item.name
+                if target.is_symlink() or target.is_file():
+                    target.unlink()
+                elif target.is_dir():
+                    shutil.rmtree(target)
+                shutil.move(item, target)
 
             log_ts(f"counted {sample_name}")
             check_barcode_validity(sample_name, dst_dir, chemistry)

@@ -1180,7 +1180,8 @@ def run_cellranger_count(
     threads: str,
     memory: str,
     generate_bam: str,
-    logpath
+    logpath,
+    lanes: list[str] | None = None
 ) -> subprocess.Popen:
     """
     Run cellranger count on a single sample and block until completion
@@ -1196,6 +1197,9 @@ def run_cellranger_count(
      - memory:          local memory limit in GB
      - generate_bam:    whether to generate a BAM file ("true" or "false")
      - logpath:         path to the file where stdout/stderr will be written
+     - lanes:           lane tokens from `helpers.declared_lanes` ('L001', ...) to restrict the read
+                        to, passed on as cellranger's own `--lanes`. None/empty means every lane in
+                        `fastq_dir`, which is what cellranger does by default.
     Output:
      - a completed subprocess.Popen object; check .returncode for exit status
     """
@@ -1209,23 +1213,40 @@ def run_cellranger_count(
     if isinstance(sample_name, list):
         sample_name = ','.join(sample_name)
 
+    cmd = ['time', 'stdbuf', '-oL', '-eL', cellranger_path, 'count',
+        f'--id={sample_index}',
+        f'--sample={sample_name}',
+        f'--fastqs={fastq_dir}',
+        f'--transcriptome={ref_genome}',
+        f'--chemistry={chemistry}',
+        f'--localcores={threads}',
+        f'--localmem={memory}',
+        f'--jobmode=local',
+        f'--project=fastqs',
+        f'--disable-ui',
+        f'--nosecondary',
+        f'--include-introns=true',
+        f'--create-bam={generate_bam}']
+
+    # Restrict the read to the lanes the metadata declares. `--sample` alone makes cellranger take
+    # every file in fastq_dir whose name starts with that prefix, which for a directory holding a
+    # whole flowcell means every lane the demultiplexer emitted -- not just the ones this library was
+    # loaded in. Those extra lanes are index bleed: a walkup delivery of a sample sequenced in lanes
+    # 1, 4 and 5 also carries kilobyte-sized files for lanes 2, 6, 7, 8 and, in one real case, a
+    # 20-byte empty gzip for lane 3. Cellranger read the empty pair and rejected the whole run with
+    # "R1 and R2 reads are identical" -- true of two empty files, and impossible to trace back to a
+    # lane the sample was never sequenced in.
+    #
+    # `--lanes` takes bare integers, while declared_lanes returns the zero-padded 'L001' tokens that
+    # appear in filenames. An empty list means the metadata declared no lanes (blank, or '*'), and
+    # the flag is then omitted so cellranger keeps its own default of reading everything.
+    if lanes:
+        cmd.append('--lanes=' + ','.join(str(int(lane.lstrip('Ll'))) for lane in lanes))
+
     # launch cellranger count as a child process
     with open(logpath, "a") as logfile:
         proc = subprocess.Popen(
-            ['time', 'stdbuf', '-oL', '-eL', cellranger_path, 'count',
-            f'--id={sample_index}',
-            f'--sample={sample_name}',
-            f'--fastqs={fastq_dir}',
-            f'--transcriptome={ref_genome}',
-            f'--chemistry={chemistry}',
-            f'--localcores={threads}',
-            f'--localmem={memory}',
-            f'--jobmode=local',
-            f'--project=fastqs',
-            f'--disable-ui',
-            f'--nosecondary',
-            f'--include-introns=true',
-            f'--create-bam={generate_bam}'],
+            cmd,
             cwd=output_path.parent,
             stdout=logfile,
             stderr=subprocess.STDOUT
@@ -1490,7 +1511,13 @@ def run_count() -> None:
                     NUM_THREADS,
                     MEM_SIZE,
                     generate_bam,
-                    count_log
+                    count_log,
+                    # Only for an externally supplied --fastqs directory. Reading mkfastq's own output
+                    # needs no filter: it writes one folder per library, containing exactly the lanes
+                    # the samplesheet asked it to demultiplex, so there are no foreign lanes to
+                    # exclude. A shared directory of somebody else's demultiplexing is the case where
+                    # `--sample` alone is not a tight enough filter.
+                    lanes=declared_lanes(sample_row, 'Lane') if FASTQ_INPUT is not None else None
                 )
 
             # check exit status

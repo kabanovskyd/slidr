@@ -44,6 +44,7 @@ from helpers import (
     load_metadata,
     merge_bcls,
     row_declares,
+    deduplicate_metadata,
     resolve_bcl_dir,
     validate_bcl_dir,
     test_and_install_software,
@@ -351,6 +352,11 @@ def write_metadata_to_file() -> None:
             log_write(" • Check that --bcl was given the BCL ID as written in the metadata, not the path to the run folder")
             log_write(f" • Metadata source: {METADATA_SRC}")
             sys.exit(1)
+
+    # Drop rows repeated verbatim, and refuse a sample declared twice with different values. Done on
+    # the rows selected for this run rather than the whole sheet, so a sample that legitimately appears
+    # once per BCL, or a duplicate parked behind `Run: NO`, is nobody's problem here.
+    matching_rows = deduplicate_metadata(matching_rows)
 
     # validate that species and chemistry are the same across all samples
     if len(set(matching_rows['Species'].dropna().tolist())) > 1:

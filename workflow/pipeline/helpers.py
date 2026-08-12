@@ -870,6 +870,101 @@ def _relevant_sample_names(module: str, metadata_df: pd.DataFrame) -> list[str]:
     return names
 
 
+def _normalized_cell(value) -> str:
+    """
+    A metadata cell reduced to what it actually declares, for comparing two rows.
+
+    Blank, missing and whitespace-only all become the empty string, and surrounding whitespace is
+    dropped, so a row copied with a stray trailing space is recognised as the copy it is rather than
+    reported as a sample declared twice with conflicting values.
+    """
+    try:
+        if pd.isna(value):
+            return ''
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
+
+
+def deduplicate_metadata(rows: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop rows that repeat an earlier one exactly, and refuse rows that repeat a `Sample Name` while
+    saying something different.
+
+    A duplicated row is easy to produce and hard to see: metadata is usually a shared Google Sheet, and
+    copying a row to start a new sample -- or pasting a block twice -- leaves two identical
+    declarations. Nothing downstream is written to survive that. `Sample Name` is the key for
+    `count/<sample>/`, for the mkfastq library folders, for `need_run_module`'s per-sample state and
+    for the samplesheet rows, so a repeat means cellranger is asked to demultiplex the same index
+    twice into the same place and every later stage counts the sample twice.
+
+    The two cases are deliberately not treated alike:
+
+    - **Identical rows** carry no information the first one does not, so the extras are dropped and
+      named. Stopping the run would be pedantry: there is exactly one thing the operator can have
+      meant.
+    - **Same name, different content** is a conflict, not a duplicate, and is fatal. One row says the
+      library carries `SI-TT-A1` and the other `SI-TT-B2`, or they name different pucks; keeping
+      either one is a guess about which is right, made silently, that would run to completion and
+      produce plausible output from the wrong inputs. The error names the columns that disagree, since
+      that is the part the operator has to reconcile.
+
+    Comparison is on normalized values (see `_normalized_cell`), so trailing spaces and the difference
+    between a blank cell and a missing one do not turn a copy into a conflict. The rows returned are
+    the originals, untouched.
+
+    Inputs:
+     - rows: the metadata rows selected for this run
+    Output:
+     - the same frame with exact duplicates removed
+    """
+
+    if rows.empty:
+        return rows
+
+    # The frame still carries the row order it was read in, so the index doubles as a pointer back
+    # into the sheet: data row 0 is the line under the header, which is line 2 to a human.
+    def sheet_line(index) -> str:
+        return f"line {index + 2}" if isinstance(index, (int, np.integer)) else f"index {index}"
+
+    normalized = rows.apply(lambda column: column.map(_normalized_cell))
+
+    exact = normalized.duplicated(keep='first')
+    if exact.any():
+        log_write(f"[WARNING]: {int(exact.sum())} duplicate row(s) in the metadata for this run were ignored:")
+        first_of = {}
+        for index, key in normalized.apply(tuple, axis=1).items():
+            first_of.setdefault(key, index)
+        for index in rows.index[exact]:
+            key = tuple(normalized.loc[index])
+            name = _normalized_cell(rows.at[index, 'Sample Name']) or '(unnamed)'
+            log_write(f"  • {name} ({sheet_line(index)}) repeats {sheet_line(first_of[key])} exactly")
+        log_write(" • Identical rows say nothing the first one does not, so the run continues with one of each")
+        log_write(" • Remove them from the metadata to silence this; a row copied to start a new sample and then left unedited is the usual cause")
+        rows = rows[~exact]
+        normalized = normalized[~exact]
+
+    # what remains repeating a name now disagrees about something, which is not ours to resolve
+    repeated = normalized['Sample Name'].duplicated(keep=False)
+    if repeated.any():
+        log_write("[ERROR]: the metadata declares the same sample more than once, with different values:")
+        for name, group in normalized[repeated].groupby('Sample Name', sort=False):
+            differing = [column for column in group.columns if group[column].nunique() > 1]
+            lines = ', '.join(sheet_line(index) for index in group.index)
+            log_write(f"  • {name or '(unnamed)'} on {lines} — disagrees on: {', '.join(differing)}")
+            for column in differing:
+                values = ' | '.join(f"{sheet_line(index)}: {group.at[index, column] or '(blank)'}" for index in group.index)
+                log_write(f"      {column}: {values}")
+        log_write("Troubleshooting:")
+        log_write(" • `Sample Name` names the output directory, the mkfastq libraries and the samplesheet rows, so it has to identify one sample")
+        log_write(" • Keep the row that is correct and delete the other, or rename one sample if they are genuinely different")
+        log_write(" • A library sequenced across two runs is not a second row: set `Merge RNA From BCL` / `Merge Spatial From BCL` on the one row instead")
+        log_write(" • Set `Run` to `NO` on the row you do not want, to keep it in the sheet without running it")
+        sys.exit(1)
+
+    return rows
+
+
 def row_declares(sample_row, column: str) -> bool:
     """
     True if the metadata row carries a non-empty value in `column` (optional columns may be absent).

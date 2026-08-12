@@ -403,54 +403,126 @@ ensure_uv() {
     fi
 }
 
+# Roots a conda/mamba installation is plausibly already at, searched before installing another one.
+# `$HOME/miniforge3` is where this script puts it; `/opt/miniforge3` is where the --gcp VM image ships
+# it; the rest are what a user or a cluster module is likely to have installed first. CONDA_ROOT and
+# MAMBA_ROOT_PREFIX come first so an explicit choice wins over a guess.
+CONDA_SEARCH_ROOTS=(
+    "${CONDA_ROOT:-}"
+    "${MAMBA_ROOT_PREFIX:-}"
+    "$HOME/miniforge3"
+    "$HOME/mambaforge"
+    "$HOME/miniconda3"
+    "$HOME/anaconda3"
+    "/opt/miniforge3"
+    "/opt/conda"
+)
+
+# Print the root of an existing conda installation, or return 1. Existence is judged by a runnable
+# bin/conda rather than by the directory being there at all: a half-finished or interrupted install
+# leaves the directory without the binary, and treating that as "installed" would send the pipeline on
+# to fail later at `mamba env create` instead of repairing it here.
+find_conda_root() {
+    local root
+    for root in "${CONDA_SEARCH_ROOTS[@]}"; do
+        [[ -n "$root" && -x "${root}/bin/conda" ]] && { printf '%s' "$root"; return 0; }
+    done
+    return 1
+}
+
 # ensure conda is installed (the pipeline uses it for the R / CellBender environments)
 ensure_conda() {
-    if ! command -v conda &> /dev/null; then
-        echo "Installing Miniforge..."
+    # already usable in this shell
+    command -v conda &> /dev/null && return 0
 
-        # detect OS
-        OS=$(uname -s)
-        ARCH=$(uname -m)
-
-        if [ "$OS" = "Linux" ]; then
-            INSTALLER="Miniforge3-Linux-${ARCH}.sh"
-        elif [ "$OS" = "Darwin" ]; then
-            INSTALLER="Miniforge3-MacOSX-${ARCH}.sh"
-        else
-            echo "[ERROR]: cannot install Miniforge automatically on this platform: $OS" >&2
-            echo "Troubleshooting:" >&2
-            echo " • Automatic installation supports Linux and macOS (Darwin) only" >&2
-            echo " • Install Miniforge yourself and make sure \`conda\` is on PATH: https://github.com/conda-forge/miniforge#install" >&2
-            echo " • conda/mamba is needed for the R and CellBender environments; the rest of the pipeline uses uv" >&2
-            exit 1
-        fi
-
-        # download and run the installer. Both steps are checked explicitly: under `set -e` a bare
-        # failure here aborts the script with no output at all, leaving the user with no idea that
-        # it was conda -- not their run -- that failed.
-        if ! curl -fLO "https://github.com/conda-forge/miniforge/releases/latest/download/${INSTALLER}"; then
-            echo "[ERROR]: could not download the Miniforge installer (${INSTALLER})" >&2
-            echo "Troubleshooting:" >&2
-            echo " • This usually means no network access or a proxy blocking https://github.com" >&2
-            echo " • Install Miniforge yourself and make sure \`conda\` is on PATH: https://github.com/conda-forge/miniforge#install" >&2
-            echo " • On a cluster, check whether conda/mamba is already available as a module (e.g. \`module load miniforge\`)" >&2
-            exit 1
-        fi
-        if ! bash "${INSTALLER}" -b -p "$HOME/miniforge3"; then
-            echo "[ERROR]: the Miniforge installer failed" >&2
-            echo "Troubleshooting:" >&2
-            echo " • A pre-existing ${HOME}/miniforge3 blocks the install; remove it or install elsewhere and put it on PATH" >&2
-            echo " • Check there is free space and write permission in ${HOME}" >&2
-            echo " • Installer left in place for inspection: ./${INSTALLER}" >&2
-            exit 1
-        fi
-        rm "${INSTALLER}"
-
-        # add to PATH for the rest of this script
-        export PATH="$HOME/miniforge3/bin:$PATH"
-        conda init bash
-        echo "Miniforge installed. Please restart your shell or run: source ~/.bashrc"
+    # Installed, but not on PATH -- which is the normal state, not an edge case. The install below adds
+    # conda to PATH for the rest of that one script run and calls `conda init bash`, which writes
+    # ~/.bashrc; a later `./slidr` runs in a non-interactive shell that never sources it, so conda is
+    # invisible again. Without this lookup every subsequent run tried to reinstall, and the Miniforge
+    # installer refuses a prefix that already exists -- so the pipeline failed with "the Miniforge
+    # installer failed" while a perfectly good conda sat in $HOME/miniforge3.
+    local existing_root
+    if existing_root="$(find_conda_root)"; then
+        export PATH="${existing_root}/bin:$PATH"
+        return 0
     fi
+
+    echo "Installing Miniforge..."
+
+    # detect OS
+    local OS ARCH INSTALLER
+    OS=$(uname -s)
+    ARCH=$(uname -m)
+
+    if [ "$OS" = "Linux" ]; then
+        INSTALLER="Miniforge3-Linux-${ARCH}.sh"
+    elif [ "$OS" = "Darwin" ]; then
+        INSTALLER="Miniforge3-MacOSX-${ARCH}.sh"
+    else
+        echo "[ERROR]: cannot install Miniforge automatically on this platform: $OS" >&2
+        echo "Troubleshooting:" >&2
+        echo " • Automatic installation supports Linux and macOS (Darwin) only" >&2
+        echo " • Install Miniforge yourself and make sure \`conda\` is on PATH: https://github.com/conda-forge/miniforge#install" >&2
+        echo " • conda/mamba is needed for the R and CellBender environments; the rest of the pipeline uses uv" >&2
+        exit 1
+    fi
+
+    # Into a temp directory, not the working directory: a failed install used to leave a ~100 MB
+    # Miniforge3-*.sh sitting in the repository root, untracked and easy to commit by accident.
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+
+    # download and run the installer. Both steps are checked explicitly: under `set -e` a bare
+    # failure here aborts the script with no output at all, leaving the user with no idea that
+    # it was conda -- not their run -- that failed.
+    if ! curl -fL -o "${tmpdir}/${INSTALLER}" "https://github.com/conda-forge/miniforge/releases/latest/download/${INSTALLER}"; then
+        rm -rf "$tmpdir"
+        echo "[ERROR]: could not download the Miniforge installer (${INSTALLER})" >&2
+        echo "Troubleshooting:" >&2
+        echo " • This usually means no network access or a proxy blocking https://github.com" >&2
+        echo " • Install Miniforge yourself and make sure \`conda\` is on PATH: https://github.com/conda-forge/miniforge#install" >&2
+        echo " • On a cluster, check whether conda/mamba is already available as a module (e.g. \`module load miniforge\`)" >&2
+        exit 1
+    fi
+
+    # `-u` when the prefix exists. Reaching this line means find_conda_root found no runnable
+    # bin/conda, so anything at the prefix is a half-written or broken install rather than one worth
+    # keeping -- and the installer refuses an existing prefix outright without it, which is precisely
+    # how an interrupted first install used to wedge every later run.
+    local prefix="$HOME/miniforge3"
+    local install_args=(-b -p "$prefix")
+    if [[ -e "$prefix" ]]; then
+        echo "  ${prefix} already exists but has no working conda; repairing it in place"
+        install_args=(-b -u -p "$prefix")
+    fi
+
+    if ! bash "${tmpdir}/${INSTALLER}" "${install_args[@]}"; then
+        echo "[ERROR]: the Miniforge installer failed" >&2
+        echo "Troubleshooting:" >&2
+        echo " • Check there is free space and write permission in ${HOME}" >&2
+        echo " • Remove a broken install and retry: \`rm -rf ${prefix}\`" >&2
+        echo " • Or install Miniforge yourself anywhere and put its bin/ on PATH, or point CONDA_ROOT at it" >&2
+        echo " • Installer left for inspection: ${tmpdir}/${INSTALLER}" >&2
+        exit 1
+    fi
+    rm -rf "$tmpdir"
+
+    # add to PATH for the rest of this script
+    export PATH="${prefix}/bin:$PATH"
+
+    # Convenience for the operator's own interactive shell, and nothing more: it edits ~/.bashrc, which
+    # a later non-interactive `./slidr` never reads. Future runs find this install through
+    # find_conda_root instead, so a failure here is not worth stopping a run over.
+    conda init bash >/dev/null 2>&1 || true
+
+    if ! command -v conda &> /dev/null; then
+        echo "[ERROR]: Miniforge reported success, but conda is still not runnable at ${prefix}/bin/conda" >&2
+        echo "Troubleshooting:" >&2
+        echo " • Check the install: \`ls -l ${prefix}/bin/conda\`" >&2
+        echo " • Remove it and retry: \`rm -rf ${prefix}\`" >&2
+        exit 1
+    fi
+    echo "Miniforge installed at ${prefix} (later runs find it automatically)."
 }
 
 # --- defaults ---

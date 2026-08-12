@@ -34,7 +34,9 @@ A pipeline for processing Slide-Tag spatial transcriptomics data. Starting from 
 - [Julia](https://julialang.org/) — spatial barcode processing
 
 **Python dependencies** are managed by `uv` via `pyproject.toml`.  
-**R dependencies** are managed by `conda` via `envs/conda.yml`.
+**R dependencies** are managed by `conda` via `envs/conda.yml`. The environment is created on first
+use, non-interactively — mamba 2.x otherwise stops to ask for confirmation, which nothing can answer
+in a `--gcp` VM or a Slurm job.
 
 ---
 

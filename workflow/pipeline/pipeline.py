@@ -205,6 +205,40 @@ def check_barcode_validity(
     log_write(" • Left uncorrected, cellbender fails later with an unrelated-looking error, having found no empty droplets")
 
 
+def move_replacing(item: Path, target: Path) -> None:
+    """
+    Move `item` to `target`, replacing whatever is already there.
+
+    `shutil.move` onto an existing *directory* does not replace it -- it moves the source inside it.
+    Both places cellranger's outputs are collected hit that on a re-run, and both did so silently: the
+    standard path produced count/<sample>/filtered_feature_bc_matrix/filtered_feature_bc_matrix/ on the
+    first re-run and died with "Destination path already exists" on the second, having paid for the
+    full cellranger run both times. Only directories nested -- files do get replaced -- which is why
+    the .h5 outputs downstream still looked right and the first re-run appeared to succeed.
+
+    `is_symlink()` is tested before `is_dir()` deliberately: `is_dir()` follows symlinks, so the other
+    order would rmtree *through* a symlinked destination into whatever it points at.
+
+    Two limits are accepted rather than solved. The removal happens before the move, so a move that
+    fails leaves neither copy -- tolerable only because every caller has just regenerated the data it
+    is replacing. And only the names being moved this time are cleared, so an output from an earlier
+    run under a different cellranger version survives beside the new ones; clearing the destination
+    wholesale would fix that at the cost of deleting anything an operator had put there deliberately.
+
+    Inputs:
+     - item:   the file or directory to move
+     - target: where it goes, replaced if it exists
+    Output:
+     - none
+    """
+
+    if target.is_symlink() or target.is_file():
+        target.unlink()
+    elif target.is_dir():
+        shutil.rmtree(target)
+    shutil.move(item, target)
+
+
 def conda_subprocess_env() -> dict:
     """
     This process's environment, with the per-user site directory switched off, for running a tool out
@@ -1459,8 +1493,12 @@ def run_count() -> None:
             log_write(" • Check the probe barcode IDs in the `Flex Probe Barcode IDs` metadata column match the ones actually used in the library prep")
             log_write(f" • Check `workflow.flex_probe_set` ({FLEX_PROBE_SET}) is the probe set for this kit")
             sys.exit(1)
+        # Same replacement rule as the standard path, and for the same reason: on a re-run
+        # count/flex/<sample>_<BC>/ already exists, so a plain shutil.move would put this run's
+        # partition inside the previous one -- count/flex/<sample>_<BC>/<sample>_<BC>/ -- and fail
+        # outright the run after that. See move_replacing.
         for item in src_dir.iterdir():
-            shutil.move(item, dst_dir / item.name)
+            move_replacing(item, dst_dir / item.name)
 
         log_ts("counted all Flex probe-barcode partitions")
 
@@ -1570,20 +1608,10 @@ def run_count() -> None:
                 log_write(f" • Check the FASTQs for this sample exist and are non-empty: `ls -l {fastq_path}`")
                 log_write(f" • Check the `Chemistry` metadata column ({chemistry}) matches how the library was prepared")
                 sys.exit(1)
-            # Clear each destination before moving onto it. `shutil.move` onto an existing *directory*
-            # does not replace it -- it moves the source inside it -- so a re-run (--force, or a
-            # corrected chemistry) silently produced count/<sample>/filtered_feature_bc_matrix/
-            # filtered_feature_bc_matrix/ the first time and then died with "Destination path already
-            # exists" the second, having already spent the full cellranger run. Files were never
-            # affected, which is why only the matrix directories nested and the .h5 outputs downstream
-            # still looked right.
+            # a re-run (--force, or a corrected chemistry) moves onto outputs that are already there,
+            # which plain shutil.move would nest rather than replace -- see move_replacing
             for item in src_dir.iterdir():
-                target = dst_dir / item.name
-                if target.is_symlink() or target.is_file():
-                    target.unlink()
-                elif target.is_dir():
-                    shutil.rmtree(target)
-                shutil.move(item, target)
+                move_replacing(item, dst_dir / item.name)
 
             log_ts(f"counted {sample_name}")
             check_barcode_validity(sample_name, dst_dir, chemistry)

@@ -810,26 +810,29 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
     # Cellranger and bcl2fastq are routinely preinstalled on whatever machine runs the pipeline -- the
     # --gcp VM image is built exactly that way -- and --gcp implies --stage-gcs, so treating every
     # staged run as "the software must live in a bucket" would break those runs while buying nothing.
-    # This mirrors how `auth_key_path` above is handled rather than how reference_path is: a gs:// URI
-    # is unambiguous, so it needs no flag to be recognized.
     #
-    # The bare `bucket/prefix` form the resource paths accept is NOT honoured here. It cannot be told
-    # apart from a relative local directory, and guessing wrong means a multi-GB download instead of a
-    # clear error. --stage-gcs is still required, so a staged software tree is always something the
-    # caller asked for and never a surprise inferred from the config alone.
+    # A `gs://` URI here is acted on WITHOUT --stage-gcs, exactly as `auth_key_path` above is. The flag
+    # exists to disambiguate the bare `bucket/prefix` form, which cannot be told apart from a relative
+    # local directory -- and that form is not honoured here at all, so there is nothing left for the
+    # flag to decide. Requiring it anyway made a legitimate configuration unexpressible: software in a
+    # bucket with the data local errored without the flag, and errored *with* it too, because
+    # _validate_resource_path then demands that reference_path/puck_path/raw_barcodes_path be GCS
+    # locations as well. Staging is announced below rather than silent, which is what the requirement
+    # was really protecting against; it is also lazy (a warm software_cache.txt skips it entirely) and
+    # reused by later runs sharing the output tree.
     if is_gcs_path(SOFTWARE_PATH):
-        if not STAGE_GCS:
-            err_console.print(f"[bold red]\\[ERROR][/bold red]: `software_path` is a GCS location, but this run was not asked to stage from GCS: {SOFTWARE_PATH}")
-            err_console.print("Troubleshooting:")
-            err_console.print(" • Pass --stage-gcs (or --gcp) to download the software from the bucket before it is scanned")
-            err_console.print(" • Or set `software_path` to a local directory containing the cellranger/bcl2fastq executables")
-            sys.exit(1)
         SOFTWARE_PATH = gcs_uri(SOFTWARE_PATH)
+        if not STAGE_GCS:
+            # Worth saying out loud: this run stages nothing else, so a download here would otherwise
+            # be the one surprise in an operation the caller thinks is entirely local.
+            console.print(f"[bold yellow]\\[NOTE][/bold yellow]: `software_path` is a GCS location, so Cellranger/bcl2fastq will be downloaded from {SOFTWARE_PATH} on first use")
+            console.print("  • Nothing else is staged for this run; set `software_path` to a local directory to avoid the download")
+            console.print(f"  • Already-known executables in {SOFTWARE_CACHE_FILE} are used first, and skip it entirely")
     elif SOFTWARE_PATH is None or not Path(SOFTWARE_PATH).is_dir():
         err_console.print(f"[bold red]\\[ERROR][/bold red]: invalid entry for `software_path` in configuration file: {SOFTWARE_PATH}")
         err_console.print("Troubleshooting:")
         err_console.print(" • Check that `software_path` is set to a valid directory path containing cellranger/bcl2fastq executables")
-        err_console.print(" • If the software lives in a bucket, write it as a full gs:// URL and pass --stage-gcs to download it")
+        err_console.print(" • If the software lives in a bucket, write it as a full gs:// URL -- it is downloaded on first use, and needs no --stage-gcs")
         err_console.print(f" • Or pin the executables directly by adding their paths to {SOFTWARE_CACHE_FILE}, which is consulted before this directory is scanned")
         sys.exit(1)
     else:
@@ -1107,8 +1110,11 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
             summary.write(f"  Reference (GCS):      {REF_PATH}\n")
             summary.write(f"  Pucks (GCS):          {PUCK_PATH}\n")
             summary.write(f"  Raw barcodes (GCS):   {RAW_BARCODES_PATH}\n")
-            if is_gcs_path(SOFTWARE_PATH):
-                summary.write(f"  Software (GCS):       {SOFTWARE_PATH}\n")
+        # outside the block above: a gs:// software_path is staged whether or not this run stages
+        # anything else, so a summary that recorded it only under --stage-gcs would omit the one
+        # remote input an otherwise-local run has
+        if is_gcs_path(SOFTWARE_PATH):
+            summary.write(f"  Software (GCS):       {SOFTWARE_PATH}\n")
         if applied_overrides:
             summary.write(f"  Config overrides:     {', '.join(applied_overrides)}\n")
         if metadata_override:

@@ -157,7 +157,12 @@ software tree worth knowing:
 
 - Only a full `gs://…` URL triggers it. The bare `bucket/prefix` form the other paths accept is not
   honoured here, since it cannot be told apart from a relative local directory and guessing wrong means
-  a multi-GB download instead of an error. `--stage-gcs` is still required.
+  a multi-GB download instead of an error.
+- **`--stage-gcs` is not required for this field.** A `gs://` URL is unambiguous, so it is acted on by
+  itself — the flag exists to disambiguate the bare form, which this field does not accept. Requiring it
+  would also make "software in a bucket, data local" impossible to express, since the flag forces
+  `input_path`, `reference_path`, `puck_path` and `raw_barcodes_path` to be GCS locations too. When the
+  run stages nothing else, a `[NOTE]` on startup says the download is coming.
 - The download happens once per run, lazily — a `software_cache.txt` that already pins the executables
   skips it entirely — and is reused by later runs sharing the output tree. Because GCS does not carry
   POSIX permissions, execute bits are restored on the staged copy afterwards.
@@ -534,8 +539,8 @@ Two things a staged run needs are set up outside slidr rather than through flags
   Alternatively, point `software_path` at a `gs://` location and let the job download the software.
 
 `workflow/main.py` additionally accepts `--config PATH` to run against a config file outside `config/`,
-and `--stage-gcs` to stage `reference_path`/`puck_path`/`raw_barcodes_path` (and a `gs://`
-`software_path`) from GCS without using `--gcp`. `--stage-gcs` is what the Slurm payload passes; neither
+and `--stage-gcs` to stage `reference_path`/`puck_path`/`raw_barcodes_path` from GCS without using
+`--gcp` (a `gs://` `software_path` is staged with or without it). `--stage-gcs` is what the Slurm payload passes; neither
 is exposed on `./slidr` itself.
 
 ---

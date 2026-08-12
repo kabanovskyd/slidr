@@ -47,6 +47,52 @@ cd slidr
 
 No further setup is required — `./slidr` installs missing dependencies on first run.
 
+### Staying up to date
+
+`./slidr --update` fast-forwards this checkout to the newest slidr on GitHub:
+
+```bash
+./slidr --update
+```
+
+A run also checks once a day, and says so when the checkout is behind — the notice names the commits
+and the version change, if the version moved:
+
+```
+──────────────────────────────────────────────────────────────────────
+A newer slidr is available: 1.2.0-beta → 1.3.0-beta (5 commit(s) behind origin/main)
+  cca132f Bump to 1.3.0-beta
+  eb128b0 Restrict cellranger count to the lanes the metadata declares
+  ...
+Update with: ./slidr --update
+──────────────────────────────────────────────────────────────────────
+```
+
+It is a notice, never a question. `./slidr` submits Slurm jobs and creates VMs from scripts and cron
+entries where nothing is watching stdin, so a launcher that blocked on a `y/n` would hang them. The
+check is best-effort throughout: a login node with no route to github.com, an expired credential or a
+missing remote costs nothing and never fails a run, and the network call is capped at ten seconds.
+
+**Your `config/config.yaml` is safe.** It is tracked in the repository and you have to edit it to run
+anything, so the update keeps local changes to any file the update itself does not touch. When the
+update *does* change the same file, it stops before overwriting and tells you what to do:
+
+```bash
+git stash && ./slidr --update && git stash pop   # then re-apply any new config fields by hand
+```
+
+Dependencies are not installed by `--update`. The next run syncs them, so `--update` needs nothing
+beyond git — no working Python environment, no network access to PyPI.
+
+| Variable | Effect |
+|---|---|
+| `SLIDR_NO_UPDATE_CHECK=1` | Skip the check entirely — for cron, CI, or an air-gapped cluster |
+| `SLIDR_UPDATE_INTERVAL=<seconds>` | How long between checks (default `86400`, one day) |
+
+The check is skipped automatically when it cannot mean anything: a directory that is not a git
+checkout, or a branch with no upstream. If this checkout has local commits of your own, the notice
+says `git pull --rebase` instead, since `--update` fast-forwards only and will not rewrite your work.
+
 ---
 
 ## Configuration

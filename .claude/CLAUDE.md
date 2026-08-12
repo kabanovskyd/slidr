@@ -77,6 +77,7 @@ There is no built-in default and no command-line equivalent: set `paths.input_pa
 | Flag | Short | Description |
 |---|---|---|
 | `--version` | `-v` | Print the pipeline version (read from `pyproject.toml`) and exit |
+| `--update` | `-u` | Fast-forward this checkout to the newest slidr on GitHub and exit. Local edits are kept unless the update touches the same file, in which case it aborts and points at `git stash` — `config/config.yaml` is tracked, so this is the common case. Dependencies are not synced here: `uv run`/`uv sync` do that at the next launch |
 | `--help` | `-h` | Print usage and exit |
 
 ### Where the run executes
@@ -184,6 +185,39 @@ mysample_sb_S2_L003_R1_001.fastq.gz     # spatial barcodes, as mkfastq names it
 # an explicit DIR under --gcp is for FASTQs already on the VM image, not for staged ones
 ./slidr --bcl 20240101_RUNID --gcp --fastqs /opt/reference_fastqs
 ```
+
+---
+
+## Staying up to date
+
+`./slidr --update` fast-forwards the checkout to the newest slidr on GitHub, and a run checks once a
+day and prints a notice when one is available. Both live in `./slidr` rather than the Python side: a
+`--gcp` VM clones the repo fresh at boot and a Slurm job runs from the submitter's checkout, so the
+launcher is the only place where a stale copy is both possible and fixable.
+
+Design points worth not re-litigating:
+
+- **A notice, not a prompt.** `./slidr` is run from scripts and cron entries with nothing on stdin;
+  blocking on a `y/n` would hang them. The action is named in the message and stays explicit.
+- **Best-effort, always silent on failure.** No route to github.com, an expired credential, a missing
+  remote, a detached HEAD, a non-git directory: all skip the check. It is a convenience running beside
+  the real work and must never cost a run. The fetch is capped at 10s by `run_with_timeout`, since
+  `timeout(1)` is GNU coreutils and absent on macOS.
+- **Once a day**, recorded in `.slidr_update_check` (gitignored, beside `.last_run`). The stamp is
+  written *before* the fetch, so an unreachable remote backs off for the full interval instead of
+  paying the timeout on every launch. `SLIDR_NO_UPDATE_CHECK=1` disables it, `SLIDR_UPDATE_INTERVAL`
+  re-times it.
+- **`--update` does not refuse on a dirty tree.** `config/config.yaml` is tracked and every user must
+  edit it, so a blanket refusal would refuse nearly every real checkout. `git pull --ff-only` already
+  draws the line correctly — it keeps modifications to files the update does not touch and aborts
+  before overwriting ones it does — so the decision is left to git, and the error hints point at
+  `git stash` for the case where it aborts.
+- **No dependency sync.** `uv run` (local) and the explicit `uv sync` (`--slurm`) already do it at
+  launch, so `--update` needs only git: no Python environment, no PyPI access.
+- **Version strings come from `pyproject.toml`**, local and remote both parsed by `extract_version`
+  (the remote copy via `git show @{u}:pyproject.toml`, needing no second network call). Most updates
+  are fixes that never touch the version, so the notice leads with the commit count and mentions the
+  version only when it changed.
 
 ---
 

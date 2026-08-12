@@ -589,8 +589,14 @@ GCS, and `software/` only when `paths.software_path` is a `gs://` prefix.
 
 ### The upload to `settings.output_bucket`
 
-On success `pipeline.upload_outputs` copies the whole of `output/` — and nothing else — to
-`<output_bucket>/<BCL_ID>`, so a bucket collecting several runs says which is which. A folder already at
+On success `pipeline.upload_outputs` copies `output/` to `<output_bucket>/<BCL_ID>`, so a bucket
+collecting several runs says which is which — minus `reference/` and `software/`, which a staged run
+downloads its own *inputs* into (`UPLOAD_SKIP`) and which would otherwise be returned to the bucket
+they came from: 14 GiB of reference genome and 2.5 GiB of Cellranger on a mouse run. `pucks/` and
+`barcodes/` are kept, since a puck CSV may have been generated during the run. Outside `output/`,
+`data/` holds staged reads that came out of a bucket already and `tmp/` is scratch, so neither is
+uploaded by anything — but `log/` and `metadata/` are, by a different function: see
+[Logs are uploaded separately](#logs-are-uploaded-separately). A folder already at
 that name is never written over: `unique_gcs_dest` asks the bucket what is there (`gcloud storage ls`)
 and moves to `<BCL_ID>_2`, `_3`, … , falling back to a timestamp suffix past 100. The upload is the last
 thing a run does, hours of compute after a mistake could still be caught, and nothing tells a deliberate
@@ -606,6 +612,29 @@ A `--gcp` run does not resolve the folder here at all — `./slidr` resolved it 
 order to put config.yaml in it, and passed it down as `SLIDR_OUTPUT_DEST` (`cfg['output_dest']`), which
 is used verbatim. That also closes the first limit above for `--gcp`, since writing the config claims the
 name. See [How the config reaches the VM](#how-the-config-reaches-the-vm).
+
+### Logs are uploaded separately
+
+`upload_outputs` runs only on success, so on its own a failed `--gcp` run left no trace of itself: the
+VM self-deletes when the startup script exits and takes `runtime.log`, the run summary and every
+per-stage tool log with the disk — in exactly the case where the machine can no longer be inspected.
+
+`pipeline.upload_diagnostics` closes that: it copies `log/` and `metadata/` into the same
+`<output_bucket>/<BCL_ID>` folder, landing as `<dest>/log/` and `<dest>/metadata/` beside the contents
+of `output/`. It is registered with `atexit` in `main.py`, so it runs however the process ends, and it
+is a **no-op unless `SLIDR_OUTPUT_DEST` is set** — a local or Slurm run keeps its logs on a filesystem
+that outlives it, and re-resolving a destination here could pick a different `<BCL_ID>_N` folder than
+`upload_outputs` settled on and split one run across two.
+
+`output/` is deliberately not included: it holds the FASTQs mkfastq wrote, routinely tens of GB, and
+pushing that to a bucket on every crash would cost far more than it saves.
+
+Two things it cannot do. A hard kill (OOM killer, preempted VM) runs no exit hook at all. And
+`config.py`'s own validation errors — an unreadable config.yaml, a non-GCS `input_path`, a malformed
+`SLIDR_OUTPUT_DEST` — are raised while `config` is being imported, before `main.py` reaches the line
+that registers the hook, so no log file survives for them; they are still readable through
+`watch_run.sh`, since the ops-agent forwards stderr to Cloud Logging. Note also that the uploaded
+`runtime.log` necessarily stops just short of the end, since the upload is what happens next.
 
 The copy names the *contents* of `output/` as its sources, with a trailing slash on the destination —
 both of which tell gcloud the destination is a container to place them in. `cp -r output <dest>` would
@@ -699,6 +728,7 @@ installer.
 - **Google Sheets auth failure**: verify `auth_key_path` points to a valid *service account* JSON key (an OAuth client-secret file will not work — the error names the missing `client_email` field), and that the sheet is shared with the key's `client_email`, which the error quotes. `gcloud auth login` is not a substitute — the key is read directly. A `gs://` value is read with `gcloud storage cat`, so check the *active gcloud account* can read that object even though the key inside it is a different identity. If the metadata is a local `.tsv`/`.csv`, no key is needed at all.
 - **`auth_key_path` must be a gs:// object for a --gcp run**: the key is no longer copied onto the VM, so a local path names a file that does not exist there. Upload the key once, point the field at it, and the pipeline reads it straight out of the bucket when it opens the sheet. `./slidr` raises this at launch, before a VM is created.
 - **Slack alerts not arriving**: `settings.slack_token` may be a local file path, a `gs://` object or the literal token; a path-shaped value that does not resolve is a hard error rather than being tried as a token. The bot needs `users:read.email` (to map the `Email` column to a user) and `chat:write`. A token file that is group- or world-readable produces a warning.
+- **`only N% of <sample>'s reads carry a valid cell barcode`**: cellranger matched almost none of the sample's cell barcodes against the whitelist for the `Chemistry` it was given, which nearly always means that column is wrong (3' and 5' kits use different whitelists, so the wrong one leaves a few percent matching by chance; a correct one gives 85–95%). Only a warning — cellranger exits 0 and its output is intact — but left uncorrected, cellbender fails later with a `ZeroDivisionError` from scipy, having found no empty droplets to learn an ambient profile from. Fix the `Chemistry` column and re-run `--count --force`. Flex samples are not checked, since `cellranger multi` reports this metric in a different format.
 - **`FileNotFoundError` / exit 127 for `julia` when spatial counting starts**: a path in `software_cache.txt` that does not exist or does not run. Auto-installed Julia used to be cached as `<depot>/bin/julia`, a layout juliaup never creates, so the failure surfaced only once the spatial stage tried to launch it. Fixed by globbing the depot and executing the binary before caching it; a stale line from an earlier run is skipped automatically, and can be deleted from `software_cache.txt` if you would rather not look at it.
 - **`the Julia installer reported success, but no working julia binary was found`**: juliaup exited 0 but left nothing runnable under `~/.local/slidr/bin/julia`. The message names the exact `find` to run; a binary that is present but will not execute is usually a glibc or architecture mismatch, in which case install Julia yourself and pin it in `software_cache.txt`.
 - **Cellranger version not found**: `test_and_install_software` matches an install directory named `cellranger[-_v]<version>` exactly, so a `V8` in the `Cellranger` column is expanded via `helpers.CELLRANGER_VERSIONS`. If your site has a different patch release, edit that table — an unmapped value is passed through as written. The separator between name and version may be any run of `-`, `_` or `v` (`cellranger-8.0.1`, `cellranger_8.0.1`, `cellranger-v8.0.1`), but there must be at least one: a bare `cellranger8.0.1` does not match. The match is exact at both ends, so `cellranger-8.0.11` and `cellranger-8.0.1-beta` are not picked up for `8.0.1`.

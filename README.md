@@ -175,10 +175,11 @@ The local directory a staged run downloads `input_path` into. Left unset it defa
 `<output_path>/<BCL_ID>/data`, so a staged run writes nothing outside its own run directory and needs no
 per-machine configuration — which is what a fresh VM or a cluster job can count on.
 
-It sits beside `output/` rather than inside it on purpose: `settings.output_bucket` uploads the whole of
-`output/` when a run succeeds, and this directory holds raw inputs that came *out* of a bucket. Staging
-them under `output/` would send the entire sequencing run — hundreds of GB — straight back to GCS every
-time a run finished.
+It sits beside `output/` rather than inside it on purpose: `settings.output_bucket` uploads `output/`
+when a run succeeds, and this directory holds raw inputs that came *out* of a bucket. Staging them under
+`output/` would send the entire sequencing run — hundreds of GB — straight back to GCS every time a run
+finished. (The reference genome and a staged `software_path` land under `output/` and are excluded from
+the upload individually for the same reason; the sequencing data is far too large to handle that way.)
 
 Set it to move that data elsewhere, typically cluster scratch:
 
@@ -193,18 +194,33 @@ Local runs ignore the field entirely.
 ### `settings.output_bucket`
 
 Where the run's `output/` tree is copied once it has succeeded — and, for a `--gcp` run, where its
-config is uploaded at launch. The results land in a folder named for the run, and a folder that is
-already there is never written over:
+config is uploaded at launch and where its logs are sent however the run ends. The results land in a
+folder named for the run, and a folder that is already there is never written over:
 
 ```
 gs://<output_bucket>/20240101_RUNID/      # first run of this BCL
 ├── config.yaml                           #   --gcp only: the config this run booted with
+├── log/                                  #   --gcp only: runtime.log, the summary, per-stage tool logs
+├── metadata/                             #   --gcp only: the rows and samplesheets this run used
 ├── mkfastq/
 ├── count/
 └── ...
 gs://<output_bucket>/20240101_RUNID_2/    # a later run of the same BCL
 gs://<output_bucket>/20240101_RUNID_3/    # and the one after that
 ```
+
+Two directories under `output/` are deliberately left out of the upload: `reference/` and `software/`,
+which a staged run downloads its own *inputs* into. Sending them back would return the bytes to the
+bucket they were read out of minutes earlier — on a mouse run, 14 GiB of reference genome and 2.5 GiB
+of Cellranger against roughly 5 GiB of actual output. `pucks/` and `barcodes/` are kept, since a puck
+CSV may have been generated during the run rather than downloaded.
+
+`log/` and `metadata/` are uploaded by a separate step that runs however the process exits, including
+every crash — which is when they matter most, since a `--gcp` VM deletes itself and takes its disk with
+it. That step is a no-op for local and `--slurm` runs, whose logs are already on a filesystem that
+outlives them. It cannot cover a hard kill (an OOM or a preempted VM runs no exit hook), and errors
+raised while the config is still being loaded happen too early for it — those stay visible through
+`watch_run.sh`, which reads Cloud Logging rather than the bucket.
 
 **`--gcp` requires this field.** `./slidr --gcp` uploads your local `config/config.yaml` into the folder
 above and hands the VM its URI, so the VM boots from the file you just edited rather than a copy kept in a
@@ -232,8 +248,8 @@ re-run from an accidental second launch. Deleting the folder you did not want is
 `gcloud storage rm -r gs://<output_bucket>/<BCL_ID>` before a re-run is how you get the unsuffixed name
 back.
 
-This is the only copy of the results a `--gcp` VM leaves behind, since the VM deletes itself when it
-finishes.
+This is the only copy of anything a `--gcp` VM leaves behind, since the VM deletes itself when it
+finishes — results only if the run succeeded, logs either way.
 
 ### Google Sheets authentication
 
@@ -476,14 +492,21 @@ is exposed on `./slidr` itself.
     │   │   ├── pucks/               # bead barcode files downloaded from Takara
     │   │   ├── samplesheets/        # generated Trekker demux / profiling / merge sheets
     │   │   └── trekker/             # per-partition nuclei positioning output
-    │   ├── reference/               # staged only: local copy of the reference genome
+    │   ├── reference/               # staged only: local copy of the reference genome (not uploaded)
+    │   ├── software/                # only when `software_path` is a gs:// prefix (not uploaded)
     │   ├── pucks/                   # staged only: puck coordinate CSVs, downloaded or generated
     │   └── barcodes/                # staged only: raw bead barcodes for puck generation
+    ├── data/                        # staged only: run folders downloaded from `paths.input_path`,
+    │                                #   one per BCL this run demultiplexes. A sibling of output/, not
+    │                                #   inside it — see `settings.gcs_download_dest`
     └── tmp/                         # temporary Cellranger output directory
 ```
 
 No single run contains every entry: the `flex/` tree, `multi_samplesheet.csv` and `takara_pipeline.log`
-appear only for Flex chemistry, and `reference/`/`pucks/`/`barcodes/` only when staging from GCS. The
+appear only for Flex chemistry, `reference/`/`pucks/`/`barcodes/`/`data/` only when staging from GCS,
+and `software/` only when `paths.software_path` is a `gs://` prefix. Of these, `reference/`, `software/`
+and `data/` hold inputs the run downloaded rather than results it produced, and none of the three is
+uploaded to `settings.output_bucket`. The
 run directory is `<output_path>/<BCL_ID>/`, unless `output_path` already ends in the BCL ID — in which
 case it is taken as the run directory itself rather than nested again.
 

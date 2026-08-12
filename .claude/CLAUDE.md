@@ -119,7 +119,7 @@ metadata and the run summary record one canonical spelling regardless of what wa
 |---|---|---|
 | `--fastqs [PATH]` | `-fq` | Treat the input as already-demultiplexed FASTQs; skips mkfastq. PATH is optional — with no value the FASTQs are read from `paths.input_path`. Mutually exclusive with `--mkfastq` |
 | `--metadata PATH` | `-md` | Metadata `.tsv`/`.csv` path or Google Sheet URL for this run, overriding `settings.metadata_source`. Recorded in the run summary as a `Metadata override` line |
-| `--stage-gcs` | `-sg` | Fetch this run's inputs from GCS: `reference_path`/`puck_path`/`raw_barcodes_path`, plus `software_path` when it is a `gs://` URI, plus any extra BCL run folder a split-BCL run merges from, plus — under `--slurm` — the sequencing data and the auth key if the bucket has one. A `--slurm` run's config is never staged. Implied by `--gcp` |
+| `--stage-gcs` | `-sg` | Fetch this run's inputs from GCS: `reference_path`/`puck_path`/`raw_barcodes_path`, plus any extra BCL run folder a split-BCL run merges from, plus — under `--slurm` — the sequencing data. A `gs://` `software_path` is staged with or without this flag, and neither a `--slurm` run's config nor the auth key is ever staged. Implied by `--gcp` |
 | `--run-all` | `-ra` | Run all stages end-to-end (default if no stage flag given) |
 | `--mkfastq` | `-mf` | Run Cellranger mkfastq only |
 | `--count` | `-ct` | Run Cellranger count only |
@@ -372,18 +372,24 @@ both forms remain valid under the flag:
 
 | | Value is a local directory | Value is a full `gs://…` URI |
 |---|---|---|
-| Without `--stage-gcs` | scanned in place | hard error, naming `--stage-gcs` |
+| Without `--stage-gcs` | scanned in place | contents downloaded to `output/software/`, with a `[NOTE]` saying so |
 | With `--stage-gcs`/`--gcp` | scanned in place — *not* an error | contents downloaded to `output/software/`, then scanned there |
 
-The asymmetry is intentional: Cellranger is usually preinstalled on the machine that runs the pipeline
-(the `--gcp` VM image is built that way), and since `--gcp` implies `--stage-gcs`, requiring a bucket
-would break every existing VM run. A bare `bucket/prefix` is *not* accepted here, unlike the three
-fields above — it is indistinguishable from a relative local directory, and guessing wrong costs a
-multi-GB download rather than an error message. Staging is lazy (a warm `software_cache.txt` skips it),
-happens at most once per run, is reused by later runs in the same output tree, and ends by restoring
-execute bits, which `gcloud storage cp` does not preserve.
+Both asymmetries are intentional. A local directory stays valid under the flag because Cellranger is
+usually preinstalled on the machine that runs the pipeline (the `--gcp` VM image is built that way),
+and since `--gcp` implies `--stage-gcs`, requiring a bucket would break every existing VM run.
 
-A `gs://` value without the flag is a clear error ("not a directory... pass `--stage-gcs`"), not a silent misread.
+And a `gs://` URI is acted on **without** the flag, the way `paths.auth_key_path` is. `--stage-gcs`
+exists to disambiguate the bare `bucket/prefix` form, which cannot be told apart from a relative local
+directory — and that form is *not* accepted here, so the flag has nothing left to decide. Demanding it
+anyway made a real configuration unexpressible: software in a bucket with the data local failed without
+the flag, and failed *with* it too, since `_validate_resource_path` then requires
+`reference_path`/`puck_path`/`raw_barcodes_path` to be GCS locations as well. The download is announced
+on stdout instead, which is what the requirement was really protecting against.
+
+Staging is lazy (a warm `software_cache.txt` skips it), happens at most once per run, is reused by later
+runs in the same output tree, and ends by restoring execute bits, which `gcloud storage cp` does not
+preserve. A bare `bucket/prefix` is reported as a directory that does not exist, not silently misread.
 
 ---
 
@@ -568,7 +574,7 @@ The script itself no longer downloads the sequencing data: `paths.input_path` na
 
 | Flag | Applies to | Description |
 |---|---|---|
-| `--stage-gcs` | `--slurm` | Opt a Slurm run into reading `input_path` (and its reference/puck/barcode/software paths) as GCS locations and staging them. Neither the config nor the auth key is ever staged. Implied by `--gcp` |
+| `--stage-gcs` | `--slurm` | Opt a Slurm run into reading `input_path` and its reference/puck/barcode paths as GCS locations and staging them. A `gs://` `software_path` needs no flag and is staged either way; neither the config nor the auth key is ever staged. Implied by `--gcp` |
 | `--workdir PATH` | staged `--slurm` | Where outputs are written, and — by default — where inputs are staged beneath them. Rarely needed: defaults to the parent of `paths.output_path` in the config, then `$SCRATCH/slidr`, then `<repo>/slidr-work/<BCL_ID>`. The resolved value and its origin are printed at submit time |
 
 ### Pointing a config at the job's workdir

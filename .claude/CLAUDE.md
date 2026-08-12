@@ -77,6 +77,7 @@ There is no built-in default and no command-line equivalent: set `paths.input_pa
 | Flag | Short | Description |
 |---|---|---|
 | `--version` | `-v` | Print the pipeline version (read from `pyproject.toml`) and exit |
+| `--update` | `-u` | Fast-forward this checkout to the newest slidr on GitHub and exit. Local edits are kept unless the update touches the same file, in which case it aborts and points at `git stash` — `config/config.yaml` is tracked, so this is the common case. Dependencies are not synced here: `uv run`/`uv sync` do that at the next launch |
 | `--help` | `-h` | Print usage and exit |
 
 ### Where the run executes
@@ -97,7 +98,7 @@ read); `--slurm` stages only when asked with `--stage-gcs`. Where the download l
 | `--zone ZONE` | `us-central1-a` | GCP compute zone |
 | `--machine TYPE` | `n1-standard-16` | Machine type |
 | `--disk SIZE` | `200GB` | Boot disk size |
-| `--gpu [TYPE]` | off; `nvidia-tesla-t4` when bare | Attach a GPU. Takes an optional GCE accelerator name (e.g. `--gpu nvidia-l4`), validated as lowercase alphanumerics/hyphens before the VM is created |
+| `--gpu [TYPE]` | off; `nvidia-tesla-t4` when bare | Attach a GPU. Takes an optional GCE accelerator name (e.g. `--gpu nvidia-l4`), validated as lowercase alphanumerics/hyphens before the VM is created. **Also valid with `--slurm`** — see below |
 
 ### Slurm options (only apply with `--slurm`)
 | Flag | Default | Description |
@@ -105,6 +106,7 @@ read); `--slurm` stages only when asked with `--stage-gcs`. Where the download l
 | `--partition NAME` | cluster default | Partition to submit to |
 | `--time LIMIT` | `24:00:00` | Job time limit |
 | `--workdir PATH` | derived | Where staged inputs and outputs go. Resolves to `--workdir`, then the parent of `paths.output_path` in the config the job will run with, then `$SCRATCH/slidr`, then `<repo>/slidr-work/<BCL_ID>`. The chosen value and its origin are printed at submit time. Only valid with `--stage-gcs` |
+| `--gpu [TYPE]` | off | Shared with `--gcp`, but translated for Slurm: a bare `--gpu` submits with `--gres=gpu:1`, and `--gpu TYPE` with `--gres=gpu:TYPE:1`. TYPE here is a **gres type from your cluster's `gres.conf`** (`a100`, `v100`, `a100_80gb` — `sinfo -o '%G'` lists them), not a GCE accelerator name; underscores are accepted for Slurm and rejected for GCE, and an `nvidia-`-prefixed value warns because it is almost always pasted from a `--gcp` command. Always one GPU: cellbender is the only GPU consumer and trains on a single device |
 
 CPUs and memory are not flags: they come from `settings.threads`/`settings.memory` in the config the job
 will run with (fetched from the bucket at submit time for a staged run).
@@ -152,6 +154,7 @@ and pass it by hand.
 |---|---|
 | mkfastq runs (with `--mkfastq`/`--run-all`), and `input_path/<BCL_ID>` **must** validate as an Illumina run folder — a failure is a hard error | mkfastq is skipped; `DIR` must exist and contain `.fastq.gz` files (checked in `config.py` before any stage runs, or — for a staged bare `--fastqs`, whose directory does not exist yet — in `main.py` right after it is downloaded) |
 | `count`/`spatial-count` read FASTQs from `output/mkfastq/` | `count`/`spatial-count` read FASTQs from `DIR`, and `helpers.missing_fastqs` first verifies an R1+R2 exists per sample per library, per declared lane |
+| cellranger reads every lane in the library's folder — mkfastq wrote exactly the declared ones | cellranger is restricted to the declared lanes with its own `--lanes`, since a shared delivery directory also carries other lanes' index bleed for the same sample. A blank `Lane` or `*` omits the flag and reads everything |
 | cellranger `--sample` is the sample name (mkfastq names libraries that way) | library names are read back off the filenames in `DIR` |
 | `paths.input_path` is required | `paths.input_path` is required for a bare `--fastqs` (it *is* the input); with an explicit `DIR` it may be omitted and defaults to `DIR` |
 
@@ -182,6 +185,39 @@ mysample_sb_S2_L003_R1_001.fastq.gz     # spatial barcodes, as mkfastq names it
 # an explicit DIR under --gcp is for FASTQs already on the VM image, not for staged ones
 ./slidr --bcl 20240101_RUNID --gcp --fastqs /opt/reference_fastqs
 ```
+
+---
+
+## Staying up to date
+
+`./slidr --update` fast-forwards the checkout to the newest slidr on GitHub, and a run checks once a
+day and prints a notice when one is available. Both live in `./slidr` rather than the Python side: a
+`--gcp` VM clones the repo fresh at boot and a Slurm job runs from the submitter's checkout, so the
+launcher is the only place where a stale copy is both possible and fixable.
+
+Design points worth not re-litigating:
+
+- **A notice, not a prompt.** `./slidr` is run from scripts and cron entries with nothing on stdin;
+  blocking on a `y/n` would hang them. The action is named in the message and stays explicit.
+- **Best-effort, always silent on failure.** No route to github.com, an expired credential, a missing
+  remote, a detached HEAD, a non-git directory: all skip the check. It is a convenience running beside
+  the real work and must never cost a run. The fetch is capped at 10s by `run_with_timeout`, since
+  `timeout(1)` is GNU coreutils and absent on macOS.
+- **Once a day**, recorded in `.slidr_update_check` (gitignored, beside `.last_run`). The stamp is
+  written *before* the fetch, so an unreachable remote backs off for the full interval instead of
+  paying the timeout on every launch. `SLIDR_NO_UPDATE_CHECK=1` disables it, `SLIDR_UPDATE_INTERVAL`
+  re-times it.
+- **`--update` does not refuse on a dirty tree.** `config/config.yaml` is tracked and every user must
+  edit it, so a blanket refusal would refuse nearly every real checkout. `git pull --ff-only` already
+  draws the line correctly — it keeps modifications to files the update does not touch and aborts
+  before overwriting ones it does — so the decision is left to git, and the error hints point at
+  `git stash` for the case where it aborts.
+- **No dependency sync.** `uv run` (local) and the explicit `uv sync` (`--slurm`) already do it at
+  launch, so `--update` needs only git: no Python environment, no PyPI access.
+- **Version strings come from `pyproject.toml`**, local and remote both parsed by `extract_version`
+  (the remote copy via `git show @{u}:pyproject.toml`, needing no second network call). Most updates
+  are fixes that never touch the version, so the notice leads with the commit count and mentions the
+  version only when it changed.
 
 ---
 
@@ -589,8 +625,14 @@ GCS, and `software/` only when `paths.software_path` is a `gs://` prefix.
 
 ### The upload to `settings.output_bucket`
 
-On success `pipeline.upload_outputs` copies the whole of `output/` — and nothing else — to
-`<output_bucket>/<BCL_ID>`, so a bucket collecting several runs says which is which. A folder already at
+On success `pipeline.upload_outputs` copies `output/` to `<output_bucket>/<BCL_ID>`, so a bucket
+collecting several runs says which is which — minus `reference/` and `software/`, which a staged run
+downloads its own *inputs* into (`UPLOAD_SKIP`) and which would otherwise be returned to the bucket
+they came from: 14 GiB of reference genome and 2.5 GiB of Cellranger on a mouse run. `pucks/` and
+`barcodes/` are kept, since a puck CSV may have been generated during the run. Outside `output/`,
+`data/` holds staged reads that came out of a bucket already and `tmp/` is scratch, so neither is
+uploaded by anything — but `log/` and `metadata/` are, by a different function: see
+[Logs are uploaded separately](#logs-are-uploaded-separately). A folder already at
 that name is never written over: `unique_gcs_dest` asks the bucket what is there (`gcloud storage ls`)
 and moves to `<BCL_ID>_2`, `_3`, … , falling back to a timestamp suffix past 100. The upload is the last
 thing a run does, hours of compute after a mistake could still be caught, and nothing tells a deliberate
@@ -606,6 +648,29 @@ A `--gcp` run does not resolve the folder here at all — `./slidr` resolved it 
 order to put config.yaml in it, and passed it down as `SLIDR_OUTPUT_DEST` (`cfg['output_dest']`), which
 is used verbatim. That also closes the first limit above for `--gcp`, since writing the config claims the
 name. See [How the config reaches the VM](#how-the-config-reaches-the-vm).
+
+### Logs are uploaded separately
+
+`upload_outputs` runs only on success, so on its own a failed `--gcp` run left no trace of itself: the
+VM self-deletes when the startup script exits and takes `runtime.log`, the run summary and every
+per-stage tool log with the disk — in exactly the case where the machine can no longer be inspected.
+
+`pipeline.upload_diagnostics` closes that: it copies `log/` and `metadata/` into the same
+`<output_bucket>/<BCL_ID>` folder, landing as `<dest>/log/` and `<dest>/metadata/` beside the contents
+of `output/`. It is registered with `atexit` in `main.py`, so it runs however the process ends, and it
+is a **no-op unless `SLIDR_OUTPUT_DEST` is set** — a local or Slurm run keeps its logs on a filesystem
+that outlives it, and re-resolving a destination here could pick a different `<BCL_ID>_N` folder than
+`upload_outputs` settled on and split one run across two.
+
+`output/` is deliberately not included: it holds the FASTQs mkfastq wrote, routinely tens of GB, and
+pushing that to a bucket on every crash would cost far more than it saves.
+
+Two things it cannot do. A hard kill (OOM killer, preempted VM) runs no exit hook at all. And
+`config.py`'s own validation errors — an unreadable config.yaml, a non-GCS `input_path`, a malformed
+`SLIDR_OUTPUT_DEST` — are raised while `config` is being imported, before `main.py` reaches the line
+that registers the hook, so no log file survives for them; they are still readable through
+`watch_run.sh`, since the ops-agent forwards stderr to Cloud Logging. Note also that the uploaded
+`runtime.log` necessarily stops just short of the end, since the upload is what happens next.
 
 The copy names the *contents* of `output/` as its sources, with a trailing slash on the destination —
 both of which tell gcloud the destination is a container to place them in. `cp -r output <dest>` would
@@ -678,6 +743,7 @@ installer.
 
 ## Troubleshooting
 
+- **`the Miniforge installer failed`, on every run, with conda already installed**: `ensure_conda` keyed off `command -v conda`, which is false in a non-interactive shell even when Miniforge is installed — the installer's `conda init bash` writes `~/.bashrc`, and `./slidr` never sources it. So each run tried to install again and the installer refused the existing `~/miniforge3`. It now searches `$CONDA_ROOT`, `$MAMBA_ROOT_PREFIX`, `~/miniforge3`, `~/mambaforge`, `~/miniconda3`, `~/anaconda3`, `/opt/miniforge3` and `/opt/conda` for a runnable `bin/conda` and prepends it to `PATH`; set `CONDA_ROOT` for an install anywhere else. A prefix present without a working `bin/conda` is treated as a broken install and reinstalled in place with `-u`, and the installer is downloaded to a temp directory so a failure no longer leaves a ~100 MB `Miniforge3-*.sh` in the repository root.
 - **Cellranger refuses to run on re-run**: manually delete `output/mkfastq/` and/or `output/count/` — Cellranger will not overwrite existing outputs. Use `--force` to have slidr handle this.
 - **`... is not a usable Illumina BCL run directory`**: a run folder failed the run-folder check; the preceding log lines list exactly what's missing. If the reads are in fact already demultiplexed, pass them with `--fastqs` instead — the pipeline will not guess this for you. The check covers every BCL the run demultiplexes, so for a merged-in one the fix is usually that the `Merge ... From BCL` value does not match the folder name under `paths.input_path`. On a staged run, a partial download is re-fetched with `RESTAGE=1`.
 - **`these samples declare no gene-expression library to demultiplex`**: a row has an empty `RNA Index` and no `Merge RNA From BCL`, so it names no index in any run folder. Set `RNA Index`, or — if that library was sequenced on another run — leave it empty and set `Merge RNA From BCL` + `Add RNA Index`. Raised by `create_samplesheet` before any BCL is staged, because such a row is invisible later: the mkfastq-completeness check has no read pair to require for it, so it counts as done and the run fails much later inside cellranger. A `--fastqs` run is exempt, since it never demultiplexes and reads library names off the filenames.
@@ -686,7 +752,7 @@ installer.
 - **`input_path must be a GCS location when staging from GCS`**: `--stage-gcs`/`--gcp` reads `paths.input_path` as a bucket prefix, and this one is a local path. Point it at the `gs://` prefix holding the run folders; where they are downloaded *to* is `settings.gcs_download_dest`, not this field. The same error names `reference_path`/`puck_path`/`raw_barcodes_path` for the same mistake.
 - **`input_path is a GCS location, but this run was not asked to stage from GCS`**: the converse — add `--stage-gcs` (or `--gcp`), or point the field at a local directory.
 - **`no .fastq.gz files were staged to the FASTQ directory for --fastqs`**: a staged bare `--fastqs` downloaded `<input_path>/<BCL_ID>` and found no FASTQs in it. Usually that folder holds BCLs, in which case drop `--fastqs`.
-- **`the following FASTQ files are missing from ...`**: a `--fastqs` directory is incomplete or its filenames don't follow the convention above. The message names each sample, library and read that couldn't be found; check the `Lane`/`SB Lane` metadata columns against the `_L00N_` tokens in the filenames.
+- **`the following FASTQ files are missing from ...`**: a `--fastqs` directory is incomplete or its filenames don't follow the convention above. The message names each sample, library and read that couldn't be found; check the `Lane`/`SB Lane` metadata columns against the `_L00N_` tokens in the filenames. Under `--fastqs` the `Lane` column also becomes cellranger's own `--lanes`, so a lane declared there but absent from the filenames is a hard stop rather than something count quietly works around.
 - **Missing reference genome when staging**: set `paths.reference_path` to a `gs://` location (or a bare bucket path — `gs://` is prepended automatically) — the pipeline will `gcloud storage cp` the `settings.reference_genome` subdirectory from there if it isn't already staged under `output/reference/`.
 - **Puck file not found**: when staging, `paths.puck_path` must be a `gs://` location — the pipeline downloads `<puck_id>.csv` from it; if that object is absent it falls back to copying the corresponding raw barcodes from `paths.raw_barcodes_path` and generating the puck locally, and only errors if `raw_barcodes_path` is unset too.
 - **`could not stage ... from GCS`**: `gcloud`'s own stderr is echoed under the message, along with the exact command that failed. Check the object exists (`gcloud storage ls <uri>`) and that the active account can read the bucket (`gcloud auth print-access-token`).
@@ -699,6 +765,7 @@ installer.
 - **Google Sheets auth failure**: verify `auth_key_path` points to a valid *service account* JSON key (an OAuth client-secret file will not work — the error names the missing `client_email` field), and that the sheet is shared with the key's `client_email`, which the error quotes. `gcloud auth login` is not a substitute — the key is read directly. A `gs://` value is read with `gcloud storage cat`, so check the *active gcloud account* can read that object even though the key inside it is a different identity. If the metadata is a local `.tsv`/`.csv`, no key is needed at all.
 - **`auth_key_path` must be a gs:// object for a --gcp run**: the key is no longer copied onto the VM, so a local path names a file that does not exist there. Upload the key once, point the field at it, and the pipeline reads it straight out of the bucket when it opens the sheet. `./slidr` raises this at launch, before a VM is created.
 - **Slack alerts not arriving**: `settings.slack_token` may be a local file path, a `gs://` object or the literal token; a path-shaped value that does not resolve is a hard error rather than being tried as a token. The bot needs `users:read.email` (to map the `Email` column to a user) and `chat:write`. A token file that is group- or world-readable produces a warning.
+- **`only N% of <sample>'s reads carry a valid cell barcode`**: cellranger matched almost none of the sample's cell barcodes against the whitelist for the `Chemistry` it was given, which nearly always means that column is wrong (3' and 5' kits use different whitelists, so the wrong one leaves a few percent matching by chance; a correct one gives 85–95%). Only a warning — cellranger exits 0 and its output is intact — but left uncorrected, cellbender fails later with a `ZeroDivisionError` from scipy, having found no empty droplets to learn an ambient profile from. Fix the `Chemistry` column and re-run `--count --force`. Flex samples are not checked, since `cellranger multi` reports this metric in a different format.
 - **`FileNotFoundError` / exit 127 for `julia` when spatial counting starts**: a path in `software_cache.txt` that does not exist or does not run. Auto-installed Julia used to be cached as `<depot>/bin/julia`, a layout juliaup never creates, so the failure surfaced only once the spatial stage tried to launch it. Fixed by globbing the depot and executing the binary before caching it; a stale line from an earlier run is skipped automatically, and can be deleted from `software_cache.txt` if you would rather not look at it.
 - **`the Julia installer reported success, but no working julia binary was found`**: juliaup exited 0 but left nothing runnable under `~/.local/slidr/bin/julia`. The message names the exact `find` to run; a binary that is present but will not execute is usually a glibc or architecture mismatch, in which case install Julia yourself and pin it in `software_cache.txt`.
 - **Cellranger version not found**: `test_and_install_software` matches an install directory named `cellranger[-_v]<version>` exactly, so a `V8` in the `Cellranger` column is expanded via `helpers.CELLRANGER_VERSIONS`. If your site has a different patch release, edit that table — an unmapped value is passed through as written. The separator between name and version may be any run of `-`, `_` or `v` (`cellranger-8.0.1`, `cellranger_8.0.1`, `cellranger-v8.0.1`), but there must be at least one: a bare `cellranger8.0.1` does not match. The match is exact at both ends, so `cellranger-8.0.11` and `cellranger-8.0.1-beta` are not picked up for `8.0.1`.

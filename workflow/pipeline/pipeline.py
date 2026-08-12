@@ -160,6 +160,13 @@ def check_barcode_validity(
     output is intact and the operator may have a reason to continue. It says the one thing the
     traceback two stages later will not -- look at the `Chemistry` column.
 
+    Flex is not covered, twice over: the call site is in the standard `cellranger count` branch of
+    run_count, which Flex does not take, and `cellranger multi` writes metrics_summary.csv in a long
+    Category/Metric Name/Metric Value form with no `Valid Barcodes` column, so the guard below would
+    return even if it were called. That is a gap rather than a hazard -- a Flex library declaring the
+    wrong probe barcodes fails in ways of its own -- but covering it means parsing the other format,
+    not moving this call.
+
     Inputs:
      - sample_name: sample being checked, for the message
      - count_dir:   this sample's count output directory, holding metrics_summary.csv
@@ -179,9 +186,11 @@ def check_barcode_validity(
             row = next(csv.DictReader(handle), None)
         if not row or 'Valid Barcodes' not in row:
             return
-        # cellranger writes this as a percentage string, e.g. "85.7%"
-        rate = float(str(row['Valid Barcodes']).strip().rstrip('%'))
-    except (OSError, StopIteration, TypeError, ValueError):
+        # cellranger writes this as a percentage string, e.g. "85.7%". A thousands separator is
+        # possible in this file's other columns and harmless to strip here, since a valid rate never
+        # reaches four digits.
+        rate = float(str(row['Valid Barcodes']).strip().rstrip('%').replace(',', ''))
+    except (OSError, TypeError, ValueError):
         return
 
     if rate >= threshold:
@@ -194,6 +203,40 @@ def check_barcode_validity(
     log_write(f" • Check the `Chemistry` metadata column for {sample_name} against how the library was actually prepared")
     log_write(f" • Full metrics are in {run_relative(metrics)}, and the barcode-rank plot in {run_relative(Path(count_dir) / 'web_summary.html')}")
     log_write(" • Left uncorrected, cellbender fails later with an unrelated-looking error, having found no empty droplets")
+
+
+def move_replacing(item: Path, target: Path) -> None:
+    """
+    Move `item` to `target`, replacing whatever is already there.
+
+    `shutil.move` onto an existing *directory* does not replace it -- it moves the source inside it.
+    Both places cellranger's outputs are collected hit that on a re-run, and both did so silently: the
+    standard path produced count/<sample>/filtered_feature_bc_matrix/filtered_feature_bc_matrix/ on the
+    first re-run and died with "Destination path already exists" on the second, having paid for the
+    full cellranger run both times. Only directories nested -- files do get replaced -- which is why
+    the .h5 outputs downstream still looked right and the first re-run appeared to succeed.
+
+    `is_symlink()` is tested before `is_dir()` deliberately: `is_dir()` follows symlinks, so the other
+    order would rmtree *through* a symlinked destination into whatever it points at.
+
+    Two limits are accepted rather than solved. The removal happens before the move, so a move that
+    fails leaves neither copy -- tolerable only because every caller has just regenerated the data it
+    is replacing. And only the names being moved this time are cleared, so an output from an earlier
+    run under a different cellranger version survives beside the new ones; clearing the destination
+    wholesale would fix that at the cost of deleting anything an operator had put there deliberately.
+
+    Inputs:
+     - item:   the file or directory to move
+     - target: where it goes, replaced if it exists
+    Output:
+     - none
+    """
+
+    if target.is_symlink() or target.is_file():
+        target.unlink()
+    elif target.is_dir():
+        shutil.rmtree(target)
+    shutil.move(item, target)
 
 
 def conda_subprocess_env() -> dict:
@@ -840,13 +883,17 @@ def upload_outputs() -> None:
     just put a config.yaml there, so leaving that to chance would put the results one level deeper than
     a locally-resolved run's.
 
-    Only `output/` is uploaded, as before: `data/` holds staged sequencing reads that came out of a
-    bucket in the first place, and `log/`, `metadata/` and `tmp/` stay on the machine that ran the job.
+    What is uploaded is `output/`, minus the directories a staged run downloads its own *inputs* into
+    (UPLOAD_SKIP). Those sit under `output/` only because a staged run needs somewhere local and
+    writable to put them, and sending them back is pure cost: on a mouse run that is the 14 GiB
+    reference genome and 2.5 GiB of Cellranger, returned to the folder they were copied out of moments
+    earlier.
 
-    Within `output/`, the directories a staged run downloads its *inputs* into are skipped as well --
-    see UPLOAD_SKIP. They sit there only because a staged run needs somewhere local to put them, and
-    sending them back is pure cost: on a mouse run that is the 14 GiB reference genome and 2.5 GiB of
-    Cellranger, re-uploaded into the results folder they were copied out of moments earlier.
+    What is not uploaded here divides in two. `data/` (staged sequencing reads, which came out of a
+    bucket in the first place) and `tmp/` (scratch) are not uploaded by anything, deliberately. `log/`
+    and `metadata/` are not this function's job but are not left behind either: `upload_diagnostics`
+    sends them to the same folder from an atexit hook, so that a run which never reaches here -- every
+    crash, which is when they matter most -- still leaves its logs in the bucket.
 
     Output:
      - none; a failure is a warning, since the outputs themselves are already on local disk
@@ -855,12 +902,18 @@ def upload_outputs() -> None:
     if OUTPUT_DEST is None and (OUTPUT_BUCKET is None or not str(OUTPUT_BUCKET).strip()):
         return
 
-    entries = sorted(
-        entry for entry in (OUTPUT_PATH.iterdir() if OUTPUT_PATH.is_dir() else [])
-        if entry.name not in UPLOAD_SKIP
-    )
+    present = sorted(OUTPUT_PATH.iterdir()) if OUTPUT_PATH.is_dir() else []
+    entries = [entry for entry in present if entry.name not in UPLOAD_SKIP]
     if not entries:
-        log_write(f"[WARNING]: nothing to upload to {OUTPUT_DEST or OUTPUT_BUCKET} — {run_relative(OUTPUT_PATH)} is empty")
+        # Told apart because they mean different things: an empty output/ is a run that produced
+        # nothing, while a tree holding only staged inputs is a staged run whose stages all no-opped
+        # (everything already present, and no --force). Reporting the second as "empty" sends whoever
+        # reads it looking for outputs that were never missing.
+        if present:
+            skipped = ', '.join(entry.name for entry in present)
+            log_write(f"[WARNING]: nothing to upload to {OUTPUT_DEST or OUTPUT_BUCKET} — {run_relative(OUTPUT_PATH)} holds only staged inputs ({skipped}), which are never uploaded")
+        else:
+            log_write(f"[WARNING]: nothing to upload to {OUTPUT_DEST or OUTPUT_BUCKET} — {run_relative(OUTPUT_PATH)} is empty")
         return
 
     bucket = gcs_uri(OUTPUT_DEST or OUTPUT_BUCKET)
@@ -918,8 +971,17 @@ def upload_diagnostics() -> None:
 
     Registered with `atexit` by main.py rather than called at the end of it, so that it also runs on
     the paths that leave through `sys.exit` instead of reaching the bottom of the script: every tool
-    crash (`helpers.job_failure`) and every validation error. It cannot cover a hard kill -- SIGKILL
-    from the OOM killer, a preempted VM -- because nothing runs then.
+    crash (`helpers.job_failure`), and the checks that run once the metadata is loaded -- the
+    samplesheet's index validation, the FASTQ checks, the run-folder checks.
+
+    Two gaps, both of them structural rather than oversights. A hard kill (SIGKILL from the OOM
+    killer, a preempted VM) runs nothing at all. And config.py's own validation -- the ~30 exits for
+    an unreadable config.yaml, a non-GCS `input_path`, a malformed SLIDR_OUTPUT_DEST -- happens while
+    `config` is being imported, which is before main.py executes a single statement and therefore
+    before this hook can be registered. Those errors are printed to stderr, which on a --gcp VM the
+    ops-agent still forwards to Cloud Logging, so they remain readable through `watch_run.sh` even
+    though no log file survives to the bucket. Registering earlier would mean registering from inside
+    config.py, which cannot import this module without a cycle.
 
     Deliberately not `output/`: that tree holds the FASTQs mkfastq wrote, routinely tens of GB, and
     pushing it to a bucket on every crash would cost far more than it saves. Preserving a failed run's
@@ -1431,8 +1493,12 @@ def run_count() -> None:
             log_write(" • Check the probe barcode IDs in the `Flex Probe Barcode IDs` metadata column match the ones actually used in the library prep")
             log_write(f" • Check `workflow.flex_probe_set` ({FLEX_PROBE_SET}) is the probe set for this kit")
             sys.exit(1)
+        # Same replacement rule as the standard path, and for the same reason: on a re-run
+        # count/flex/<sample>_<BC>/ already exists, so a plain shutil.move would put this run's
+        # partition inside the previous one -- count/flex/<sample>_<BC>/<sample>_<BC>/ -- and fail
+        # outright the run after that. See move_replacing.
         for item in src_dir.iterdir():
-            shutil.move(item, dst_dir / item.name)
+            move_replacing(item, dst_dir / item.name)
 
         log_ts("counted all Flex probe-barcode partitions")
 
@@ -1542,20 +1608,10 @@ def run_count() -> None:
                 log_write(f" • Check the FASTQs for this sample exist and are non-empty: `ls -l {fastq_path}`")
                 log_write(f" • Check the `Chemistry` metadata column ({chemistry}) matches how the library was prepared")
                 sys.exit(1)
-            # Clear each destination before moving onto it. `shutil.move` onto an existing *directory*
-            # does not replace it -- it moves the source inside it -- so a re-run (--force, or a
-            # corrected chemistry) silently produced count/<sample>/filtered_feature_bc_matrix/
-            # filtered_feature_bc_matrix/ the first time and then died with "Destination path already
-            # exists" the second, having already spent the full cellranger run. Files were never
-            # affected, which is why only the matrix directories nested and the .h5 outputs downstream
-            # still looked right.
+            # a re-run (--force, or a corrected chemistry) moves onto outputs that are already there,
+            # which plain shutil.move would nest rather than replace -- see move_replacing
             for item in src_dir.iterdir():
-                target = dst_dir / item.name
-                if target.is_symlink() or target.is_file():
-                    target.unlink()
-                elif target.is_dir():
-                    shutil.rmtree(target)
-                shutil.move(item, target)
+                move_replacing(item, dst_dir / item.name)
 
             log_ts(f"counted {sample_name}")
             check_barcode_validity(sample_name, dst_dir, chemistry)

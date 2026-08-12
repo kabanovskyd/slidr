@@ -47,6 +47,52 @@ cd slidr
 
 No further setup is required — `./slidr` installs missing dependencies on first run.
 
+### Staying up to date
+
+`./slidr --update` fast-forwards this checkout to the newest slidr on GitHub:
+
+```bash
+./slidr --update
+```
+
+A run also checks once a day, and says so when the checkout is behind — the notice names the commits
+and the version change, if the version moved:
+
+```
+──────────────────────────────────────────────────────────────────────
+A newer slidr is available: 1.2.0-beta → 1.3.0-beta (5 commit(s) behind origin/main)
+  cca132f Bump to 1.3.0-beta
+  eb128b0 Restrict cellranger count to the lanes the metadata declares
+  ...
+Update with: ./slidr --update
+──────────────────────────────────────────────────────────────────────
+```
+
+It is a notice, never a question. `./slidr` submits Slurm jobs and creates VMs from scripts and cron
+entries where nothing is watching stdin, so a launcher that blocked on a `y/n` would hang them. The
+check is best-effort throughout: a login node with no route to github.com, an expired credential or a
+missing remote costs nothing and never fails a run, and the network call is capped at ten seconds.
+
+**Your `config/config.yaml` is safe.** It is tracked in the repository and you have to edit it to run
+anything, so the update keeps local changes to any file the update itself does not touch. When the
+update *does* change the same file, it stops before overwriting and tells you what to do:
+
+```bash
+git stash && ./slidr --update && git stash pop   # then re-apply any new config fields by hand
+```
+
+Dependencies are not installed by `--update`. The next run syncs them, so `--update` needs nothing
+beyond git — no working Python environment, no network access to PyPI.
+
+| Variable | Effect |
+|---|---|
+| `SLIDR_NO_UPDATE_CHECK=1` | Skip the check entirely — for cron, CI, or an air-gapped cluster |
+| `SLIDR_UPDATE_INTERVAL=<seconds>` | How long between checks (default `86400`, one day) |
+
+The check is skipped automatically when it cannot mean anything: a directory that is not a git
+checkout, or a branch with no upstream. If this checkout has local commits of your own, the notice
+says `git pull --rebase` instead, since `--update` fast-forwards only and will not rewrite your work.
+
 ---
 
 ## Configuration
@@ -175,10 +221,11 @@ The local directory a staged run downloads `input_path` into. Left unset it defa
 `<output_path>/<BCL_ID>/data`, so a staged run writes nothing outside its own run directory and needs no
 per-machine configuration — which is what a fresh VM or a cluster job can count on.
 
-It sits beside `output/` rather than inside it on purpose: `settings.output_bucket` uploads the whole of
-`output/` when a run succeeds, and this directory holds raw inputs that came *out* of a bucket. Staging
-them under `output/` would send the entire sequencing run — hundreds of GB — straight back to GCS every
-time a run finished.
+It sits beside `output/` rather than inside it on purpose: `settings.output_bucket` uploads `output/`
+when a run succeeds, and this directory holds raw inputs that came *out* of a bucket. Staging them under
+`output/` would send the entire sequencing run — hundreds of GB — straight back to GCS every time a run
+finished. (The reference genome and a staged `software_path` land under `output/` and are excluded from
+the upload individually for the same reason; the sequencing data is far too large to handle that way.)
 
 Set it to move that data elsewhere, typically cluster scratch:
 
@@ -193,18 +240,33 @@ Local runs ignore the field entirely.
 ### `settings.output_bucket`
 
 Where the run's `output/` tree is copied once it has succeeded — and, for a `--gcp` run, where its
-config is uploaded at launch. The results land in a folder named for the run, and a folder that is
-already there is never written over:
+config is uploaded at launch and where its logs are sent however the run ends. The results land in a
+folder named for the run, and a folder that is already there is never written over:
 
 ```
 gs://<output_bucket>/20240101_RUNID/      # first run of this BCL
 ├── config.yaml                           #   --gcp only: the config this run booted with
+├── log/                                  #   --gcp only: runtime.log, the summary, per-stage tool logs
+├── metadata/                             #   --gcp only: the rows and samplesheets this run used
 ├── mkfastq/
 ├── count/
 └── ...
 gs://<output_bucket>/20240101_RUNID_2/    # a later run of the same BCL
 gs://<output_bucket>/20240101_RUNID_3/    # and the one after that
 ```
+
+Two directories under `output/` are deliberately left out of the upload: `reference/` and `software/`,
+which a staged run downloads its own *inputs* into. Sending them back would return the bytes to the
+bucket they were read out of minutes earlier — on a mouse run, 14 GiB of reference genome and 2.5 GiB
+of Cellranger against roughly 5 GiB of actual output. `pucks/` and `barcodes/` are kept, since a puck
+CSV may have been generated during the run rather than downloaded.
+
+`log/` and `metadata/` are uploaded by a separate step that runs however the process exits, including
+every crash — which is when they matter most, since a `--gcp` VM deletes itself and takes its disk with
+it. That step is a no-op for local and `--slurm` runs, whose logs are already on a filesystem that
+outlives them. It cannot cover a hard kill (an OOM or a preempted VM runs no exit hook), and errors
+raised while the config is still being loaded happen too early for it — those stay visible through
+`watch_run.sh`, which reads Cloud Logging rather than the bucket.
 
 **`--gcp` requires this field.** `./slidr --gcp` uploads your local `config/config.yaml` into the folder
 above and hands the VM its URI, so the VM boots from the file you just edited rather than a copy kept in a
@@ -232,8 +294,8 @@ re-run from an accidental second launch. Deleting the folder you did not want is
 `gcloud storage rm -r gs://<output_bucket>/<BCL_ID>` before a re-run is how you get the unsuffixed name
 back.
 
-This is the only copy of the results a `--gcp` VM leaves behind, since the VM deletes itself when it
-finishes.
+This is the only copy of anything a `--gcp` VM leaves behind, since the VM deletes itself when it
+finishes — results only if the run succeeded, logs either way.
 
 ### Google Sheets authentication
 
@@ -381,9 +443,10 @@ Run `./slidr --help` for the authoritative list.
 | `--no-cellbender` | Skip Cellbender when running the full pipeline |
 | `--spatial-count` | Run spatial barcode counting only |
 | `--spatial-analysis` | Run spatial analysis only |
-| `--fastqs [PATH]` | Run on already-demultiplexed FASTQs; skips mkfastq (mutually exclusive with `--mkfastq`). PATH is optional — with no value the FASTQs are read from `paths.input_path` |
+| `--fastqs [PATH]` | Run on already-demultiplexed FASTQs; skips mkfastq (mutually exclusive with `--mkfastq`). PATH is optional — with no value the FASTQs are read from `paths.input_path`. The `Lane` column is passed to cellranger as `--lanes`, so a shared delivery directory's other lanes are not read for this sample; blank or `*` reads every lane |
 | `--force` | Overwrite existing outputs and re-run |
 | `--version`, `-v` | Print the pipeline version and exit |
+| `--update`, `-u` | Pull the newest slidr from GitHub and exit — see [Staying up to date](#staying-up-to-date) |
 | `--help`, `-h` | Print usage and exit |
 
 **Where the run executes**
@@ -402,7 +465,7 @@ Run `./slidr --help` for the authoritative list.
 | `--zone ZONE` | `us-central1-a` | Compute zone |
 | `--machine TYPE` | `n1-standard-16` | Machine type |
 | `--disk SIZE` | `200GB` | Boot disk size |
-| `--gpu [TYPE]` | off; `nvidia-tesla-t4` when bare | Attach a GPU; TYPE is an optional GCE accelerator name (e.g. `nvidia-l4`) |
+| `--gpu [TYPE]` | off; `nvidia-tesla-t4` when bare | Attach a GPU; TYPE is an optional GCE accelerator name (e.g. `nvidia-l4`). Also valid with `--slurm`, where it means something different — see below |
 
 **Slurm options** (only with `--slurm`; CPUs and memory come from `settings.threads`/`settings.memory`)
 
@@ -411,6 +474,23 @@ Run `./slidr --help` for the authoritative list.
 | `--partition NAME` | cluster default | Partition to submit to |
 | `--time LIMIT` | `24:00:00` | Job time limit |
 | `--workdir PATH` | derived — see below | Where to stage inputs and write outputs |
+| `--gpu [TYPE]` | off | Request a GPU: a bare `--gpu` submits with `--gres=gpu:1`, `--gpu TYPE` with `--gres=gpu:TYPE:1` |
+
+`--gpu` is shared with `--gcp` but means a different thing on each. Under `--slurm`, TYPE is a **gres
+type from your cluster's `gres.conf`** — `a100`, `v100`, `a100_80gb`; `sinfo -o '%G'` lists what the
+partitions offer — not a GCE accelerator name. Underscores are ordinary in gres names and are accepted
+here, where `--gcp` rejects them, and a value starting with `nvidia-` produces a warning, since it is
+nearly always pasted from a `--gcp` command and no cluster will recognise it.
+
+```bash
+./slidr --bcl 20240101_RUNID --slurm --gpu                      # --gres=gpu:1
+./slidr --bcl 20240101_RUNID --slurm --gpu a100 --partition gpu # --gres=gpu:a100:1
+```
+
+It always requests exactly one GPU. CellBender is the pipeline's only GPU consumer and trains on a
+single device, so a second card would sit idle while making the job harder to schedule. Only the
+CellBender stage uses it; everything else is CPU-bound, so on a cluster that bills GPU partitions by
+the hour it is often cheaper to run `--cellbender` as its own GPU job.
 
 For a staged run the workdir is normally derived, so you rarely pass `--workdir`. It resolves in order:
 
@@ -476,14 +556,21 @@ is exposed on `./slidr` itself.
     │   │   ├── pucks/               # bead barcode files downloaded from Takara
     │   │   ├── samplesheets/        # generated Trekker demux / profiling / merge sheets
     │   │   └── trekker/             # per-partition nuclei positioning output
-    │   ├── reference/               # staged only: local copy of the reference genome
+    │   ├── reference/               # staged only: local copy of the reference genome (not uploaded)
+    │   ├── software/                # only when `software_path` is a gs:// prefix (not uploaded)
     │   ├── pucks/                   # staged only: puck coordinate CSVs, downloaded or generated
     │   └── barcodes/                # staged only: raw bead barcodes for puck generation
+    ├── data/                        # staged only: run folders downloaded from `paths.input_path`,
+    │                                #   one per BCL this run demultiplexes. A sibling of output/, not
+    │                                #   inside it — see `settings.gcs_download_dest`
     └── tmp/                         # temporary Cellranger output directory
 ```
 
 No single run contains every entry: the `flex/` tree, `multi_samplesheet.csv` and `takara_pipeline.log`
-appear only for Flex chemistry, and `reference/`/`pucks/`/`barcodes/` only when staging from GCS. The
+appear only for Flex chemistry, `reference/`/`pucks/`/`barcodes/`/`data/` only when staging from GCS,
+and `software/` only when `paths.software_path` is a `gs://` prefix. Of these, `reference/`, `software/`
+and `data/` hold inputs the run downloaded rather than results it produced, and none of the three is
+uploaded to `settings.output_bucket`. The
 run directory is `<output_path>/<BCL_ID>/`, unless `output_path` already ends in the BCL ID — in which
 case it is taken as the run directory itself rather than nested again.
 
@@ -501,6 +588,8 @@ case it is taken as the run directory itself rather than nested again.
 ---
 
 ## Troubleshooting / known issues
+- **`the Miniforge installer failed` / conda reinstalled on every run**
+  - Fixed. `ensure_conda` used to decide by `command -v conda` alone, but the install only puts conda on `PATH` for that one script run — `conda init bash` writes `~/.bashrc`, which a later non-interactive `./slidr` never reads. Every run therefore tried to install again, and the Miniforge installer refuses a prefix that already exists. It now looks for an existing installation first (`$CONDA_ROOT`, `$MAMBA_ROOT_PREFIX`, `~/miniforge3`, `~/mambaforge`, `~/miniconda3`, `~/anaconda3`, `/opt/miniforge3`, `/opt/conda`) and puts it on `PATH`. If your conda lives somewhere else, export `CONDA_ROOT=/path/to/it` and it will be found. A prefix that exists but has no runnable `bin/conda` is a broken install and is now repaired in place (`-u`) rather than being a permanent block.
 - **Cellranger refusing to run**
   - If you're attempting to re-run the mkfastq and count stages of the analysis, you need to **manually delete the output directories for those modules**, as cellranger will refuse to overwrite existing files and will crash.
 - **`settings.output_bucket` is not set, so a --gcp run has nowhere to put its config or its results**

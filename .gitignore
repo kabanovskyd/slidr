@@ -12,6 +12,7 @@ slack_token.txt
 # Per-machine run state, written by ./slidr
 .last_run
 software_cache.txt
+.slidr_update_check
 
 # Staged inputs and outputs from a --slurm run, plus its sbatch logs
 slidr-work/

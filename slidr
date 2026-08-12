@@ -15,6 +15,13 @@ Required:
 Informational (these exit immediately and need no other flags):
   -v, --version         Print the pipeline version and exit
   -h, --help            Print this message and exit
+  -u, --update          Pull the newest slidr from GitHub and exit. Fast-forward
+                         only; local edits (config/config.yaml, typically) are
+                         kept unless the update touches the same file, in which
+                         case it stops and tells you to stash. A run also checks
+                         once a day and says so when a newer version is out;
+                         SLIDR_NO_UPDATE_CHECK=1 disables that check,
+                         SLIDR_UPDATE_INTERVAL=<seconds> re-times it
 
 Where inputs come from:
   Staging location is configuration, not a flag. \`paths.input_path\` in
@@ -155,20 +162,27 @@ strip_trailing_slashes() {
 # Python environment has not been set up (or is broken), which is exactly when you want to check it.
 # Only the `version` key inside the [project] table is considered: a bare grep would also match a
 # version key belonging to some later [tool.*] table.
+# Read the [project] version out of a pyproject.toml arriving on stdin. Separated from print_version
+# so the same parse serves the local file and the copy on the remote branch (`git show @{u}:...`),
+# which the update check compares against -- two readings of the same field must not disagree.
+extract_version() {
+    awk -F= '
+        /^\[/            { in_project = ($0 == "[project]"); next }
+        in_project && $1 ~ /^[ \t]*version[ \t]*$/ {
+            gsub(/[ \t"'"'"']/, "", $2); print $2; exit
+        }'
+}
+
 print_version() {
     local file="${SCRIPT_DIR}/pyproject.toml" version
     if [[ ! -f "$file" ]]; then
         echo "[ERROR]: cannot determine the slidr version: ${file} not found" >&2
         echo "Troubleshooting:" >&2
-        echo " • Run \`git pull\` to restore the missing pyproject.toml file" >&2
+        echo " • Run \`./slidr --update\` to restore the missing pyproject.toml file" >&2
         echo " • Check you are running ./slidr from inside the repository checkout" >&2
         exit 1
     fi
-    version="$(awk -F= '
-        /^\[/            { in_project = ($0 == "[project]"); next }
-        in_project && $1 ~ /^[ \t]*version[ \t]*$/ {
-            gsub(/[ \t"'"'"']/, "", $2); print $2; exit
-        }' "$file")"
+    version="$(extract_version < "$file")"
     if [[ -z "$version" ]]; then
         echo "[ERROR]: cannot determine the slidr version: no \`version\` key in the [project] table of ${file}" >&2
         echo "Troubleshooting:" >&2
@@ -178,6 +192,192 @@ print_version() {
     # same wording as `workflow/main.py --version`, so both entry points report identically
     echo "slidr version ${version}"
     exit 0
+}
+
+# --------------------------------------------------------------------------------------- #
+#                                    staying up to date                                     #
+# --------------------------------------------------------------------------------------- #
+#
+# How long between update checks, and where the last one is recorded. A check costs a network round
+# trip, so doing it on every invocation would tax every run of a pipeline whose whole point is to be
+# launched repeatedly; once a day catches a fix the morning after it lands, which is the timescale
+# that actually matters here.
+UPDATE_INTERVAL="${SLIDR_UPDATE_INTERVAL:-86400}"
+UPDATE_STAMP="${SCRIPT_DIR}/.slidr_update_check"
+
+# Run a command, killing it after `secs` if it has not finished. `timeout(1)` would be the obvious
+# tool, but it is GNU coreutils and absent from a stock macOS, where this script also has to run.
+# Returns 124 on timeout, mirroring timeout's own convention.
+run_with_timeout() {
+    local secs="$1"; shift
+    "$@" &
+    local pid=$! tenths=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if (( tenths >= secs * 10 )); then
+            kill -TERM "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 0.1
+        tenths=$(( tenths + 1 ))
+    done
+    wait "$pid"
+}
+
+# Name of the upstream branch this checkout tracks (e.g. `origin/main`), or nothing when there is
+# none -- a detached HEAD, or a branch never pushed. Both are legitimate states to run from, so
+# callers treat an empty answer as "cannot check" rather than as an error.
+upstream_branch() {
+    git -C "$SCRIPT_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true
+}
+
+# True if this checkout is a git working tree with an upstream to compare against. A tarball
+# extraction or a copied directory is neither, and must not be nagged about updates it cannot apply.
+can_check_updates() {
+    git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
+    [[ -n "$(upstream_branch)" ]] || return 1
+}
+
+# Tell the user, once a day, when the checkout is behind its upstream -- and nothing else. This is a
+# notice, never a prompt: ./slidr submits Slurm jobs and creates VMs from scripts and cron entries
+# where nothing is watching stdin, and a launcher that blocks on a y/n would hang them. The action
+# stays explicit and is named in the message (`./slidr --update`).
+#
+# Every failure is silent. The check is a convenience running alongside the real work, so a login
+# node with no route to github.com, an expired credential or a missing remote must cost a warning at
+# most, never a run. Set SLIDR_NO_UPDATE_CHECK=1 to skip it entirely.
+update_check() {
+    [[ -n "${SLIDR_NO_UPDATE_CHECK:-}" ]] && return 0
+    can_check_updates || return 0
+
+    # Skip if the last check is younger than the interval. The stamp is touched before the fetch
+    # rather than after it, so an unreachable remote backs off for the full interval too instead of
+    # retrying -- and paying the timeout -- on every launch.
+    if [[ -f "$UPDATE_STAMP" ]]; then
+        local last now
+        last="$(cat "$UPDATE_STAMP" 2>/dev/null || echo 0)"
+        now="$(date +%s)"
+        [[ "$last" =~ ^[0-9]+$ ]] || last=0
+        (( now - last < UPDATE_INTERVAL )) && return 0
+    fi
+    date +%s > "$UPDATE_STAMP" 2>/dev/null || true
+
+    local upstream remote
+    upstream="$(upstream_branch)"
+    remote="${upstream%%/*}"
+    run_with_timeout 10 git -C "$SCRIPT_DIR" fetch --quiet "$remote" 2>/dev/null || return 0
+
+    local behind ahead
+    behind="$(git -C "$SCRIPT_DIR" rev-list --count "HEAD..${upstream}" 2>/dev/null || echo 0)"
+    ahead="$(git -C "$SCRIPT_DIR" rev-list --count "${upstream}..HEAD" 2>/dev/null || echo 0)"
+    (( behind > 0 )) || return 0
+
+    # A version bump is worth naming when there is one, but most updates are fixes that never touch
+    # it, so the commit count is what the message leads with.
+    local local_version remote_version
+    local_version="$(extract_version < "${SCRIPT_DIR}/pyproject.toml" 2>/dev/null || true)"
+    remote_version="$(git -C "$SCRIPT_DIR" show "${upstream}:pyproject.toml" 2>/dev/null | extract_version || true)"
+
+    echo "──────────────────────────────────────────────────────────────────────" >&2
+    if [[ -n "$remote_version" && "$remote_version" != "$local_version" ]]; then
+        echo "A newer slidr is available: ${local_version:-unknown} → ${remote_version} (${behind} commit(s) behind ${upstream})" >&2
+    else
+        echo "This slidr checkout is ${behind} commit(s) behind ${upstream}" >&2
+    fi
+    git -C "$SCRIPT_DIR" log --oneline --no-decorate -3 "HEAD..${upstream}" 2>/dev/null | sed 's/^/  /' >&2
+    (( behind > 3 )) && echo "  ... and $(( behind - 3 )) more" >&2
+    if (( ahead > 0 )); then
+        echo "Update with: git pull --rebase   (this checkout also has ${ahead} local commit(s), so --update will not fast-forward)" >&2
+    else
+        echo "Update with: ./slidr --update" >&2
+    fi
+    echo "Set SLIDR_NO_UPDATE_CHECK=1 to silence this check." >&2
+    echo "──────────────────────────────────────────────────────────────────────" >&2
+    return 0
+}
+
+# Pull the newest slidr from GitHub. The built-in the notice above points at, so updating is one
+# command from the same entry point everything else runs through, rather than remembering which
+# directory to git pull in.
+#
+# Fast-forward only, and refused outright on a dirty tree. Both keep this from being a command that
+# can lose work: a merge or a rebase here could conflict halfway and leave the checkout in a state
+# the operator did not ask for and may not know how to leave, in the middle of trying to start a run.
+do_update() {
+    if ! git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        echo "[ERROR]: ${SCRIPT_DIR} is not a git checkout, so there is nothing to update from" >&2
+        echo "Troubleshooting:" >&2
+        echo " • Install slidr by cloning it: \`git clone https://github.com/kabanovskyd/slidr\`" >&2
+        echo " • A downloaded/copied directory has no link to the repository and must be re-cloned" >&2
+        exit 1
+    fi
+
+    local upstream
+    upstream="$(upstream_branch)"
+    if [[ -z "$upstream" ]]; then
+        echo "[ERROR]: this checkout tracks no upstream branch, so there is nothing to pull from" >&2
+        echo "Troubleshooting:" >&2
+        echo " • On a detached HEAD, check out a branch first: \`git checkout main\`" >&2
+        echo " • On a local-only branch, set its upstream: \`git branch --set-upstream-to=origin/main\`" >&2
+        exit 1
+    fi
+
+    # Local modifications are NOT a blanket refusal, because the most likely one is unavoidable:
+    # config/config.yaml is tracked and every user has to edit it to run anything at all, so refusing
+    # on a dirty tree would refuse almost every real checkout and make this command useless. Git
+    # already draws the line in exactly the right place -- a fast-forward keeps modifications to files
+    # the update does not touch, and aborts before overwriting ones it does -- so the decision is left
+    # to it, and this only reports what is being carried across.
+    local dirty
+    dirty="$(git -C "$SCRIPT_DIR" status --porcelain --untracked-files=no 2>/dev/null || true)"
+    if [[ -n "$dirty" ]]; then
+        echo "Local changes are kept, unless the update needs the same file:"
+        echo "$dirty" | sed 's/^/  /'
+        echo ""
+    fi
+
+    local before after
+    before="$(git -C "$SCRIPT_DIR" rev-parse HEAD)"
+    echo "Updating slidr from ${upstream}..."
+    if ! git -C "$SCRIPT_DIR" pull --ff-only --quiet; then
+        echo "" >&2
+        echo "[ERROR]: could not fast-forward to ${upstream}" >&2
+        echo "Troubleshooting:" >&2
+        echo " • git's own error is above -- it names the real cause" >&2
+        if [[ -n "$dirty" ]]; then
+            echo " • Local edits to a file the update also changes will block it. Set them aside and retry:" >&2
+            echo "     \`git -C ${SCRIPT_DIR} stash\` → \`./slidr --update\` → \`git -C ${SCRIPT_DIR} stash pop\`" >&2
+            echo " • For config/config.yaml specifically, keeping your copy is usually right: stash, update, pop, then re-apply any new fields by hand" >&2
+        fi
+        echo " • If this checkout has local commits, they have to be rebased by hand: \`git pull --rebase\`" >&2
+        echo " • If the branch was rewritten upstream, re-clone rather than forcing a merge here" >&2
+        exit 1
+    fi
+    after="$(git -C "$SCRIPT_DIR" rev-parse HEAD)"
+
+    if [[ "$before" == "$after" ]]; then
+        echo "Already up to date ($(print_version_string))."
+        exit 0
+    fi
+
+    echo ""
+    git -C "$SCRIPT_DIR" log --oneline --no-decorate "${before}..${after}" | sed 's/^/  /'
+    echo ""
+    echo "Updated to $(print_version_string)."
+    # Dependencies are not synced here on purpose: `uv run` (local runs) and the explicit `uv sync`
+    # in the --slurm path both do it at launch, so the next run picks up a changed pyproject.toml
+    # without this command needing network access to PyPI or a working toolchain to succeed.
+    echo "Dependency changes, if any, are applied by the next run."
+    # a check has effectively just happened, so do not repeat it on the next launch
+    date +%s > "$UPDATE_STAMP" 2>/dev/null || true
+    exit 0
+}
+
+# The version string alone, for messages that embed it. print_version() exits, so it cannot be used.
+print_version_string() {
+    local version
+    version="$(extract_version < "${SCRIPT_DIR}/pyproject.toml" 2>/dev/null || true)"
+    echo "version ${version:-unknown}"
 }
 
 # ensure uv is installed and on PATH (installs into $HOME/.local/slidr on first use)
@@ -203,54 +403,126 @@ ensure_uv() {
     fi
 }
 
+# Roots a conda/mamba installation is plausibly already at, searched before installing another one.
+# `$HOME/miniforge3` is where this script puts it; `/opt/miniforge3` is where the --gcp VM image ships
+# it; the rest are what a user or a cluster module is likely to have installed first. CONDA_ROOT and
+# MAMBA_ROOT_PREFIX come first so an explicit choice wins over a guess.
+CONDA_SEARCH_ROOTS=(
+    "${CONDA_ROOT:-}"
+    "${MAMBA_ROOT_PREFIX:-}"
+    "$HOME/miniforge3"
+    "$HOME/mambaforge"
+    "$HOME/miniconda3"
+    "$HOME/anaconda3"
+    "/opt/miniforge3"
+    "/opt/conda"
+)
+
+# Print the root of an existing conda installation, or return 1. Existence is judged by a runnable
+# bin/conda rather than by the directory being there at all: a half-finished or interrupted install
+# leaves the directory without the binary, and treating that as "installed" would send the pipeline on
+# to fail later at `mamba env create` instead of repairing it here.
+find_conda_root() {
+    local root
+    for root in "${CONDA_SEARCH_ROOTS[@]}"; do
+        [[ -n "$root" && -x "${root}/bin/conda" ]] && { printf '%s' "$root"; return 0; }
+    done
+    return 1
+}
+
 # ensure conda is installed (the pipeline uses it for the R / CellBender environments)
 ensure_conda() {
-    if ! command -v conda &> /dev/null; then
-        echo "Installing Miniforge..."
+    # already usable in this shell
+    command -v conda &> /dev/null && return 0
 
-        # detect OS
-        OS=$(uname -s)
-        ARCH=$(uname -m)
-
-        if [ "$OS" = "Linux" ]; then
-            INSTALLER="Miniforge3-Linux-${ARCH}.sh"
-        elif [ "$OS" = "Darwin" ]; then
-            INSTALLER="Miniforge3-MacOSX-${ARCH}.sh"
-        else
-            echo "[ERROR]: cannot install Miniforge automatically on this platform: $OS" >&2
-            echo "Troubleshooting:" >&2
-            echo " • Automatic installation supports Linux and macOS (Darwin) only" >&2
-            echo " • Install Miniforge yourself and make sure \`conda\` is on PATH: https://github.com/conda-forge/miniforge#install" >&2
-            echo " • conda/mamba is needed for the R and CellBender environments; the rest of the pipeline uses uv" >&2
-            exit 1
-        fi
-
-        # download and run the installer. Both steps are checked explicitly: under `set -e` a bare
-        # failure here aborts the script with no output at all, leaving the user with no idea that
-        # it was conda -- not their run -- that failed.
-        if ! curl -fLO "https://github.com/conda-forge/miniforge/releases/latest/download/${INSTALLER}"; then
-            echo "[ERROR]: could not download the Miniforge installer (${INSTALLER})" >&2
-            echo "Troubleshooting:" >&2
-            echo " • This usually means no network access or a proxy blocking https://github.com" >&2
-            echo " • Install Miniforge yourself and make sure \`conda\` is on PATH: https://github.com/conda-forge/miniforge#install" >&2
-            echo " • On a cluster, check whether conda/mamba is already available as a module (e.g. \`module load miniforge\`)" >&2
-            exit 1
-        fi
-        if ! bash "${INSTALLER}" -b -p "$HOME/miniforge3"; then
-            echo "[ERROR]: the Miniforge installer failed" >&2
-            echo "Troubleshooting:" >&2
-            echo " • A pre-existing ${HOME}/miniforge3 blocks the install; remove it or install elsewhere and put it on PATH" >&2
-            echo " • Check there is free space and write permission in ${HOME}" >&2
-            echo " • Installer left in place for inspection: ./${INSTALLER}" >&2
-            exit 1
-        fi
-        rm "${INSTALLER}"
-
-        # add to PATH for the rest of this script
-        export PATH="$HOME/miniforge3/bin:$PATH"
-        conda init bash
-        echo "Miniforge installed. Please restart your shell or run: source ~/.bashrc"
+    # Installed, but not on PATH -- which is the normal state, not an edge case. The install below adds
+    # conda to PATH for the rest of that one script run and calls `conda init bash`, which writes
+    # ~/.bashrc; a later `./slidr` runs in a non-interactive shell that never sources it, so conda is
+    # invisible again. Without this lookup every subsequent run tried to reinstall, and the Miniforge
+    # installer refuses a prefix that already exists -- so the pipeline failed with "the Miniforge
+    # installer failed" while a perfectly good conda sat in $HOME/miniforge3.
+    local existing_root
+    if existing_root="$(find_conda_root)"; then
+        export PATH="${existing_root}/bin:$PATH"
+        return 0
     fi
+
+    echo "Installing Miniforge..."
+
+    # detect OS
+    local OS ARCH INSTALLER
+    OS=$(uname -s)
+    ARCH=$(uname -m)
+
+    if [ "$OS" = "Linux" ]; then
+        INSTALLER="Miniforge3-Linux-${ARCH}.sh"
+    elif [ "$OS" = "Darwin" ]; then
+        INSTALLER="Miniforge3-MacOSX-${ARCH}.sh"
+    else
+        echo "[ERROR]: cannot install Miniforge automatically on this platform: $OS" >&2
+        echo "Troubleshooting:" >&2
+        echo " • Automatic installation supports Linux and macOS (Darwin) only" >&2
+        echo " • Install Miniforge yourself and make sure \`conda\` is on PATH: https://github.com/conda-forge/miniforge#install" >&2
+        echo " • conda/mamba is needed for the R and CellBender environments; the rest of the pipeline uses uv" >&2
+        exit 1
+    fi
+
+    # Into a temp directory, not the working directory: a failed install used to leave a ~100 MB
+    # Miniforge3-*.sh sitting in the repository root, untracked and easy to commit by accident.
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+
+    # download and run the installer. Both steps are checked explicitly: under `set -e` a bare
+    # failure here aborts the script with no output at all, leaving the user with no idea that
+    # it was conda -- not their run -- that failed.
+    if ! curl -fL -o "${tmpdir}/${INSTALLER}" "https://github.com/conda-forge/miniforge/releases/latest/download/${INSTALLER}"; then
+        rm -rf "$tmpdir"
+        echo "[ERROR]: could not download the Miniforge installer (${INSTALLER})" >&2
+        echo "Troubleshooting:" >&2
+        echo " • This usually means no network access or a proxy blocking https://github.com" >&2
+        echo " • Install Miniforge yourself and make sure \`conda\` is on PATH: https://github.com/conda-forge/miniforge#install" >&2
+        echo " • On a cluster, check whether conda/mamba is already available as a module (e.g. \`module load miniforge\`)" >&2
+        exit 1
+    fi
+
+    # `-u` when the prefix exists. Reaching this line means find_conda_root found no runnable
+    # bin/conda, so anything at the prefix is a half-written or broken install rather than one worth
+    # keeping -- and the installer refuses an existing prefix outright without it, which is precisely
+    # how an interrupted first install used to wedge every later run.
+    local prefix="$HOME/miniforge3"
+    local install_args=(-b -p "$prefix")
+    if [[ -e "$prefix" ]]; then
+        echo "  ${prefix} already exists but has no working conda; repairing it in place"
+        install_args=(-b -u -p "$prefix")
+    fi
+
+    if ! bash "${tmpdir}/${INSTALLER}" "${install_args[@]}"; then
+        echo "[ERROR]: the Miniforge installer failed" >&2
+        echo "Troubleshooting:" >&2
+        echo " • Check there is free space and write permission in ${HOME}" >&2
+        echo " • Remove a broken install and retry: \`rm -rf ${prefix}\`" >&2
+        echo " • Or install Miniforge yourself anywhere and put its bin/ on PATH, or point CONDA_ROOT at it" >&2
+        echo " • Installer left for inspection: ${tmpdir}/${INSTALLER}" >&2
+        exit 1
+    fi
+    rm -rf "$tmpdir"
+
+    # add to PATH for the rest of this script
+    export PATH="${prefix}/bin:$PATH"
+
+    # Convenience for the operator's own interactive shell, and nothing more: it edits ~/.bashrc, which
+    # a later non-interactive `./slidr` never reads. Future runs find this install through
+    # find_conda_root instead, so a failure here is not worth stopping a run over.
+    conda init bash >/dev/null 2>&1 || true
+
+    if ! command -v conda &> /dev/null; then
+        echo "[ERROR]: Miniforge reported success, but conda is still not runnable at ${prefix}/bin/conda" >&2
+        echo "Troubleshooting:" >&2
+        echo " • Check the install: \`ls -l ${prefix}/bin/conda\`" >&2
+        echo " • Remove it and retry: \`rm -rf ${prefix}\`" >&2
+        exit 1
+    fi
+    echo "Miniforge installed at ${prefix} (later runs find it automatically)."
 }
 
 # --- defaults ---
@@ -279,6 +551,12 @@ GPU=""
 # the validation error below can still name the default after GPU_TYPE has been overwritten.
 GPU_TYPE_DEFAULT="nvidia-tesla-t4"
 GPU_TYPE="$GPU_TYPE_DEFAULT"
+# Whether a type was actually typed, rather than inferred by comparing GPU_TYPE to the default. The
+# comparison is wrong in one case that is easy to hit by accident: `--slurm --gpu nvidia-tesla-t4`
+# names a type explicitly but matches the default, and would be forwarded as a bare `--gres=gpu:1`
+# with the type silently dropped. Which is arguably the better outcome -- a GCE name is meaningless
+# to Slurm -- but it should be a decision the caller can see, not one made by string equality.
+GPU_TYPE_EXPLICIT=""
 SLURM=""
 PARTITION=""
 TIME="24:00:00"
@@ -297,7 +575,7 @@ while [[ $# -gt 0 ]]; do
     # it is not itself a flag, so a bare `--gpu` (or `--gpu --run-all`) keeps working and defaults to
     # $GPU_TYPE below rather than swallowing the following flag as a type name.
     --gpu)             GPU=true
-                       if [[ $# -gt 1 && "$2" != -* ]]; then GPU_TYPE="$2"; shift 2; else shift; fi ;;
+                       if [[ $# -gt 1 && "$2" != -* ]]; then GPU_TYPE="$2"; GPU_TYPE_EXPLICIT=true; shift 2; else shift; fi ;;
     --project)         PROJECT="$2";      shift 2 ;;
     --zone)            ZONE="$2";         shift 2 ;;
     --machine)         MACHINE_TYPE="$2"; shift 2 ;;
@@ -330,6 +608,7 @@ while [[ $# -gt 0 ]]; do
     # handled inline (and before the --bcl check below) so `./slidr --version` works on its own
     -v|--version)      print_version ;;
     -h|--help)         usage ;;
+    -u|--update)       do_update ;;
     *)                 echo "[ERROR]: unknown argument: $1" >&2
                        echo " • Check the flag against the list below; pipeline flags are passed through to workflow/main.py unchanged" >&2
                        echo " • A value-taking flag needs its value as a separate argument (e.g. \`--fastqs /path\`, not \`--fastqs=/path\`)" >&2
@@ -350,6 +629,12 @@ done
     echo " • Give the ID itself, not a path -- the run folder is resolved as <input_path>/<BCL_ID>" >&2
     usage
 }
+
+# Say so if a newer slidr is out. Placed after the arguments validate, so a mistyped command gets its
+# own error rather than an update notice above it, and before any of the work starts, so the notice is
+# read while there is still the option of updating and re-launching rather than hours later. Writes to
+# stderr and never fails the run -- see update_check.
+update_check
 
 # --fastqs supplies already-demultiplexed reads; --mkfastq asks for BCLs to be demultiplexed.
 # main.py rejects the combination too, but catching it here avoids creating a billable VM first.
@@ -427,17 +712,36 @@ unique_output_dest() {
     printf '%s_%s' "$base" "$(date +%Y%m%d_%H%M%S)"
 }
 
-# Sanity-check the accelerator type before it reaches gcloud/sbatch. GCE accelerator names are
-# lowercase alphanumerics and hyphens (nvidia-tesla-t4, nvidia-l4, nvidia-a100-80gb), so anything
-# else is a typo -- and catching it here beats a VM-creation failure minutes later, or (on Slurm) a
-# job that sits pending forever against a resource the cluster has never heard of.
-if [[ "$GPU" == true ]] && ! [[ "$GPU_TYPE" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
-    echo "[ERROR]: invalid GPU type: '${GPU_TYPE}'" >&2
-    echo "Troubleshooting:" >&2
-    echo " • Accelerator names are lowercase letters, digits and hyphens, e.g. nvidia-tesla-t4, nvidia-l4, nvidia-a100-80gb" >&2
-    echo " • List what your zone offers: \`gcloud compute accelerator-types list --filter=\"zone:${ZONE}\"\`" >&2
-    echo " • Pass a bare \`--gpu\` to use the default (${GPU_TYPE_DEFAULT})" >&2
-    exit 1
+# Sanity-check the accelerator type before it reaches gcloud/sbatch, in whichever of the two naming
+# schemes applies. Catching a typo here beats a VM-creation failure minutes later, or (on Slurm) a job
+# that sits pending forever against a resource the cluster has never heard of.
+#
+# The two schemes are genuinely different and the check has to follow the destination rather than pick
+# one. GCE accelerator names are lowercase alphanumerics and hyphens (nvidia-tesla-t4, nvidia-l4,
+# nvidia-a100-80gb). Slurm gres types are whatever a site's gres.conf calls them, and underscores are
+# ordinary there -- `a100_80gb` and `rtx_6000` are real names on real clusters, and the GCE-shaped rule
+# rejected every one of them, so `--slurm --gpu a100_80gb` failed at this line for a value that the
+# gres translation below would have handled correctly.
+if [[ "$GPU" == true ]]; then
+    if [[ "$SLURM" == true ]]; then
+        GPU_TYPE_RE='^[a-z0-9][a-z0-9_-]*$'
+        GPU_TYPE_HINT=" • Slurm gres types come from your cluster's gres.conf, e.g. a100, v100, a100_80gb -- check with \`sinfo -o '%G'\`"
+    else
+        GPU_TYPE_RE='^[a-z0-9][a-z0-9-]*$'
+        GPU_TYPE_HINT=" • GCE accelerator names are lowercase letters, digits and hyphens, e.g. nvidia-tesla-t4, nvidia-l4, nvidia-a100-80gb"
+    fi
+    if ! [[ "$GPU_TYPE" =~ $GPU_TYPE_RE ]]; then
+        echo "[ERROR]: invalid GPU type: '${GPU_TYPE}'" >&2
+        echo "Troubleshooting:" >&2
+        echo "$GPU_TYPE_HINT" >&2
+        if [[ "$SLURM" == true ]]; then
+            echo " • A GCE accelerator name (nvidia-tesla-t4) is not a gres type; Slurm will not recognise it" >&2
+        else
+            echo " • List what your zone offers: \`gcloud compute accelerator-types list --filter=\"zone:${ZONE}\"\`" >&2
+        fi
+        echo " • Pass a bare \`--gpu\` for one GPU of no particular type" >&2
+        exit 1
+    fi
 fi
 
 if [[ "$GCP" == true ]]; then
@@ -731,14 +1035,30 @@ elif [[ "$SLURM" == true ]]; then
     )
     # --partition omitted (uses the cluster default) unless one is given
     [[ -n "$PARTITION" ]] && SBATCH_OPTS+=(--partition="$PARTITION")
-    # Request a GPU when --gpu is passed. An explicit type is forwarded as a Slurm gres type
-    # (gpu:<type>:1) rather than dropped, but note Slurm gres names are whatever the cluster's
-    # gres.conf calls them (often bare, e.g. `a100`) and will not match GCE accelerator names.
+    # Request a GPU when --gpu is passed. A type given on the command line is forwarded as a Slurm
+    # gres type (gpu:<type>:1); a bare `--gpu` asks for one GPU of whatever kind the partition has,
+    # since the GCE default this flag carries for --gcp means nothing to Slurm. Keyed on whether a
+    # type was typed rather than on whether it happens to equal that default, so `--gpu nvidia-tesla-t4`
+    # is forwarded as written instead of silently collapsing into a bare request.
+    #
+    # A `nvidia-`-prefixed value is almost certainly a GCE name pasted from a --gcp invocation. It is
+    # only warned about, not rejected -- nothing stops a site naming a gres that way -- but the warning
+    # is worth the line, because sbatch's own refusal ("Invalid generic resource specification") never
+    # mentions the flag the value came from.
+    #
+    # One GPU, not a count the caller chooses: cellbender is the only GPU consumer in the pipeline and
+    # trains on a single device, so a second card would sit idle while making the job harder to
+    # schedule. Set SBATCH_OPTS by hand in this script if a site ever needs otherwise.
     if [[ "$GPU" == true ]]; then
-        if [[ "$GPU_TYPE" == "$GPU_TYPE_DEFAULT" ]]; then
-            SBATCH_OPTS+=(--gres=gpu:1)
-        else
+        if [[ "$GPU_TYPE_EXPLICIT" == true ]]; then
+            if [[ "$GPU_TYPE" == nvidia-* ]]; then
+                echo "[WARNING]: '--gpu ${GPU_TYPE}' looks like a GCE accelerator name, which Slurm does not use" >&2
+                echo " • Slurm gres types come from your cluster's gres.conf, e.g. a100 or v100 -- check with \`sinfo -o '%G'\`" >&2
+                echo " • Requesting --gres=gpu:${GPU_TYPE}:1 as asked; sbatch will refuse it if the cluster has no such gres" >&2
+            fi
             SBATCH_OPTS+=(--gres="gpu:${GPU_TYPE}:1")
+        else
+            SBATCH_OPTS+=(--gres=gpu:1)
         fi
     fi
 

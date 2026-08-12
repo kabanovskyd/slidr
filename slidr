@@ -279,6 +279,12 @@ GPU=""
 # the validation error below can still name the default after GPU_TYPE has been overwritten.
 GPU_TYPE_DEFAULT="nvidia-tesla-t4"
 GPU_TYPE="$GPU_TYPE_DEFAULT"
+# Whether a type was actually typed, rather than inferred by comparing GPU_TYPE to the default. The
+# comparison is wrong in one case that is easy to hit by accident: `--slurm --gpu nvidia-tesla-t4`
+# names a type explicitly but matches the default, and would be forwarded as a bare `--gres=gpu:1`
+# with the type silently dropped. Which is arguably the better outcome -- a GCE name is meaningless
+# to Slurm -- but it should be a decision the caller can see, not one made by string equality.
+GPU_TYPE_EXPLICIT=""
 SLURM=""
 PARTITION=""
 TIME="24:00:00"
@@ -297,7 +303,7 @@ while [[ $# -gt 0 ]]; do
     # it is not itself a flag, so a bare `--gpu` (or `--gpu --run-all`) keeps working and defaults to
     # $GPU_TYPE below rather than swallowing the following flag as a type name.
     --gpu)             GPU=true
-                       if [[ $# -gt 1 && "$2" != -* ]]; then GPU_TYPE="$2"; shift 2; else shift; fi ;;
+                       if [[ $# -gt 1 && "$2" != -* ]]; then GPU_TYPE="$2"; GPU_TYPE_EXPLICIT=true; shift 2; else shift; fi ;;
     --project)         PROJECT="$2";      shift 2 ;;
     --zone)            ZONE="$2";         shift 2 ;;
     --machine)         MACHINE_TYPE="$2"; shift 2 ;;
@@ -427,17 +433,36 @@ unique_output_dest() {
     printf '%s_%s' "$base" "$(date +%Y%m%d_%H%M%S)"
 }
 
-# Sanity-check the accelerator type before it reaches gcloud/sbatch. GCE accelerator names are
-# lowercase alphanumerics and hyphens (nvidia-tesla-t4, nvidia-l4, nvidia-a100-80gb), so anything
-# else is a typo -- and catching it here beats a VM-creation failure minutes later, or (on Slurm) a
-# job that sits pending forever against a resource the cluster has never heard of.
-if [[ "$GPU" == true ]] && ! [[ "$GPU_TYPE" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
-    echo "[ERROR]: invalid GPU type: '${GPU_TYPE}'" >&2
-    echo "Troubleshooting:" >&2
-    echo " • Accelerator names are lowercase letters, digits and hyphens, e.g. nvidia-tesla-t4, nvidia-l4, nvidia-a100-80gb" >&2
-    echo " • List what your zone offers: \`gcloud compute accelerator-types list --filter=\"zone:${ZONE}\"\`" >&2
-    echo " • Pass a bare \`--gpu\` to use the default (${GPU_TYPE_DEFAULT})" >&2
-    exit 1
+# Sanity-check the accelerator type before it reaches gcloud/sbatch, in whichever of the two naming
+# schemes applies. Catching a typo here beats a VM-creation failure minutes later, or (on Slurm) a job
+# that sits pending forever against a resource the cluster has never heard of.
+#
+# The two schemes are genuinely different and the check has to follow the destination rather than pick
+# one. GCE accelerator names are lowercase alphanumerics and hyphens (nvidia-tesla-t4, nvidia-l4,
+# nvidia-a100-80gb). Slurm gres types are whatever a site's gres.conf calls them, and underscores are
+# ordinary there -- `a100_80gb` and `rtx_6000` are real names on real clusters, and the GCE-shaped rule
+# rejected every one of them, so `--slurm --gpu a100_80gb` failed at this line for a value that the
+# gres translation below would have handled correctly.
+if [[ "$GPU" == true ]]; then
+    if [[ "$SLURM" == true ]]; then
+        GPU_TYPE_RE='^[a-z0-9][a-z0-9_-]*$'
+        GPU_TYPE_HINT=" • Slurm gres types come from your cluster's gres.conf, e.g. a100, v100, a100_80gb -- check with \`sinfo -o '%G'\`"
+    else
+        GPU_TYPE_RE='^[a-z0-9][a-z0-9-]*$'
+        GPU_TYPE_HINT=" • GCE accelerator names are lowercase letters, digits and hyphens, e.g. nvidia-tesla-t4, nvidia-l4, nvidia-a100-80gb"
+    fi
+    if ! [[ "$GPU_TYPE" =~ $GPU_TYPE_RE ]]; then
+        echo "[ERROR]: invalid GPU type: '${GPU_TYPE}'" >&2
+        echo "Troubleshooting:" >&2
+        echo "$GPU_TYPE_HINT" >&2
+        if [[ "$SLURM" == true ]]; then
+            echo " • A GCE accelerator name (nvidia-tesla-t4) is not a gres type; Slurm will not recognise it" >&2
+        else
+            echo " • List what your zone offers: \`gcloud compute accelerator-types list --filter=\"zone:${ZONE}\"\`" >&2
+        fi
+        echo " • Pass a bare \`--gpu\` for one GPU of no particular type" >&2
+        exit 1
+    fi
 fi
 
 if [[ "$GCP" == true ]]; then
@@ -731,14 +756,30 @@ elif [[ "$SLURM" == true ]]; then
     )
     # --partition omitted (uses the cluster default) unless one is given
     [[ -n "$PARTITION" ]] && SBATCH_OPTS+=(--partition="$PARTITION")
-    # Request a GPU when --gpu is passed. An explicit type is forwarded as a Slurm gres type
-    # (gpu:<type>:1) rather than dropped, but note Slurm gres names are whatever the cluster's
-    # gres.conf calls them (often bare, e.g. `a100`) and will not match GCE accelerator names.
+    # Request a GPU when --gpu is passed. A type given on the command line is forwarded as a Slurm
+    # gres type (gpu:<type>:1); a bare `--gpu` asks for one GPU of whatever kind the partition has,
+    # since the GCE default this flag carries for --gcp means nothing to Slurm. Keyed on whether a
+    # type was typed rather than on whether it happens to equal that default, so `--gpu nvidia-tesla-t4`
+    # is forwarded as written instead of silently collapsing into a bare request.
+    #
+    # A `nvidia-`-prefixed value is almost certainly a GCE name pasted from a --gcp invocation. It is
+    # only warned about, not rejected -- nothing stops a site naming a gres that way -- but the warning
+    # is worth the line, because sbatch's own refusal ("Invalid generic resource specification") never
+    # mentions the flag the value came from.
+    #
+    # One GPU, not a count the caller chooses: cellbender is the only GPU consumer in the pipeline and
+    # trains on a single device, so a second card would sit idle while making the job harder to
+    # schedule. Set SBATCH_OPTS by hand in this script if a site ever needs otherwise.
     if [[ "$GPU" == true ]]; then
-        if [[ "$GPU_TYPE" == "$GPU_TYPE_DEFAULT" ]]; then
-            SBATCH_OPTS+=(--gres=gpu:1)
-        else
+        if [[ "$GPU_TYPE_EXPLICIT" == true ]]; then
+            if [[ "$GPU_TYPE" == nvidia-* ]]; then
+                echo "[WARNING]: '--gpu ${GPU_TYPE}' looks like a GCE accelerator name, which Slurm does not use" >&2
+                echo " • Slurm gres types come from your cluster's gres.conf, e.g. a100 or v100 -- check with \`sinfo -o '%G'\`" >&2
+                echo " • Requesting --gres=gpu:${GPU_TYPE}:1 as asked; sbatch will refuse it if the cluster has no such gres" >&2
+            fi
             SBATCH_OPTS+=(--gres="gpu:${GPU_TYPE}:1")
+        else
+            SBATCH_OPTS+=(--gres=gpu:1)
         fi
     fi
 

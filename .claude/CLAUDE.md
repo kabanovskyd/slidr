@@ -97,7 +97,7 @@ read); `--slurm` stages only when asked with `--stage-gcs`. Where the download l
 | `--zone ZONE` | `us-central1-a` | GCP compute zone |
 | `--machine TYPE` | `n1-standard-16` | Machine type |
 | `--disk SIZE` | `200GB` | Boot disk size |
-| `--gpu [TYPE]` | off; `nvidia-tesla-t4` when bare | Attach a GPU. Takes an optional GCE accelerator name (e.g. `--gpu nvidia-l4`), validated as lowercase alphanumerics/hyphens before the VM is created |
+| `--gpu [TYPE]` | off; `nvidia-tesla-t4` when bare | Attach a GPU. Takes an optional GCE accelerator name (e.g. `--gpu nvidia-l4`), validated as lowercase alphanumerics/hyphens before the VM is created. **Also valid with `--slurm`** — see below |
 
 ### Slurm options (only apply with `--slurm`)
 | Flag | Default | Description |
@@ -105,6 +105,7 @@ read); `--slurm` stages only when asked with `--stage-gcs`. Where the download l
 | `--partition NAME` | cluster default | Partition to submit to |
 | `--time LIMIT` | `24:00:00` | Job time limit |
 | `--workdir PATH` | derived | Where staged inputs and outputs go. Resolves to `--workdir`, then the parent of `paths.output_path` in the config the job will run with, then `$SCRATCH/slidr`, then `<repo>/slidr-work/<BCL_ID>`. The chosen value and its origin are printed at submit time. Only valid with `--stage-gcs` |
+| `--gpu [TYPE]` | off | Shared with `--gcp`, but translated for Slurm: a bare `--gpu` submits with `--gres=gpu:1`, and `--gpu TYPE` with `--gres=gpu:TYPE:1`. TYPE here is a **gres type from your cluster's `gres.conf`** (`a100`, `v100`, `a100_80gb` — `sinfo -o '%G'` lists them), not a GCE accelerator name; underscores are accepted for Slurm and rejected for GCE, and an `nvidia-`-prefixed value warns because it is almost always pasted from a `--gcp` command. Always one GPU: cellbender is the only GPU consumer and trains on a single device |
 
 CPUs and memory are not flags: they come from `settings.threads`/`settings.memory` in the config the job
 will run with (fetched from the bucket at submit time for a staged run).

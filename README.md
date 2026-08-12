@@ -418,7 +418,7 @@ Run `./slidr --help` for the authoritative list.
 | `--zone ZONE` | `us-central1-a` | Compute zone |
 | `--machine TYPE` | `n1-standard-16` | Machine type |
 | `--disk SIZE` | `200GB` | Boot disk size |
-| `--gpu [TYPE]` | off; `nvidia-tesla-t4` when bare | Attach a GPU; TYPE is an optional GCE accelerator name (e.g. `nvidia-l4`) |
+| `--gpu [TYPE]` | off; `nvidia-tesla-t4` when bare | Attach a GPU; TYPE is an optional GCE accelerator name (e.g. `nvidia-l4`). Also valid with `--slurm`, where it means something different — see below |
 
 **Slurm options** (only with `--slurm`; CPUs and memory come from `settings.threads`/`settings.memory`)
 
@@ -427,6 +427,23 @@ Run `./slidr --help` for the authoritative list.
 | `--partition NAME` | cluster default | Partition to submit to |
 | `--time LIMIT` | `24:00:00` | Job time limit |
 | `--workdir PATH` | derived — see below | Where to stage inputs and write outputs |
+| `--gpu [TYPE]` | off | Request a GPU: a bare `--gpu` submits with `--gres=gpu:1`, `--gpu TYPE` with `--gres=gpu:TYPE:1` |
+
+`--gpu` is shared with `--gcp` but means a different thing on each. Under `--slurm`, TYPE is a **gres
+type from your cluster's `gres.conf`** — `a100`, `v100`, `a100_80gb`; `sinfo -o '%G'` lists what the
+partitions offer — not a GCE accelerator name. Underscores are ordinary in gres names and are accepted
+here, where `--gcp` rejects them, and a value starting with `nvidia-` produces a warning, since it is
+nearly always pasted from a `--gcp` command and no cluster will recognise it.
+
+```bash
+./slidr --bcl 20240101_RUNID --slurm --gpu                      # --gres=gpu:1
+./slidr --bcl 20240101_RUNID --slurm --gpu a100 --partition gpu # --gres=gpu:a100:1
+```
+
+It always requests exactly one GPU. CellBender is the pipeline's only GPU consumer and trains on a
+single device, so a second card would sit idle while making the job harder to schedule. Only the
+CellBender stage uses it; everything else is CPU-bound, so on a cluster that bills GPU partitions by
+the hour it is often cheaper to run `--cellbender` as its own GPU job.
 
 For a staged run the workdir is normally derived, so you rarely pass `--workdir`. It resolves in order:
 

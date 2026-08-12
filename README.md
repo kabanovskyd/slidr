@@ -397,9 +397,10 @@ Run `./slidr --help` for the authoritative list.
 | `--no-cellbender` | Skip Cellbender when running the full pipeline |
 | `--spatial-count` | Run spatial barcode counting only |
 | `--spatial-analysis` | Run spatial analysis only |
-| `--fastqs [PATH]` | Run on already-demultiplexed FASTQs; skips mkfastq (mutually exclusive with `--mkfastq`). PATH is optional — with no value the FASTQs are read from `paths.input_path` |
+| `--fastqs [PATH]` | Run on already-demultiplexed FASTQs; skips mkfastq (mutually exclusive with `--mkfastq`). PATH is optional — with no value the FASTQs are read from `paths.input_path`. The `Lane` column is passed to cellranger as `--lanes`, so a shared delivery directory's other lanes are not read for this sample; blank or `*` reads every lane |
 | `--force` | Overwrite existing outputs and re-run |
 | `--version`, `-v` | Print the pipeline version and exit |
+| `--update`, `-u` | Pull the newest slidr from GitHub and exit — see [Staying up to date](#staying-up-to-date) |
 | `--help`, `-h` | Print usage and exit |
 
 **Where the run executes**

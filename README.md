@@ -351,7 +351,7 @@ following columns:
 |---|---|
 | `Run` | `YES` to include this sample, anything else to skip |
 | `Email` | User email, used for Slack notifications |
-| `Sample Name` | Unique sample identifier |
+| `Sample Name` | Unique sample identifier — two rows in one run may not share it unless they are identical (see below) |
 | `BCL` | BCL run ID (matched to `--bcl`); the run folder is resolved as `input_path/<BCL>` |
 | `Species` | `Human` or `Mouse` (selects the reference genome automatically) |
 | `Chemistry` | Sequencing chemistry, e.g. `3Pv3`, `5P`, `Flex` |
@@ -360,6 +360,20 @@ following columns:
 | `SB Index` | Cellranger index for the spatial barcode library |
 | `SB Lane` | Lane(s) for the spatial barcode library, comma-separated |
 | `Puck ID` | Identifier matching a puck CSV in `puck_path` |
+
+Duplicate rows are handled for you. A shared sheet accumulates them easily — copy a row to start a
+new sample, or paste a block twice — and two rows naming the same sample would have cellranger
+demultiplex the same index twice into the same directory, with every later stage counting it twice.
+What happens depends on whether the rows agree:
+
+- **Identical rows** — the extras are dropped, named in the log, and the run continues.
+- **Same `Sample Name`, something different** — the run stops, naming the columns that disagree and
+  both lines of the sheet. Choosing one for you would be a guess, and the run would finish and produce
+  plausible output from the wrong index, puck or chemistry.
+
+Only the rows selected for this run are considered, so a sample that appears once per BCL is fine, as
+is a duplicate left in the sheet with `Run: NO`. Trailing spaces and the difference between a blank
+and an empty cell are ignored when comparing, so a sloppy copy is still recognised as a copy.
 
 These columns are optional, and only read when non-empty:
 
@@ -590,6 +604,8 @@ case it is taken as the run directory itself rather than nested again.
 ## Troubleshooting / known issues
 - **`the Miniforge installer failed` / conda reinstalled on every run**
   - Fixed. `ensure_conda` used to decide by `command -v conda` alone, but the install only puts conda on `PATH` for that one script run — `conda init bash` writes `~/.bashrc`, which a later non-interactive `./slidr` never reads. Every run therefore tried to install again, and the Miniforge installer refuses a prefix that already exists. It now looks for an existing installation first (`$CONDA_ROOT`, `$MAMBA_ROOT_PREFIX`, `~/miniforge3`, `~/mambaforge`, `~/miniconda3`, `~/anaconda3`, `/opt/miniforge3`, `/opt/conda`) and puts it on `PATH`. If your conda lives somewhere else, export `CONDA_ROOT=/path/to/it` and it will be found. A prefix that exists but has no runnable `bin/conda` is a broken install and is now repaired in place (`-u`) rather than being a permanent block.
+- **`the metadata declares the same sample more than once, with different values`**
+  - Two rows selected for this run share a `Sample Name` but disagree somewhere; the error names the columns and both sheet lines. Keep the correct row and delete the other, rename one sample if they are genuinely different, or set `Run` to `NO` on the one you do not want. A library sequenced across two runs is not a second row — use `Merge RNA From BCL` / `Merge Spatial From BCL` instead. Rows that are *identical* are dropped automatically with a warning rather than stopping the run.
 - **Cellranger refusing to run**
   - If you're attempting to re-run the mkfastq and count stages of the analysis, you need to **manually delete the output directories for those modules**, as cellranger will refuse to overwrite existing files and will crash.
 - **`settings.output_bucket` is not set, so a --gcp run has nowhere to put its config or its results**

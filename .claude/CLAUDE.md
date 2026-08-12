@@ -395,7 +395,7 @@ Metadata must be provided as a Google Sheet or `.tsv`/`.csv` file with these col
 |---|---|
 | `Run` | `YES` to include this sample, anything else to skip |
 | `Email` | User email (used for Slack notifications) |
-| `Sample Name` | Unique sample identifier |
+| `Sample Name` | Unique sample identifier. Enforced: two rows selected for one run may not share a name unless they are identical (see [Duplicate rows](#duplicate-rows)) — it names the output directory, the mkfastq libraries and the samplesheet rows |
 | `BCL` | BCL run ID (matched to `--bcl`); the BCL directory is resolved as `input_path/<BCL>` — there is no separate "BCL Path" column |
 | `Species` | `Human` or `Mouse` (auto-selects reference genome) |
 | `Chemistry` | e.g. `3Pv3`, `5P`, `Flex` |
@@ -413,6 +413,29 @@ Metadata must be provided as a Google Sheet or `.tsv`/`.csv` file with these col
 | `Flex Probe Barcode IDs` | Probe barcode IDs for Flex chemistry (required for `Flex`). Separated by `,` or `\|`, or a mixture — parsed by `helpers.split_probe_barcodes` |
 
 `example_metadata.tsv` in the repository root carries this exact schema — all 11 required columns followed by the 7 optional ones — with rows demonstrating a two-sample 3' run, a skipped row (`Run: NO`), a cross-BCL RNA merge, a `Cellranger` version override and a Flex pool. Optional columns left empty are ignored, so it can be edited down in place.
+
+### Duplicate rows
+
+`helpers.deduplicate_metadata` runs over the rows selected for this run — after the `BCL`/`Run` filter,
+so a sample that legitimately appears once per BCL, or a duplicate parked behind `Run: NO`, is not its
+business. It splits the two things a repeated row can mean:
+
+| | |
+|---|---|
+| **Identical rows** (every column equal) | The extras are dropped and named, and the run continues. There is exactly one thing the operator can have meant, so stopping would be pedantry |
+| **Same `Sample Name`, any column differing** | Fatal. The error names the disagreeing columns and both sheet lines. Keeping either row is a silent guess about which is right, and the run would finish and produce plausible output from the wrong index, puck or chemistry |
+
+Comparison is on normalized values (`_normalized_cell`): surrounding whitespace is stripped and blank,
+missing and whitespace-only all compare equal, so a row copied with a stray trailing space is
+recognised as the copy it is rather than reported as a conflict. The rows kept are the originals.
+
+Messages point at sheet lines rather than DataFrame positions — the frame still carries the order it
+was read in, so index *i* is line *i+2* with the header as line 1, and that survives the `BCL`/`Run`
+filter because the mask preserves the index.
+
+Why it is worth a check at all: `Sample Name` is the key for `count/<sample>/`, the mkfastq library
+folders, `need_run_module`'s per-sample state and the samplesheet rows. A repeat asks cellranger to
+demultiplex the same index twice into the same place, and every later stage counts the sample twice.
 
 ---
 
@@ -746,6 +769,8 @@ installer.
 - **`the Miniforge installer failed`, on every run, with conda already installed**: `ensure_conda` keyed off `command -v conda`, which is false in a non-interactive shell even when Miniforge is installed — the installer's `conda init bash` writes `~/.bashrc`, and `./slidr` never sources it. So each run tried to install again and the installer refused the existing `~/miniforge3`. It now searches `$CONDA_ROOT`, `$MAMBA_ROOT_PREFIX`, `~/miniforge3`, `~/mambaforge`, `~/miniconda3`, `~/anaconda3`, `/opt/miniforge3` and `/opt/conda` for a runnable `bin/conda` and prepends it to `PATH`; set `CONDA_ROOT` for an install anywhere else. A prefix present without a working `bin/conda` is treated as a broken install and reinstalled in place with `-u`, and the installer is downloaded to a temp directory so a failure no longer leaves a ~100 MB `Miniforge3-*.sh` in the repository root.
 - **Cellranger refuses to run on re-run**: manually delete `output/mkfastq/` and/or `output/count/` — Cellranger will not overwrite existing outputs. Use `--force` to have slidr handle this.
 - **`... is not a usable Illumina BCL run directory`**: a run folder failed the run-folder check; the preceding log lines list exactly what's missing. If the reads are in fact already demultiplexed, pass them with `--fastqs` instead — the pipeline will not guess this for you. The check covers every BCL the run demultiplexes, so for a merged-in one the fix is usually that the `Merge ... From BCL` value does not match the folder name under `paths.input_path`. On a staged run, a partial download is re-fetched with `RESTAGE=1`.
+- **`N duplicate row(s) in the metadata for this run were ignored`**: a warning, not a failure — two or more rows selected for this run are identical in every column, so only the first is used. Usually a row copied in the sheet to start a new sample and then left unedited. Delete the extras to silence it; see [Duplicate rows](#duplicate-rows).
+- **`the metadata declares the same sample more than once, with different values`**: two rows share a `Sample Name` but disagree somewhere, and the error names the columns and both sheet lines. Fatal by design: `Sample Name` is the output directory and the samplesheet key, so picking one row would silently run the wrong index, puck or chemistry to completion. Keep the correct row and delete the other, rename one sample if they really are different, or set `Run` to `NO` on the one you do not want. A library sequenced across two runs is not a second row — use `Merge RNA From BCL` / `Merge Spatial From BCL`.
 - **`these samples declare no gene-expression library to demultiplex`**: a row has an empty `RNA Index` and no `Merge RNA From BCL`, so it names no index in any run folder. Set `RNA Index`, or — if that library was sequenced on another run — leave it empty and set `Merge RNA From BCL` + `Add RNA Index`. Raised by `create_samplesheet` before any BCL is staged, because such a row is invisible later: the mkfastq-completeness check has no read pair to require for it, so it counts as done and the run fails much later inside cellranger. A `--fastqs` run is exempt, since it never demultiplexes and reads library names off the filenames.
 - **`these samples merge reads from another run but do not say which index that library carries there`**: `Merge RNA From BCL` / `Merge Spatial From BCL` is set but the matching `Add RNA Index` / `Add SB Index` is empty, which would write an index-less row into that BCL's samplesheet. A merge column naming *this* run's own BCL is exempt — it is ignored with a warning and needs no index.
 - **`these samples declare no spatial-barcode library`**: a warning, not an error — `SB Index` and `Merge Spatial From BCL` are both empty, so no `<sample>_sb` library is demultiplexed and the spatial stages have nothing to run on for that sample. Intended for a gene-expression-only sample; otherwise a missing `SB Index`.

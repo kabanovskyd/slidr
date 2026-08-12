@@ -1342,6 +1342,36 @@ def parse_cellranger_html(
     }
 
 
+_MAMBA_YES_FLAG = None
+
+
+def _mamba_env_create_yes_flag() -> list[str]:
+    """
+    `['--yes']` if this mamba's `env create` accepts it, `[]` if it does not.
+
+    mamba 2.x prompts "Confirm changes: [Y/n]" where 1.x created the environment outright, and takes
+    `--yes` to skip it -- but 1.x rejects the flag as an unknown argument, so passing it unconditionally
+    would trade a prompt on new mamba for a hard failure on old. The answer is read out of `env create
+    --help`, which has no side effects, rather than by attempting the create and retrying: a failed
+    create can leave a half-built environment that the retry then trips over.
+
+    Cached, since the answer cannot change within a run, and every failure answers "no flag" -- the
+    CONDA_ALWAYS_YES and closed stdin at the call site cover that case.
+    """
+
+    global _MAMBA_YES_FLAG
+    if _MAMBA_YES_FLAG is None:
+        try:
+            proc = subprocess.run(
+                ['mamba', 'env', 'create', '--help'],
+                capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL
+            )
+            _MAMBA_YES_FLAG = ['--yes'] if '--yes' in f"{proc.stdout or ''}{proc.stderr or ''}" else []
+        except (OSError, subprocess.SubprocessError):
+            _MAMBA_YES_FLAG = []
+    return _MAMBA_YES_FLAG
+
+
 def ensure_conda_env(
     env_name: str,
     environment_yml: str | None = 'envs/conda.yml'
@@ -1429,7 +1459,26 @@ def ensure_conda_env(
             log_write(f" • Environments mamba can currently see: {', '.join(sorted(Path(e).name for e in envs)) or '(none)'}")
             sys.exit(1)
 
-        subprocess.run(['mamba', 'env', 'create', '-f', str(env_file)], check=True)
+        # Non-interactively, three ways, because a prompt here is not merely annoying: this runs
+        # unattended on a --gcp VM and inside a Slurm batch job, where nothing can answer it and the
+        # job sits on the question until the wall clock kills it.
+        #
+        #  - `--yes` when this mamba's `env create` takes it. mamba 2.x asks "Confirm changes: [Y/n]"
+        #    where 1.x did not, and the flag is the documented answer -- but passing it blind would
+        #    break the older releases that reject it as an unknown argument, so it is probed for.
+        #  - CONDA_ALWAYS_YES, which conda and mamba have both honoured for far longer than the flag
+        #    has existed, and which also covers any nested conda call the flag would not reach.
+        #  - stdin closed, so that a prompt neither of those anticipated ends the run in seconds with
+        #    an EOF rather than hanging until the scheduler intervenes. A fast failure is diagnosable;
+        #    a hung job at 3am is not.
+        env = os.environ.copy()
+        env['CONDA_ALWAYS_YES'] = 'true'
+        subprocess.run(
+            ['mamba', 'env', 'create', *_mamba_env_create_yes_flag(), '-f', str(env_file)],
+            check=True,
+            env=env,
+            stdin=subprocess.DEVNULL
+        )
 
         # re-query to get the env path after creation
         envs = list_envs()

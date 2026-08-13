@@ -747,38 +747,48 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
 
     def _validate_resource_path(value, field: str, contents: str, required: bool = True):
         """
-        Validate one of the three stageable resource paths, returning it normalized: a `gs://` URI
-        string when staging from GCS, a local `Path` otherwise. Returns None for an unset optional
-        field.
+        Validate one of the stageable resource paths, returning it normalized: a `gs://` URI string
+        when it names a bucket, a local `Path` otherwise. Returns None for an unset optional field.
+
+        Which of the two a value is, is a property of the value, not of the invocation. A `gs://` URI
+        cannot mean anything else, so it is staged whether or not --stage-gcs was passed -- the same
+        rule `auth_key_path` and `software_path` already follow.
+
+        --stage-gcs still decides one thing here: whether a bare `bucket/prefix` is read as a bucket.
+        That form genuinely is ambiguous -- it is also a valid relative directory -- so it needs the
+        caller to say which was meant.
+
+        Deciding per field is what makes a mixed configuration possible: sequencing data in a bucket
+        with the reference genome on local disk used to be unexpressible, because the flag that made
+        the first work forced every other path to be a bucket too.
         """
         if value is None or (isinstance(value, str) and not value.strip()):
             if not required:
                 return None
             err_console.print(f"[bold red]\\[ERROR][/bold red]: `{field}` is not set in the configuration file")
             err_console.print("Troubleshooting:")
-            if STAGE_GCS:
-                err_console.print(f" • Set `{field}` to the GCS location holding {contents} (e.g. gs://my-bucket/prefix)")
-            else:
-                err_console.print(f" • Set `{field}` to a local directory containing {contents}")
+            err_console.print(f" • Set `{field}` to a local directory containing {contents}")
+            err_console.print(f" • Or to the GCS location holding it (e.g. gs://my-bucket/prefix), which is staged automatically")
             sys.exit(1)
 
-        if STAGE_GCS:
-            # the bucket contents cannot be checked without a network round trip per field, so only
-            # the form is validated here; a missing object is reported when it is staged
-            if not isinstance(value, str) or looks_local(value):
-                err_console.print(f"[bold red]\\[ERROR][/bold red]: `{field}` must be a GCS location when staging from GCS, but is: {value!r}")
-                err_console.print("Troubleshooting:")
-                err_console.print(f" • Set `{field}` to a gs:// URL (or a bare bucket/prefix -- gs:// is prepended for you)")
-                err_console.print(f" • This run stages from GCS, so `{field}` names a bucket location rather than a directory on this machine")
-                err_console.print(" • Drop --stage-gcs (and --gcp) to read this path off the local filesystem instead")
-                sys.exit(1)
+        # An explicit gs:// URI: unambiguous, so it is staged on its own say-so. The bucket's contents
+        # cannot be checked without a network round trip per field, so only the form is validated here
+        # and a missing object is reported when it is staged.
+        if is_gcs_path(value):
+            return gcs_uri(value)
+
+        # A bare `bucket/prefix` counts as a bucket only when --stage-gcs says to read it that way.
+        # `looks_local` excludes what cannot be a bucket name at all (an absolute path, a leading ~),
+        # which is what lets those fall through to the local branch below instead of being rejected.
+        if STAGE_GCS and isinstance(value, str) and not looks_local(value):
             return gcs_uri(value)
 
         if not Path(value).is_dir():
             err_console.print(f"[bold red]\\[ERROR][/bold red]: `{field}` in the configuration file is not a directory: {value}")
             err_console.print("Troubleshooting:")
             err_console.print(f" • Check that `{field}` is set to a valid directory containing {contents}")
-            err_console.print(" • If this data lives in a bucket, pass --stage-gcs to download it instead")
+            err_console.print(" • If this data lives in a bucket, write it as a full gs:// URL -- it is then staged automatically, with no flag needed")
+            err_console.print(" • A bare bucket/prefix is read as a bucket only under --stage-gcs, since it is also a valid relative directory")
             sys.exit(1)
         return Path(value)
 
@@ -822,9 +832,12 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
     # reused by later runs sharing the output tree.
     if is_gcs_path(SOFTWARE_PATH):
         SOFTWARE_PATH = gcs_uri(SOFTWARE_PATH)
-        if not STAGE_GCS:
-            # Worth saying out loud: this run stages nothing else, so a download here would otherwise
-            # be the one surprise in an operation the caller thinks is entirely local.
+        # Worth saying out loud when nothing *else* comes from a bucket: the download is then the one
+        # remote step in an operation the caller thinks is entirely local. Keyed on the other fields
+        # rather than on --stage-gcs, which since paths decide for themselves no longer answers the
+        # question -- a run with a gs:// input_path and no flag stages plenty, and the note would be
+        # telling it otherwise.
+        if not any(is_gcs_path(other) for other in (INPUT_PATH, REF_PATH, PUCK_PATH, RAW_BARCODES_PATH)):
             console.print(f"[bold yellow]\\[NOTE][/bold yellow]: `software_path` is a GCS location, so Cellranger/bcl2fastq will be downloaded from {SOFTWARE_PATH} on first use")
             console.print("  • Nothing else is staged for this run; set `software_path` to a local directory to avoid the download")
             console.print(f"  • Already-known executables in {SOFTWARE_CACHE_FILE} are used first, and skip it entirely")
@@ -978,15 +991,19 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
     STAGE_FASTQ_INPUT = False
     FASTQ_INPUT = args.fastqs
 
-    if STAGE_GCS:
-        if not isinstance(INPUT_PATH, str) or not INPUT_PATH.strip() or looks_local(INPUT_PATH):
-            err_console.print(f"[bold red]\\[ERROR][/bold red]: `input_path` must be a GCS location when staging from GCS, but is: {INPUT_PATH!r}")
-            err_console.print("Troubleshooting:")
-            err_console.print(" • Set `paths.input_path` to the prefix holding this run's data folder (e.g. gs://my-bucket/inputs)")
-            err_console.print(" • A bare bucket/prefix works too -- gs:// is prepended for you")
-            err_console.print(" • Under --stage-gcs/--gcp this field is where the run folders are downloaded *from*; where they land is `settings.gcs_download_dest`")
-            err_console.print(" • Drop --stage-gcs (and --gcp) to read the run folders off this machine's filesystem instead")
-            sys.exit(1)
+    # Same rule as the resource paths above: a `gs://` input_path names a bucket on its own say-so,
+    # and a bare `bucket/prefix` is read as one only under --stage-gcs, being indistinguishable from a
+    # relative directory. Anything else is a local directory of run folders.
+    #
+    # Note what --stage-gcs still means for a `--slurm` run even when nothing here needs it: ./slidr
+    # uses it to decide that the job must self-stage, and so submits workflow/bash/slidr_slurm.sh
+    # (which checks gcloud, exports SLIDR_OUTPUT_PATH and syncs on the compute node) rather than
+    # wrapping main.py directly. The launcher infers it from a gs:// input_path for that reason.
+    input_is_bucket = is_gcs_path(INPUT_PATH) or (
+        STAGE_GCS and isinstance(INPUT_PATH, str) and INPUT_PATH.strip() and not looks_local(INPUT_PATH)
+    )
+
+    if input_is_bucket:
         INPUT_BUCKET = gcs_uri(INPUT_PATH)
 
         # Where the download lands. `settings.gcs_download_dest` names it explicitly; left unset it
@@ -1023,13 +1040,8 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
             STAGE_FASTQ_INPUT = True
 
     else:
-        if is_gcs_path(INPUT_PATH):
-            err_console.print(f"[bold red]\\[ERROR][/bold red]: `input_path` is a GCS location, but this run was not asked to stage from GCS: {INPUT_PATH}")
-            err_console.print("Troubleshooting:")
-            err_console.print(" • Pass --stage-gcs (or --gcp) to download the run folders from the bucket before they are read")
-            err_console.print(" • Or set `paths.input_path` to a local directory containing the BCL run folders")
-            sys.exit(1)
-        # nothing is staged, so the field names nowhere; keep it out of the run's recorded config
+        # a local input_path stages nothing, so the download destination names nowhere; keep it out of
+        # the run's recorded config rather than reporting a directory this run will never write to
         GCS_DOWNLOAD_DEST = None
 
     # Validate the FASTQ directory supplied with --fastqs. Skipped for a staged bare --fastqs, whose
@@ -1103,16 +1115,19 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         summary.write(f"  Output bucket:        {OUTPUT_BUCKET}\n")
         if OUTPUT_DEST is not None:
             summary.write(f"  Upload to:            {OUTPUT_DEST}\n")
-        summary.write(f"  Stage inputs from GCS:{'  yes' if STAGE_GCS else '  no'}\n")
-        if STAGE_GCS:
+        # Which inputs come from a bucket is now a per-field fact, so the summary records it per field
+        # rather than as one yes/no. `--stage-gcs` is reported too, but only for what it still decides:
+        # whether a bare `bucket/prefix` was read as a bucket.
+        summary.write(f"  Bare bucket/prefix ok:{'  yes (--stage-gcs)' if STAGE_GCS else '  no'}\n")
+        if INPUT_BUCKET is not None:
             summary.write(f"  Input (GCS):          {INPUT_BUCKET}\n")
             summary.write(f"  Staged into:          {GCS_DOWNLOAD_DEST}\n")
+        if is_gcs_path(REF_PATH):
             summary.write(f"  Reference (GCS):      {REF_PATH}\n")
+        if is_gcs_path(PUCK_PATH):
             summary.write(f"  Pucks (GCS):          {PUCK_PATH}\n")
+        if is_gcs_path(RAW_BARCODES_PATH):
             summary.write(f"  Raw barcodes (GCS):   {RAW_BARCODES_PATH}\n")
-        # outside the block above: a gs:// software_path is staged whether or not this run stages
-        # anything else, so a summary that recorded it only under --stage-gcs would omit the one
-        # remote input an otherwise-local run has
         if is_gcs_path(SOFTWARE_PATH):
             summary.write(f"  Software (GCS):       {SOFTWARE_PATH}\n")
         if applied_overrides:
@@ -1170,7 +1185,9 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         source = "Google Sheet" if is_google_sheet(METADATA_SRC) else METADATA_SRC
         logfile.write(_field("Metadata", source) + "\n")
         logfile.write(_field("Resources", f"{NUM_THREADS} cores · {MEM_SIZE} GB") + "\n")
-        if STAGE_GCS:
+        # keyed on the input actually naming a bucket, not on the flag: a gs:// input_path stages
+        # itself now, and reporting the flag would say nothing about where this run's reads come from
+        if INPUT_BUCKET is not None:
             logfile.write(_field("Staging", f"{INPUT_BUCKET} → {GCS_DOWNLOAD_DEST}") + "\n")
         logfile.write(_field("Stages", ', '.join(REQUESTED_STAGES) or "none requested") + "\n")
         if SKIPPED_STAGES:

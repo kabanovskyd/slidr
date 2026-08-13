@@ -173,9 +173,11 @@ software tree worth knowing:
 
 Where the run reads its reads from. It is dual-purpose, exactly like `reference_path`, `puck_path` and
 `raw_barcodes_path`: a local directory of run folders for a local run, and the GCS prefix those folders
-are staged out of when staging. Which one it is is decided by `--stage-gcs`/`--gcp`, never by the shape
-of the value — a `gs://` value without the flag, or a local path with it, is a clear error rather than a
-silent misread. This is the only place the location is configured; there is no command-line equivalent.
+are staged out of. Which one it is is read from the value itself: a `gs://` URI is staged, anything else
+is a local directory. No flag is needed to use a bucket, and the four path fields may differ from one
+another — bucket data with a local reference genome is an ordinary configuration. Only the bare
+`bucket/prefix` form needs `--stage-gcs`, since it is also a valid relative directory. This is the only
+place the location is configured; there is no command-line equivalent.
 
 ```yaml
 # local run

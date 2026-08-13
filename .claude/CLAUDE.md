@@ -29,7 +29,7 @@ That is the whole list. Neither `config.yaml` nor `auth_key.json` is staged by h
 
 There is no built-in default and no command-line equivalent: set `paths.input_path` in your local `config/config.yaml` to that `gs://` prefix. `./slidr` reads it locally and passes the location to the VM as instance metadata, and the pipeline downloads the run folders themselves into `settings.gcs_download_dest`.
 
-`paths.input_path` is dual-purpose, exactly like `reference_path`/`puck_path`/`raw_barcodes_path`: a local directory of run folders for a local run, and the bucket prefix they are staged out of when staging. Which one it is is decided by `--stage-gcs`/`--gcp`, never by the shape of the value — so a `gs://` value without the flag, or a local path with it, is a clear error rather than a silent misread.
+`paths.input_path` is dual-purpose, exactly like `reference_path`/`puck_path`/`raw_barcodes_path`: a local directory of run folders, or the bucket prefix they are staged out of. Which one it is is read from the value itself — a `gs://` URI is staged, anything else is a local directory — so no flag is needed to use a bucket, and each path may differ from the others. Only the bare `bucket/prefix` form needs `--stage-gcs`, being indistinguishable from a relative directory.
 
 ### Minimal example
 
@@ -352,20 +352,49 @@ workflow:
 
 There is no separate `cloud:` section — bucket locations for the sequencing data, reference genome, puck files, and raw barcodes are the same `paths.*` fields used locally, just pointed at a `gs://` location when the run stages from GCS (`--gcp` or `--stage-gcs`). Similarly `settings.output_bucket` replaces what used to be `cloud.output_bucket`, etc.
 
-Whether `input_path`, `reference_path`, `puck_path` and `raw_barcodes_path` are read locally or staged from GCS is decided by the flag, never by the shape of the value:
+**Each path decides for itself**, from the shape of its own value — being a bucket is a property of the
+location, not of the invocation:
 
-| | Without `--stage-gcs`/`--gcp` | With `--stage-gcs`/`--gcp` |
+| Value | Read as | `--stage-gcs` needed? |
 |---|---|---|
-| Expected value | a local directory, validated on disk at startup | a `gs://bucket/prefix` (or bare `bucket/prefix`) string; only the form is checked at startup |
-| `input_path` | used in place | `<BCL>/` downloaded to `settings.gcs_download_dest`, for the primary BCL and every merged-in one |
-| `reference_path` | used in place | `<genome>` downloaded to `output/reference/` |
-| `puck_path` | read and written in place | `<puck>.csv` downloaded to `output/pucks/`, which is also where generated pucks are written |
-| `raw_barcodes_path` | read in place | `<puck>/` downloaded to `output/barcodes/` |
+| `gs://bucket/prefix` | a bucket, staged automatically | no |
+| `bucket/prefix` (bare) | a bucket **only** under the flag; a relative directory otherwise | yes |
+| `/an/absolute/path`, `~/path` | a local directory, validated on disk at startup | n/a — never read as a bucket |
 
-Mixing the two forms is caught rather than misread: a `gs://` value without the flag is an error naming
-`--stage-gcs`, and an absolute local path *with* it is an error too (`config.looks_local`). The latter
-matters because a bucket name cannot begin with `/`, so `gcs_uri` would otherwise quietly turn
-`/data/runs` into `gs:///data/runs` and fail much later as an unreadable bucket.
+Where each staged field lands:
+
+| Field | Staged to |
+|---|---|
+| `input_path` | `<BCL>/` downloaded to `settings.gcs_download_dest`, for the primary BCL and every merged-in one |
+| `reference_path` | `<genome>` downloaded to `output/reference/` |
+| `puck_path` | `<puck>.csv` downloaded to `output/pucks/`, which is also where generated pucks are written |
+| `raw_barcodes_path` | `<puck>/` downloaded to `output/barcodes/` |
+
+So **the fields can differ**: sequencing data in a bucket with the reference genome on local disk is an
+ordinary configuration, and needs no flag at all.
+
+```yaml
+paths:
+  input_path:     gs://slidr_data/runs      # staged
+  reference_path: /mnt/reference            # read in place
+  puck_path:      gs://slidr_data/pucks     # staged
+```
+
+That was previously impossible. `--stage-gcs` used to be one switch over all four, so the flag that
+made the bucket field work forced every other field to be a bucket too — one error without it, a
+different error with it.
+
+What the flag still decides is the **bare `bucket/prefix` form**, which is genuinely ambiguous: it is
+also a valid relative directory, and guessing wrong means either a surprise download or a confusing
+"not a directory". An absolute path is never read as a bucket regardless (`config.looks_local`), which
+matters because a bucket name cannot begin with `/` — `gcs_uri` would otherwise turn `/data/runs` into
+`gs:///data/runs` and fail much later as an unreadable bucket.
+
+Under `--slurm` the flag has a second job: `./slidr` submits `workflow/bash/slidr_slurm.sh` (which
+checks gcloud, exports `SLIDR_OUTPUT_PATH` and syncs on the compute node) rather than wrapping
+`main.py` directly. That choice is made from whether the *input* is bucket-backed — a `gs://`
+`input_path`, or a bare one under the flag — so the launcher and the pipeline cannot disagree about
+where the reads live.
 
 `paths.software_path` is stageable too, but by a deliberately narrower rule — it is the one field where
 both forms remain valid under the flag:
@@ -781,8 +810,8 @@ installer.
 - **`these samples declare no gene-expression library to demultiplex`**: a row has an empty `RNA Index` and no `Merge RNA From BCL`, so it names no index in any run folder. Set `RNA Index`, or — if that library was sequenced on another run — leave it empty and set `Merge RNA From BCL` + `Add RNA Index`. Raised by `create_samplesheet` before any BCL is staged, because such a row is invisible later: the mkfastq-completeness check has no read pair to require for it, so it counts as done and the run fails much later inside cellranger. A `--fastqs` run is exempt, since it never demultiplexes and reads library names off the filenames.
 - **`these samples merge reads from another run but do not say which index that library carries there`**: `Merge RNA From BCL` / `Merge Spatial From BCL` is set but the matching `Add RNA Index` / `Add SB Index` is empty, which would write an index-less row into that BCL's samplesheet. A merge column naming *this* run's own BCL is exempt — it is ignored with a warning and needs no index.
 - **`these samples declare no spatial-barcode library`**: a warning, not an error — `SB Index` and `Merge Spatial From BCL` are both empty, so no `<sample>_sb` library is demultiplexed and the spatial stages have nothing to run on for that sample. Intended for a gene-expression-only sample; otherwise a missing `SB Index`.
-- **`input_path must be a GCS location when staging from GCS`**: `--stage-gcs`/`--gcp` reads `paths.input_path` as a bucket prefix, and this one is a local path. Point it at the `gs://` prefix holding the run folders; where they are downloaded *to* is `settings.gcs_download_dest`, not this field. The same error names `reference_path`/`puck_path`/`raw_barcodes_path` for the same mistake.
-- **`input_path is a GCS location, but this run was not asked to stage from GCS`**: the converse — add `--stage-gcs` (or `--gcp`), or point the field at a local directory.
+- **`input_path is a GCS location, but this run was not asked to stage from GCS`** *(and the matching `must be a GCS location when staging from GCS`)*: both errors are gone. Paths now decide for themselves — a `gs://` value is staged with no flag, and a local one is read in place even under `--stage-gcs` — so neither the combination they rejected nor the mixed configuration they made impossible is an error any more. A `gs://` path that cannot be read now fails where it is staged, with gcloud's own message.
+- **`<field> in the configuration file is not a directory`**: the value is neither a `gs://` URI nor an existing local directory. A bare `bucket/prefix` reads as a relative directory unless `--stage-gcs` is passed, so this is what a bucket written without its scheme looks like — add `gs://`, or pass the flag.
 - **`no .fastq.gz files were staged to the FASTQ directory for --fastqs`**: a staged bare `--fastqs` downloaded `<input_path>/<BCL_ID>` and found no FASTQs in it. Usually that folder holds BCLs, in which case drop `--fastqs`.
 - **`the following FASTQ files are missing from ...`**: a `--fastqs` directory is incomplete or its filenames don't follow the convention above. The message names each sample, library and read that couldn't be found; check the `Lane`/`SB Lane` metadata columns against the `_L00N_` tokens in the filenames. Under `--fastqs` the `Lane` column also becomes cellranger's own `--lanes`, so a lane declared there but absent from the filenames is a hard stop rather than something count quietly works around.
 - **Missing reference genome when staging**: set `paths.reference_path` to a `gs://` location (or a bare bucket path — `gs://` is prepended automatically) — the pipeline will `gcloud storage cp` the `settings.reference_genome` subdirectory from there if it isn't already staged under `output/reference/`.

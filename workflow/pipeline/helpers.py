@@ -371,19 +371,33 @@ def test_and_install_software(
         except Exception as exc:
             log_write(f"[WARNING]: Could not search {search_root} for {software}: {exc}")
 
-    # software not found locally, attempting to install automatically
+    # Software not found locally; decide what to do about it.
+    #
+    # These arms match on the *executable* name, which is what callers pass and what the scan above
+    # searched for -- not on the name of the release that ships it. The two differ for exactly one
+    # tool: Illumina's package is bcl2fastq2, but the binary inside it is `bcl2fastq`
+    # (bcl2fastq2_v2.20.0/bin/bcl2fastq), and run_mkfastq asks for the binary. Matching only
+    # "bcl2fastq2" here therefore sent a perfectly ordinary "bcl2fastq is not installed" straight to
+    # the `case _` internal-error arm, telling the operator to file a bug about their own missing
+    # software. It went unnoticed since the initial commit because this point is reached only when the
+    # cache misses *and* the scan finds nothing, and bcl2fastq was always in one or the other.
     match software:
         case "cellranger":
             # proprietary software, cannot install automatically
             log_write("[ERROR]: Cellranger software not found on the system.\n")
             log_write("Troubleshooting:")
+            log_write(f" • Only `paths.software_path` is scanned{f' ({search_root})' if search_root else ''}, and only one directory at a time -- an install elsewhere is not found")
+            log_write(f" • To use an install outside that tree, pin it in {SOFTWARE_CACHE_FILE}, one absolute path to the executable per line")
             log_write(" • Follow the steps on the 10x Genomics website to install Cellranger: https://www.10xgenomics.com/support/software/cell-ranger/downloads#download-links")
             sys.exit(1)
 
-        case "bcl2fastq2":
+        case "bcl2fastq" | "bcl2fastq2":
             # proprietary software, cannot install automatically
-            log_write("[ERROR]: bcl2fastq2 software not found on the system.\n")
+            log_write("[ERROR]: bcl2fastq software not found on the system.\n")
             log_write("Troubleshooting:")
+            log_write(f" • Only `paths.software_path` is scanned{f' ({search_root})' if search_root else ''}, and only one directory at a time -- a copy elsewhere is not found")
+            log_write(f" • To use an install outside that tree, pin it in {SOFTWARE_CACHE_FILE}: the executable is `bcl2fastq`, inside e.g. bcl2fastq2_v2.20.0/bin/")
+            log_write(" • Only mkfastq needs it, so --fastqs skips this entirely when the reads are already demultiplexed")
             log_write(" • Follow the steps on the Illumina website to install bcl2fastq2: https://support.illumina.com/sequencing/sequencing_software/bcl2fastq-conversion-software.html")
             sys.exit(1)
 
@@ -493,7 +507,7 @@ def test_and_install_software(
             log_write(f'[INTERNAL ERROR]: Unrecognized software name: {software}')
             log_write("Troubleshooting:")
             log_write(" • This is a bug in slidr, not a problem with your setup or data")
-            log_write(" • test_and_install_software() only knows `cellranger`, `bcl2fastq2` and `julia`")
+            log_write(" • test_and_install_software() only knows `cellranger`, `bcl2fastq` and `julia` -- the names of the executables themselves, not of the releases that ship them")
             log_write(" • Please report it at https://github.com/kabanovskyd/slidr/issues, quoting the software name above")
             sys.exit(1)
 

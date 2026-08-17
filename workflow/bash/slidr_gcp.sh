@@ -74,9 +74,26 @@ THRESHOLD=10      # CPU % below which VM is considered idle
 WAIT_MINUTES=30   # How long it must stay idle before shutting down
 INTERVAL=60       # Check every 60 seconds
 
-mkdir -p "/pipeline/out/${BCL_ID}/log"
-touch "/pipeline/out/${BCL_ID}/log/runtime.log"
-chmod 644 "/pipeline/out/${BCL_ID}/log/runtime.log"
+# Where this VM's run writes. Exported to the pipeline as SLIDR_OUTPUT_PATH further down, and used to
+# build the ops-agent's include path here, so the file the agent tails and the file the pipeline writes
+# are the same by construction.
+#
+# They were not, and that is why a --gcp run streamed nothing back while completing perfectly happily.
+# The path below was hardcoded, but the pipeline writes runtime.log under `paths.output_path` from its
+# config -- and since ./slidr began uploading the operator's own config/config.yaml, that value is
+# whatever their local checkout says (a lab filesystem, a cluster home) rather than /pipeline/out. The
+# agent then tailed a file created by the `touch` below and never written to again, so Cloud Logging
+# stayed empty and `watch_run.sh` had nothing to show. Slack alerts kept arriving throughout, since
+# those do not go through Cloud Logging -- which is exactly what made it look like a streaming problem
+# rather than a path one.
+VM_OUTPUT_PATH="/pipeline/out"
+RUNTIME_LOG="${VM_OUTPUT_PATH}/${BCL_ID}/log/runtime.log"
+
+# Created up front, and owned by the runner below, because the ops-agent only tails files that exist
+# when it starts: waiting for the pipeline to create it would miss the beginning of the run.
+mkdir -p "${VM_OUTPUT_PATH}/${BCL_ID}/log"
+touch "${RUNTIME_LOG}"
+chmod 644 "${RUNTIME_LOG}"
 
 sudo tee /etc/google-cloud-ops-agent/config.yaml > /dev/null <<EOF
 logging:
@@ -84,7 +101,7 @@ logging:
     pipeline_runtime:
       type: files
       include_paths:
-        - /pipeline/out/${BCL_ID}/log/runtime.log
+        - ${RUNTIME_LOG}
       record_log_file_path: true
   service:
     pipelines:
@@ -106,7 +123,7 @@ RUNNER_USER="runner"
 # work needs to write to, then drop privileges for the rest of the run.
 # The sequencing data no longer gets its own directory here: the pipeline stages it inside its own run
 # directory (/pipeline/out/${BCL_ID}/data), the way it already stages the reference, pucks and barcodes.
-mkdir -p /slidr /pipeline/out /pipeline/software /pipeline/pucks /pipeline/reference /pipeline/barcodes
+mkdir -p /slidr "${VM_OUTPUT_PATH}" /pipeline/software /pipeline/pucks /pipeline/reference /pipeline/barcodes
 chown -R "${RUNNER_USER}:${RUNNER_USER}" /slidr /pipeline
 
 # The conda root is handed over too, because `helpers.ensure_conda_env` builds a missing environment
@@ -126,6 +143,7 @@ runuser -u "${RUNNER_USER}" -- env \
   BCL_ID="${BCL_ID}" \
   CONFIG_GCS="${CONFIG_GCS}" \
   SLIDR_OUTPUT_DEST="${OUTPUT_DEST}" \
+  SLIDR_OUTPUT_PATH="${VM_OUTPUT_PATH}" \
   PATH="/home/${RUNNER_USER}/.local/bin:/opt/miniforge3/bin:/home/${RUNNER_USER}/.juliaup/bin:${PATH}" \
   bash -s -- "${SLIDR_ARGS[@]}" <<'RUNNER_SCRIPT'
 set -euo pipefail
@@ -189,8 +207,8 @@ uv sync || die \
     "Check the boot disk has free space: relaunch with a larger --disk"
 uv run python workflow/main.py --bcl "${BCL_ID}" "$@" || die \
     "the pipeline exited with an error" \
-    "The pipeline's own error and troubleshooting notes are above, and in /pipeline/out/${BCL_ID}/log/runtime.log" \
-    "Per-stage tool output is in /pipeline/out/${BCL_ID}/log/ (mkfastq.log, count.log, cellbender.log, ...)" \
+    "The pipeline's own error and troubleshooting notes are above, and in ${SLIDR_OUTPUT_PATH}/${BCL_ID}/log/runtime.log" \
+    "Per-stage tool output is in ${SLIDR_OUTPUT_PATH}/${BCL_ID}/log/ (mkfastq.log, count.log, cellbender.log, ...)" \
     "This VM self-deletes shortly, so copy anything you need now -- the log is also streamed to Cloud Logging and readable with ./watch_run.sh" \
     "Outputs are only uploaded to \`settings.output_bucket\` on success, so nothing was written there"
 RUNNER_SCRIPT

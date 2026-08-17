@@ -277,7 +277,9 @@ def staged_ref_dir() -> Path:
     configured reference_path otherwise.
     """
 
-    if not STAGE_GCS:
+    # keyed on reference_path naming a bucket, not on --stage-gcs: a run may now stage its reads
+    # while reading the reference off local disk, or the reverse
+    if not is_gcs_path(REF_PATH):
         return Path(REF_PATH) / REF_GENOME
     if REF_DEST is None:
         log_write("[ERROR]: the reference genome has not been staged yet (REF_DEST unset)")
@@ -424,8 +426,8 @@ def create_samplesheet() -> list[Path]:
                     log_write(" • `Human` and `Mouse` select a reference automatically; check the `Species` column for a typo if you meant one of those")
                     sys.exit(1)
         
-        # stage the reference genome out of GCS when the local filesystem does not hold it
-        if STAGE_GCS:
+        # stage the reference genome out of GCS when reference_path names a bucket
+        if is_gcs_path(REF_PATH):
             global REF_DEST
             REF_DEST = OUTPUT_PATH / "reference"
             REF_DEST.mkdir(exist_ok=True)
@@ -461,10 +463,10 @@ def create_samplesheet() -> list[Path]:
                 log_write(f'[ERROR]: the reference genome directory {ref_dir} is not found or is not a directory')
                 log_write('Troubleshooting:')
                 log_write(f" • Check that `settings.reference_genome` ({REF_GENOME}) names a directory that exists under `paths.reference_path` ({REF_PATH})")
-                if STAGE_GCS:
+                if is_gcs_path(REF_PATH):
                     log_write(f" • Check the reference exists in the bucket: `gcloud storage ls {gcs_uri(REF_PATH)}/{REF_GENOME}`")
                 else:
-                    log_write(" • If the reference lives in a bucket rather than on this filesystem, pass --stage-gcs to download it")
+                    log_write(" • If the reference lives in a bucket rather than on this filesystem, write `reference_path` as a gs:// URL -- it is then staged automatically")
                 sys.exit(1)
             # Resolve the emptydrops cutoff into a local rather than reassigning the module global.
             # Assigning to EMPTYDROPS_MIN_UMI here would make the name local to this whole function,
@@ -748,7 +750,9 @@ def stage_input_data(bcl_ids: list[str]) -> None:
      - none; each folder is left at resolve_bcl_dir(<bcl_id>)
     """
 
-    if not STAGE_GCS or not bcl_ids:
+    # INPUT_BUCKET is set exactly when input_path named a bucket, which is what decides whether
+    # there is anything to download -- independently of the other paths
+    if INPUT_BUCKET is None or not bcl_ids:
         return
 
     for bcl in bcl_ids:
@@ -1095,7 +1099,7 @@ def run_mkfastq() -> None:
                 log_write(f" • {bcl} is named by a `Merge RNA From BCL` / `Merge Spatial From BCL` column, so its run folder has to be demultiplexed alongside {BCL_ID}")
                 log_write(f" • Check that run folder sits beside the {BCL_ID} one, under `input_path` ({INPUT_PATH})")
                 log_write(" • Clear the column for that sample if its reads should not be merged after all")
-            if STAGE_GCS:
+            if INPUT_BUCKET is not None:
                 log_write(f" • Check it exists in the bucket: `gcloud storage ls {INPUT_BUCKET}/{bcl}`")
                 log_write(" • Re-download a partially staged folder by re-running with RESTAGE=1 in the environment")
             sys.exit(1)
@@ -1394,7 +1398,7 @@ def run_count() -> None:
         log_write(f'[ERROR]: reference genome directory {genome} not found')
         log_write("Troubleshooting:")
         log_write(f" • Check that `settings.reference_genome` ({REF_GENOME}) names a directory that exists under `paths.reference_path` ({REF_PATH})")
-        if STAGE_GCS:
+        if is_gcs_path(REF_PATH):
             log_write(f" • Check the reference exists in the bucket: `gcloud storage ls {gcs_uri(REF_PATH)}/{REF_GENOME}`")
             log_write(f" • Delete the partial local copy at {genome} and re-run to stage it again")
         else:
@@ -1867,26 +1871,32 @@ def run_spatial_positioning() -> None:
     if PUCK_PATH is None:
         log_write("[ERROR]: `puck_path` is not set in the configuration file, but the spatial barcode counting stage needs it")
         log_write("Troubleshooting:")
-        if STAGE_GCS:
-            log_write(" • Set `paths.puck_path` to the GCS location holding the puck CSVs (e.g. gs://my-bucket/pucks)")
-        else:
-            log_write(" • Set `paths.puck_path` to the local directory holding the puck CSVs")
+        log_write(" • Set `paths.puck_path` to the local directory holding the puck CSVs")
+        log_write(" • Or to the GCS location holding them (e.g. gs://my-bucket/pucks), which is staged automatically")
         log_write(" • The puck CSV for each sample's `Puck ID` is read from there, or generated into it from `raw_barcodes_path`")
         log_write(" • Skip this stage instead by omitting --spatial-count/--run-all")
         sys.exit(1)
 
     # generate_puck_csv.jl reads raw barcode directories from LIB_PUCK_IN and *writes* the puck CSVs
-    # it builds to LIB_PUCK_PATH, so when staging from GCS both must point at writable local
-    # directories -- passing the gs:// puck_path as the output directory makes Julia try to create a
-    # literal 'gs:' directory instead.
-    if STAGE_GCS:
+    # it builds to LIB_PUCK_PATH, so a bucket-backed field has to become a writable local directory
+    # here -- handing Julia a gs:// path as its output directory makes it create a literal 'gs:'
+    # directory instead.
+    #
+    # The two are decided separately, because they can now differ: puck maps in a bucket with raw
+    # barcodes on local disk is a configuration the old global flag could not express.
+    if is_gcs_path(PUCK_PATH):
         puck_dir = PUCK_DEST
-        barcodes_dir = BARCODES_DEST
         puck_dir.mkdir(exist_ok=True, parents=True)
-        barcodes_dir.mkdir(exist_ok=True, parents=True)
     else:
         puck_dir = Path(PUCK_PATH)
-        barcodes_dir = Path(RAW_BARCODES_PATH) if RAW_BARCODES_PATH is not None else None
+
+    if RAW_BARCODES_PATH is None:
+        barcodes_dir = None
+    elif is_gcs_path(RAW_BARCODES_PATH):
+        barcodes_dir = BARCODES_DEST
+        barcodes_dir.mkdir(exist_ok=True, parents=True)
+    else:
+        barcodes_dir = Path(RAW_BARCODES_PATH)
 
     env["LIB_PUCK_PATH"] = str(puck_dir)
     env["LIB_PUCK_IN"] = str(barcodes_dir)
@@ -1923,7 +1933,7 @@ def run_spatial_positioning() -> None:
 
         # if a puck file already exists, copy it into the working directory
         input_puck_file = puck_dir / f'{puck_id}.csv'
-        if STAGE_GCS and not input_puck_file.is_file():
+        if is_gcs_path(PUCK_PATH) and not input_puck_file.is_file():
             # A puck map absent from the bucket is NOT fatal: fall through to generating it from raw
             # barcodes, exactly as a local run does when the CSV is missing. Exiting here instead
             # would make the documented fallback unreachable.
@@ -1946,7 +1956,7 @@ def run_spatial_positioning() -> None:
                 log_write(f" • Set `raw_barcodes_path` to the location of {puck_id}'s BeadBarcodes.txt/BeadLocations.txt")
                 log_write(f" • Or place a pre-built {puck_id}.csv in `puck_path`")
                 sys.exit(1)
-            if STAGE_GCS:
+            if is_gcs_path(RAW_BARCODES_PATH):
                 stage_from_gcs(
                     f'{gcs_uri(RAW_BARCODES_PATH)}/{puck_id}',
                     barcodes_dir,
@@ -2046,6 +2056,28 @@ def run_spatial_analysis() -> None:
     # activate conda environment and install R libraries
     conda_lib = ensure_conda_env("r_env")
 
+    # The interpreter is invoked directly rather than through `mamba run -n r_env`, which is how the
+    # cellbender stage has always launched. Starting mamba initialises libmamba, which takes a lock on
+    # the package cache before doing anything else -- irrelevant work for a command that only activates
+    # an environment, and a warning on every run where that lock cannot be had ("cannot lock
+    # '<prefix>/pkgs'"), which on a cluster home is the normal case rather than a fault: NFS often has
+    # no usable flock. It also removes a process layer and mamba's startup from a stage that is
+    # launched once per run.
+    #
+    # What activation would have done and this does not: source the environment's activate.d scripts.
+    # Conda's own R wrapper resolves R_HOME relative to its own location, so the interpreter, its
+    # library and its shared objects are all found without them; what would be missed is any variable
+    # such a script exports. Nothing in envs/conda.yml ships one today, and the variables this stage
+    # actually depends on are set explicitly below.
+    rscript = Path(conda_lib) / 'Rscript'
+    if not rscript.is_file():
+        log_write(f"[ERROR]: the `r_env` conda environment has no Rscript at {rscript}")
+        log_write("Troubleshooting:")
+        log_write(" • Check the environment is complete: `mamba run -n r_env Rscript --version`")
+        log_write(" • Rebuild it if it is not: `mamba env remove -n r_env`, then re-run this stage")
+        log_write(f" • Check what the environment does contain: `ls {conda_lib}`")
+        sys.exit(1)
+
     # export environment variables
     env = conda_subprocess_env()
     env["R_FUNC"] = str(SCRIPT_PATH / 'spatial_analysis' / 'functions')
@@ -2053,6 +2085,12 @@ def run_spatial_analysis() -> None:
     env["DATA_PATH"] = str(OUTPUT_PATH.parent.parent)
     # the R scripts take the directory *containing* reference genomes, not the genome itself
     env["REF_PATH"] = str(staged_ref_dir().parent)
+    # The two things activation would otherwise have arranged, and that the R code can depend on: the
+    # environment's own bin ahead of everything else, so anything R shells out to is the environment's
+    # copy rather than the machine's, and CONDA_PREFIX, which some R packages read to locate resources
+    # relative to the environment they were installed into.
+    env["PATH"] = f"{conda_lib}{os.pathsep}{env.get('PATH', '')}"
+    env["CONDA_PREFIX"] = str(Path(conda_lib).parent)
 
     # define samples list
     samples = metadata_df['Sample Name'].astype(str).tolist()
@@ -2080,7 +2118,7 @@ def run_spatial_analysis() -> None:
         with console.status("  Running spatial analysis... "):
             proc = subprocess.Popen(
                 [
-                    'stdbuf', '-oL', '-eL', 'mamba', 'run', '-n', 'r_env', 'Rscript',
+                    'stdbuf', '-oL', '-eL', str(rscript),
                     script_base_path / 'run_spatial.R',
                     BCL_ID,
                     sample_list,

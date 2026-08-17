@@ -945,11 +945,29 @@ elif [[ "$SLURM" == true ]]; then
     # run relative-path commands from the repo root regardless of the caller's directory
     cd "$SCRIPT_DIR"
 
-    # A --slurm run stages its inputs from GCS only when --stage-gcs asks it to. Left off, the job
-    # reads everything off the local filesystem exactly as before: whether a run is self-staging is
-    # stated by the flag, never guessed from whether `paths.input_path` happens to look like a bucket.
+    # Whether this job has to stage its own inputs, which decides which payload is submitted below.
+    #
+    # --stage-gcs says so explicitly. A `gs://` `paths.input_path` also says so, on its own: the
+    # pipeline stages such a value whether or not the flag was passed (config.py decides per field),
+    # and if the launcher did not agree it would submit the non-staging payload -- a bare `sbatch
+    # --wrap` around main.py, with no gcloud check, no SLIDR_OUTPUT_PATH and no workdir -- for a job
+    # that then downloads hundreds of GB into whatever `paths.output_path` happens to name.
+    #
+    # A bare `bucket/prefix` is deliberately not inferred from: it is indistinguishable from a
+    # relative directory, and only --stage-gcs settles which was meant.
+    # Mirrors config.py's `input_is_bucket`, and must: this decides which payload is submitted, and a
+    # launcher that disagreed with the pipeline about where the reads live would send a staging job to
+    # read local disk, or a plain --wrap job to download hundreds of GB with no workdir set up.
+    #
+    # NOT simply `--stage-gcs`, which no longer means "this run stages". Since paths decide for
+    # themselves, the flag may be present only to let some *other* field use the bare bucket/prefix
+    # form while the input is local -- a job that needs no staging payload at all.
     SLURM_STAGE=""
-    [[ "$STAGE_GCS" == true ]] && SLURM_STAGE=true
+    if [[ "$INPUT_GCS" == gs://* ]]; then
+        SLURM_STAGE=true
+    elif [[ "$STAGE_GCS" == true && -n "$INPUT_GCS" && "$INPUT_GCS" != /* && "$INPUT_GCS" != '~'* ]]; then
+        SLURM_STAGE=true
+    fi
 
     # Every value read at submit time comes from this checkout's config, staged run or not: a --slurm
     # job always runs with config/config.yaml rather than a copy fetched from the bucket.
@@ -964,13 +982,15 @@ elif [[ "$SLURM" == true ]]; then
             echo " • Or drop --stage-gcs to run entirely off the local filesystem, with no staging" >&2
             exit 1
         }
-        [[ "$INPUT_GCS" == gs://* ]] || {
-            echo "[ERROR]: --stage-gcs needs \`paths.input_path\` to be a gs:// URL, but it is: '${INPUT_GCS}'" >&2
+        # Reaching here means the input is already bucket-backed -- SLURM_STAGE is set from exactly
+        # that. Only the empty case is left to catch, which would otherwise stage from "gs://".
+        [[ -n "$INPUT_GCS" ]] || {
+            echo "[ERROR]: this job stages its inputs, but \`paths.input_path\` is not set" >&2
             echo "Troubleshooting:" >&2
             echo " • Set \`paths.input_path\` in ${LOCAL_CONFIG} to the prefix holding the ${BCL_ID} data folder" >&2
             echo " • Write the full URL including the scheme, e.g. gs://my-bucket/inputs" >&2
             echo " • A --slurm run needs no config.yaml in the bucket: it runs with ${LOCAL_CONFIG} from this checkout" >&2
-            echo " • To read inputs off this cluster's own filesystem instead, drop --stage-gcs and point \`paths.input_path\` at a local directory" >&2
+            echo " • To read inputs off this cluster's own filesystem instead, point \`paths.input_path\` at a local directory" >&2
             exit 1
         }
 

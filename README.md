@@ -173,9 +173,11 @@ software tree worth knowing:
 
 Where the run reads its reads from. It is dual-purpose, exactly like `reference_path`, `puck_path` and
 `raw_barcodes_path`: a local directory of run folders for a local run, and the GCS prefix those folders
-are staged out of when staging. Which one it is is decided by `--stage-gcs`/`--gcp`, never by the shape
-of the value — a `gs://` value without the flag, or a local path with it, is a clear error rather than a
-silent misread. This is the only place the location is configured; there is no command-line equivalent.
+are staged out of. Which one it is is read from the value itself: a `gs://` URI is staged, anything else
+is a local directory. No flag is needed to use a bucket, and the four path fields may differ from one
+another — bucket data with a local reference genome is an ordinary configuration. Only the bare
+`bucket/prefix` form needs `--stage-gcs`, since it is also a valid relative directory. This is the only
+place the location is configured; there is no command-line equivalent.
 
 ```yaml
 # local run
@@ -609,6 +611,8 @@ case it is taken as the run directory itself rather than nested again.
 ---
 
 ## Troubleshooting / known issues
+- **`bcl2fastq software not found on the system`**
+  - Demultiplexing needs it, and it was in neither `software_cache.txt` nor the single directory `paths.software_path` names. Only that one tree is scanned, so if your Cellranger release and your bcl2fastq install live in different places, pin the missing one in `software_cache.txt` (one absolute path per line) instead of moving anything — the executable is `bcl2fastq`, inside e.g. `bcl2fastq2_v2.20.0/bin/`. If the reads are already demultiplexed, `--fastqs` skips the stage entirely.
 - **`the Miniforge installer failed` / conda reinstalled on every run**
   - Fixed. `ensure_conda` used to decide by `command -v conda` alone, but the install only puts conda on `PATH` for that one script run — `conda init bash` writes `~/.bashrc`, which a later non-interactive `./slidr` never reads. Every run therefore tried to install again, and the Miniforge installer refuses a prefix that already exists. It now looks for an existing installation first (`$CONDA_ROOT`, `$MAMBA_ROOT_PREFIX`, `~/miniforge3`, `~/mambaforge`, `~/miniconda3`, `~/anaconda3`, `/opt/miniforge3`, `/opt/conda`) and puts it on `PATH`. If your conda lives somewhere else, export `CONDA_ROOT=/path/to/it` and it will be found. A prefix that exists but has no runnable `bin/conda` is a broken install and is now repaired in place (`-u`) rather than being a permanent block.
 - **`the metadata declares the same sample more than once, with different values`**

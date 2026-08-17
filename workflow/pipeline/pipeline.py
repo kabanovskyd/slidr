@@ -2056,6 +2056,28 @@ def run_spatial_analysis() -> None:
     # activate conda environment and install R libraries
     conda_lib = ensure_conda_env("r_env")
 
+    # The interpreter is invoked directly rather than through `mamba run -n r_env`, which is how the
+    # cellbender stage has always launched. Starting mamba initialises libmamba, which takes a lock on
+    # the package cache before doing anything else -- irrelevant work for a command that only activates
+    # an environment, and a warning on every run where that lock cannot be had ("cannot lock
+    # '<prefix>/pkgs'"), which on a cluster home is the normal case rather than a fault: NFS often has
+    # no usable flock. It also removes a process layer and mamba's startup from a stage that is
+    # launched once per run.
+    #
+    # What activation would have done and this does not: source the environment's activate.d scripts.
+    # Conda's own R wrapper resolves R_HOME relative to its own location, so the interpreter, its
+    # library and its shared objects are all found without them; what would be missed is any variable
+    # such a script exports. Nothing in envs/conda.yml ships one today, and the variables this stage
+    # actually depends on are set explicitly below.
+    rscript = Path(conda_lib) / 'Rscript'
+    if not rscript.is_file():
+        log_write(f"[ERROR]: the `r_env` conda environment has no Rscript at {rscript}")
+        log_write("Troubleshooting:")
+        log_write(" • Check the environment is complete: `mamba run -n r_env Rscript --version`")
+        log_write(" • Rebuild it if it is not: `mamba env remove -n r_env`, then re-run this stage")
+        log_write(f" • Check what the environment does contain: `ls {conda_lib}`")
+        sys.exit(1)
+
     # export environment variables
     env = conda_subprocess_env()
     env["R_FUNC"] = str(SCRIPT_PATH / 'spatial_analysis' / 'functions')
@@ -2063,6 +2085,12 @@ def run_spatial_analysis() -> None:
     env["DATA_PATH"] = str(OUTPUT_PATH.parent.parent)
     # the R scripts take the directory *containing* reference genomes, not the genome itself
     env["REF_PATH"] = str(staged_ref_dir().parent)
+    # The two things activation would otherwise have arranged, and that the R code can depend on: the
+    # environment's own bin ahead of everything else, so anything R shells out to is the environment's
+    # copy rather than the machine's, and CONDA_PREFIX, which some R packages read to locate resources
+    # relative to the environment they were installed into.
+    env["PATH"] = f"{conda_lib}{os.pathsep}{env.get('PATH', '')}"
+    env["CONDA_PREFIX"] = str(Path(conda_lib).parent)
 
     # define samples list
     samples = metadata_df['Sample Name'].astype(str).tolist()
@@ -2090,7 +2118,7 @@ def run_spatial_analysis() -> None:
         with console.status("  Running spatial analysis... "):
             proc = subprocess.Popen(
                 [
-                    'stdbuf', '-oL', '-eL', 'mamba', 'run', '-n', 'r_env', 'Rscript',
+                    'stdbuf', '-oL', '-eL', str(rscript),
                     script_base_path / 'run_spatial.R',
                     BCL_ID,
                     sample_list,

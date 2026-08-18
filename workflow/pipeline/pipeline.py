@@ -21,6 +21,7 @@ from config import (
     args,
     cfg,
     gcs_uri,
+    is_gcs_path,
     is_int,
     is_number,
     bool_value_hint,

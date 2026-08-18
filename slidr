@@ -562,10 +562,45 @@ PARTITION=""
 TIME="24:00:00"
 WORKDIR=""
 
+# Refuse to take another flag as a flag's value.
+#
+# `--project --zone us-east` silently set PROJECT="--zone" and then reported `us-east` -- the one token
+# in that sequence that was not the mistake -- as an unknown argument. Since every value here is a
+# project ID, a zone, a machine type, a size, a partition, a duration or a path, a leading `-` is never
+# a value anyone meant, so treating it as a missing value costs nothing and names the real error.
+#
+# The argument count is passed in rather than inferred, so that a flag at the very end of the command
+# ("./slidr --bcl RUN --project") is told apart from one followed by a flag, and reported as what it is.
+require_value() {
+    local flag="$1" argc="$2" value="${3-}"
+    if (( argc < 2 )); then
+        echo "[ERROR]: \`${flag}\` needs a value, but the command ends there" >&2
+        echo "Troubleshooting:" >&2
+        echo " • Write the value as the next argument: \`${flag} <value>\`" >&2
+        echo " • Run \`./slidr --help\` for what this flag expects" >&2
+        exit 1
+    fi
+    if [[ "$value" == -* ]]; then
+        echo "[ERROR]: \`${flag}\` needs a value, but the next argument is another flag: '${value}'" >&2
+        echo "Troubleshooting:" >&2
+        echo " • \`${flag}\` was most likely left empty; give it a value: \`${flag} <value> ${value} ...\`" >&2
+        echo " • Values are given as separate arguments (\`${flag} <value>\`, not \`${flag}=<value>\`)" >&2
+        echo " • Run \`./slidr --help\` for what this flag expects" >&2
+        exit 1
+    fi
+    if [[ -z "$value" ]]; then
+        echo "[ERROR]: \`${flag}\` was given an empty value" >&2
+        echo "Troubleshooting:" >&2
+        echo " • Remove the empty quotes, or give the flag a real value: \`${flag} <value>\`" >&2
+        echo " • Run \`./slidr --help\` for what this flag expects" >&2
+        exit 1
+    fi
+}
+
 # --- parse arguments ---
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --bcl)             BCL_ID="$2";       shift 2 ;;
+    --bcl)             require_value "$1" $# "${2-}"; BCL_ID="$2";       shift 2 ;;
     # -sl has no canonical_flag entry, and needs none: --slurm is consumed here rather than forwarded
     # (workflow/main.py has no --slurm flag -- scheduler dispatch is entirely a wrapper concern), so
     # it never reaches the pass-through array that canonicalization exists to normalize.
@@ -576,13 +611,13 @@ while [[ $# -gt 0 ]]; do
     # $GPU_TYPE below rather than swallowing the following flag as a type name.
     --gpu)             GPU=true
                        if [[ $# -gt 1 && "$2" != -* ]]; then GPU_TYPE="$2"; GPU_TYPE_EXPLICIT=true; shift 2; else shift; fi ;;
-    --project)         PROJECT="$2";      shift 2 ;;
-    --zone)            ZONE="$2";         shift 2 ;;
-    --machine)         MACHINE_TYPE="$2"; shift 2 ;;
-    --disk)            DISK_SIZE="$2";    shift 2 ;;
-    --partition)       PARTITION="$2";    shift 2 ;;
-    --time)            TIME="$2";         shift 2 ;;
-    --workdir)         WORKDIR="$2";      shift 2 ;;
+    --project)         require_value "$1" $# "${2-}"; PROJECT="$2";      shift 2 ;;
+    --zone)            require_value "$1" $# "${2-}"; ZONE="$2";         shift 2 ;;
+    --machine)         require_value "$1" $# "${2-}"; MACHINE_TYPE="$2"; shift 2 ;;
+    --disk)            require_value "$1" $# "${2-}"; DISK_SIZE="$2";    shift 2 ;;
+    --partition)       require_value "$1" $# "${2-}"; PARTITION="$2";    shift 2 ;;
+    --time)            require_value "$1" $# "${2-}"; TIME="$2";         shift 2 ;;
+    --workdir)         require_value "$1" $# "${2-}"; WORKDIR="$2";      shift 2 ;;
     # pass-through pipeline flags that take a value. --fastqs's is optional: a bare one means "the
     # FASTQs are in `paths.input_path`", so the next argument is consumed only when it is not itself
     # a flag (same rule as --gpu above).
@@ -592,7 +627,8 @@ while [[ $# -gt 0 ]]; do
                        else
                            shift
                        fi ;;
-    -md|--metadata)    METADATA_PATH="$2"; SLIDR_ARGS+=("$(canonical_flag "$1")" "$2"); shift 2 ;;
+    -md|--metadata)    require_value "$1" $# "${2-}"
+                       METADATA_PATH="$2"; SLIDR_ARGS+=("$(canonical_flag "$1")" "$2"); shift 2 ;;
     # pass-through stage-selection flags
     -ra|--run-all|-mf|--mkfastq|-ct|--count|-cb|--cellbender|-sc|--spatial-count|-sa|--spatial-analysis)
                        STAGE_FLAG=true; SLIDR_ARGS+=("$(canonical_flag "$1")"); shift ;;

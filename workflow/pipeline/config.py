@@ -97,7 +97,7 @@ def is_gcs_path(value) -> bool:
 
     Only a literal `gs://` prefix counts. The `paths.*` directory fields also accept a bare
     `bucket/prefix` (normalized by gcs_uri()), but that form is indistinguishable from a relative
-    local path, which is why those fields are gated behind --stage-gcs. A `gs://` URI needs no such
+    local path, which is why that form is not accepted for those fields at all. A `gs://` URI needs no such
     gate: it cannot be mistaken for a local path, so it is safe to act on directly.
 
     Inputs:
@@ -200,26 +200,6 @@ def gcs_uri(path: Path | str) -> str:
     if not text.startswith('gs://'):
         text = 'gs://' + text.lstrip('/')
     return text
-
-
-def looks_local(value) -> bool:
-    """
-    True if a configured GCS location is unmistakably a local filesystem path instead.
-
-    A staged field accepts a bare `bucket/prefix` as well as a full `gs://` URI, and a relative
-    directory cannot be told apart from the former -- but an *absolute* path can: GCS bucket names
-    may not begin with a slash, and `~` is meaningless in one. Without this check gcs_uri() strips
-    the leading slash and quietly builds `gs:///data/runs`, which fails much later as an unreadable
-    bucket rather than as the "you forgot to point this at the bucket" it actually is.
-
-    Inputs:
-     - value: the configured field value
-    Output:
-     - True if the value can only be a local path
-    """
-
-    text = str(value).strip()
-    return text.startswith('/') or text.startswith('~')
 
 
 # Machine-local paths that an environment variable may override, taking precedence over the config
@@ -511,15 +491,7 @@ def _parse_arguments() -> argparse.ArgumentParser:
         "--gcp",
         "-gc",
         action="store_true",
-        help="Run the pipeline on Google Cloud Platform (implies --stage-gcs)"
-    )
-
-    parser.add_argument(
-        "--stage-gcs",
-        "-sg",
-        action="store_true",
-        help="Treat reference_path/puck_path/raw_barcodes_path as GCS locations and stage them onto "
-             "local disk before use (for running on a cluster with no access to the lab filesystem)"
+        help="Run the pipeline on Google Cloud Platform"
     )
 
     parser.add_argument(
@@ -695,9 +667,9 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
     # through Application Default Credentials.
     # A gs:// key is left as a string here and downloaded on demand by helpers.load_metadata: only its
     # form can be checked at config time, since verifying the object exists would mean a network round
-    # trip during startup. It is deliberately NOT gated behind --stage-gcs, unlike the `paths.*`
+    # trip during startup. It follows the same per-value rule as the `paths.*`
     # directory fields -- a gs:// URI is unambiguous where their bare `bucket/prefix` form is not, and
-    # demanding --stage-gcs would drag reference_path/puck_path/raw_barcodes_path into GCS staging too,
+    # fields: the scheme decides, and nothing about one field constrains another,
     # breaking a run whose only remote input is the key.
     if is_gcs_path(AUTH_KEY_PATH):
         AUTH_KEY_PATH = AUTH_KEY_PATH.strip().rstrip('/')
@@ -736,10 +708,9 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
     
     # Whether the reference genome, puck maps and raw barcodes are read off a local filesystem or
     # staged out of GCS is stated explicitly, never inferred from the shape of the configured path.
-    # --gcp implies it (a fresh GCE VM has no access to the lab filesystem by definition); --stage-gcs
+    # --gcp always stages (a fresh GCE VM has no access to the lab filesystem by definition); elsewhere
     # requests the same behaviour anywhere else, which is what lets a Slurm job on an unrelated
     # cluster pull its own inputs.
-    STAGE_GCS = args.gcp or args.stage_gcs
 
     # `input_path` is stageable too, and is resolved further down -- once the output tree is known,
     # since that is where a staged run downloads to by default. See "resolve where this run reads its
@@ -750,17 +721,15 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         Validate one of the stageable resource paths, returning it normalized: a `gs://` URI string
         when it names a bucket, a local `Path` otherwise. Returns None for an unset optional field.
 
-        Which of the two a value is, is a property of the value, not of the invocation. A `gs://` URI
-        cannot mean anything else, so it is staged whether or not --stage-gcs was passed -- the same
-        rule `auth_key_path` and `software_path` already follow.
+        One rule, read off the value itself: a `gs://` URI names a bucket, anything else is a local
+        directory. No flag selects between them, and the fields are independent, so sequencing data in
+        a bucket with the reference genome on local disk is an ordinary configuration.
 
-        --stage-gcs still decides one thing here: whether a bare `bucket/prefix` is read as a bucket.
-        That form genuinely is ambiguous -- it is also a valid relative directory -- so it needs the
-        caller to say which was meant.
-
-        Deciding per field is what makes a mixed configuration possible: sequencing data in a bucket
-        with the reference genome on local disk used to be unexpressible, because the flag that made
-        the first work forced every other path to be a bucket too.
+        The bare `bucket/prefix` form is deliberately not accepted. It cannot be told apart from a
+        relative directory, and the flag that used to disambiguate it bought that one
+        capability at the price of a mode: every path had to agree about being remote, mixed setups
+        were unexpressible, and the same value meant different things depending on the command line. A
+        scheme is three characters; requiring it makes every value mean exactly one thing.
         """
         if value is None or (isinstance(value, str) and not value.strip()):
             if not required:
@@ -771,24 +740,17 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
             err_console.print(f" • Or to the GCS location holding it (e.g. gs://my-bucket/prefix), which is staged automatically")
             sys.exit(1)
 
-        # An explicit gs:// URI: unambiguous, so it is staged on its own say-so. The bucket's contents
-        # cannot be checked without a network round trip per field, so only the form is validated here
-        # and a missing object is reported when it is staged.
+        # The bucket's contents cannot be checked without a network round trip per field, so only the
+        # form is validated here; a missing object is reported when it is staged.
         if is_gcs_path(value):
-            return gcs_uri(value)
-
-        # A bare `bucket/prefix` counts as a bucket only when --stage-gcs says to read it that way.
-        # `looks_local` excludes what cannot be a bucket name at all (an absolute path, a leading ~),
-        # which is what lets those fall through to the local branch below instead of being rejected.
-        if STAGE_GCS and isinstance(value, str) and not looks_local(value):
             return gcs_uri(value)
 
         if not Path(value).is_dir():
             err_console.print(f"[bold red]\\[ERROR][/bold red]: `{field}` in the configuration file is not a directory: {value}")
             err_console.print("Troubleshooting:")
             err_console.print(f" • Check that `{field}` is set to a valid directory containing {contents}")
-            err_console.print(" • If this data lives in a bucket, write it as a full gs:// URL -- it is then staged automatically, with no flag needed")
-            err_console.print(" • A bare bucket/prefix is read as a bucket only under --stage-gcs, since it is also a valid relative directory")
+            err_console.print(f" • If this data lives in a bucket, write the full URL with its scheme: gs://{str(value).lstrip('/')}")
+            err_console.print(" • A bucket is recognised by the `gs://` prefix alone -- there is no flag to pass")
             sys.exit(1)
         return Path(value)
 
@@ -815,13 +777,13 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
 
     # `software_path` is stageable out of GCS like the three resource paths above, but the trigger is
     # deliberately narrower: only an explicit `gs://` URI is staged, and a local directory stays valid
-    # even under --stage-gcs.
+    # even when other fields name buckets.
     #
     # Cellranger and bcl2fastq are routinely preinstalled on whatever machine runs the pipeline -- the
-    # --gcp VM image is built exactly that way -- and --gcp implies --stage-gcs, so treating every
+    # --gcp VM image is built exactly that way -- so treating every
     # staged run as "the software must live in a bucket" would break those runs while buying nothing.
     #
-    # A `gs://` URI here is acted on WITHOUT --stage-gcs, exactly as `auth_key_path` above is. The flag
+    # A `gs://` URI here is acted on by itself, exactly as `auth_key_path` above is. This field led the
     # exists to disambiguate the bare `bucket/prefix` form, which cannot be told apart from a relative
     # local directory -- and that form is not honoured here at all, so there is nothing left for the
     # flag to decide. Requiring it anyway made a legitimate configuration unexpressible: software in a
@@ -834,7 +796,7 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         SOFTWARE_PATH = gcs_uri(SOFTWARE_PATH)
         # Worth saying out loud when nothing *else* comes from a bucket: the download is then the one
         # remote step in an operation the caller thinks is entirely local. Keyed on the other fields
-        # rather than on --stage-gcs, which since paths decide for themselves no longer answers the
+        # rather than on a global switch, which since paths decide for themselves cannot answer the
         # question -- a run with a gs:// input_path and no flag stages plenty, and the note would be
         # telling it otherwise.
         if not any(is_gcs_path(other) for other in (INPUT_PATH, REF_PATH, PUCK_PATH, RAW_BARCODES_PATH)):
@@ -845,7 +807,7 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         err_console.print(f"[bold red]\\[ERROR][/bold red]: invalid entry for `software_path` in configuration file: {SOFTWARE_PATH}")
         err_console.print("Troubleshooting:")
         err_console.print(" • Check that `software_path` is set to a valid directory path containing cellranger/bcl2fastq executables")
-        err_console.print(" • If the software lives in a bucket, write it as a full gs:// URL -- it is downloaded on first use, and needs no --stage-gcs")
+        err_console.print(" • If the software lives in a bucket, write it as a full gs:// URL -- it is then downloaded on first use")
         err_console.print(f" • Or pin the executables directly by adding their paths to {SOFTWARE_CACHE_FILE}, which is consulted before this directory is scanned")
         sys.exit(1)
     else:
@@ -978,7 +940,7 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
     #
     # `paths.input_path` is dual-purpose, exactly like reference_path/puck_path/raw_barcodes_path: a
     # local directory of run folders normally, and the `gs://` prefix they are staged out of under
-    # --stage-gcs/--gcp. Which one it is comes from the flag, never from the shape of the value.
+    # scheme. Which one it is comes from the value, and from nothing else.
     #
     # When staging, the configured value is kept as INPUT_BUCKET -- what to download -- and INPUT_PATH
     # is re-pointed at the local directory the download lands in, which is where every stage then
@@ -992,16 +954,14 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
     FASTQ_INPUT = args.fastqs
 
     # Same rule as the resource paths above: a `gs://` input_path names a bucket on its own say-so,
-    # and a bare `bucket/prefix` is read as one only under --stage-gcs, being indistinguishable from a
+    # and a bare `bucket/prefix` is not accepted at all, being indistinguishable from a
     # relative directory. Anything else is a local directory of run folders.
     #
-    # Note what --stage-gcs still means for a `--slurm` run even when nothing here needs it: ./slidr
+    # Note what a bucket-backed input means for a `--slurm` run beyond staging itself: ./slidr
     # uses it to decide that the job must self-stage, and so submits workflow/bash/slidr_slurm.sh
     # (which checks gcloud, exports SLIDR_OUTPUT_PATH and syncs on the compute node) rather than
     # wrapping main.py directly. The launcher infers it from a gs:// input_path for that reason.
-    input_is_bucket = is_gcs_path(INPUT_PATH) or (
-        STAGE_GCS and isinstance(INPUT_PATH, str) and INPUT_PATH.strip() and not looks_local(INPUT_PATH)
-    )
+    input_is_bucket = is_gcs_path(INPUT_PATH)
 
     if input_is_bucket:
         INPUT_BUCKET = gcs_uri(INPUT_PATH)
@@ -1087,7 +1047,7 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
             err_console.print("Troubleshooting:")
             err_console.print(" • Check that `input_path` is set to a valid directory path containing input BCL run folders")
             err_console.print(" • Alternatively, pass a directory of already-demultiplexed FASTQs with --fastqs")
-            err_console.print(" • If the run folders live in a bucket, pass --stage-gcs and set `input_path` to that prefix")
+            err_console.print(" • If the run folders live in a bucket, set `input_path` to that gs:// prefix")
             sys.exit(1)
     else:
         INPUT_PATH = Path(INPUT_PATH)
@@ -1116,9 +1076,8 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         if OUTPUT_DEST is not None:
             summary.write(f"  Upload to:            {OUTPUT_DEST}\n")
         # Which inputs come from a bucket is now a per-field fact, so the summary records it per field
-        # rather than as one yes/no. `--stage-gcs` is reported too, but only for what it still decides:
+        # rather than as one yes/no, since the fields are independent:
         # whether a bare `bucket/prefix` was read as a bucket.
-        summary.write(f"  Bare bucket/prefix ok:{'  yes (--stage-gcs)' if STAGE_GCS else '  no'}\n")
         if INPUT_BUCKET is not None:
             summary.write(f"  Input (GCS):          {INPUT_BUCKET}\n")
             summary.write(f"  Staged into:          {GCS_DOWNLOAD_DEST}\n")
@@ -1207,7 +1166,6 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         'input_path': INPUT_PATH,
         'fastq_input': FASTQ_INPUT,
         'stage_fastq_input': STAGE_FASTQ_INPUT,
-        'stage_gcs': STAGE_GCS,
         'script_path': SCRIPT_PATH,
         'metadata_path': METADATA_PATH,
         'log_path': LOG_PATH,
@@ -1220,7 +1178,7 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         'ref_genome': REF_GENOME,
         'software_cache_file': SOFTWARE_CACHE_FILE,
         'auth_key_path': AUTH_KEY_PATH,
-        # the two halves of `paths.input_path` under --stage-gcs: the gs:// prefix to download from,
+        # the two halves of a bucket-backed `paths.input_path`: the gs:// prefix to download from,
         # and the local directory it lands in (which is what 'input_path' above is set to). Both None
         # for a local run, where 'input_path' is the configured directory itself.
         'input_bucket': INPUT_BUCKET,

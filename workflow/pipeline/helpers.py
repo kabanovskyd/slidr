@@ -52,7 +52,6 @@ SLACK_TOKEN = cfg['slack_token']
 BCL_ID = cfg['bcl_id']
 START_TIME = cfg['start_time']
 SUMMARY_LOG = cfg['summary_log']
-STAGE_GCS = cfg['stage_gcs']
 
 # Local copy of a `gs://` software_path, once staged. Memoized because the tree is large (a single
 # cellranger release is a couple of GB) and test_and_install_software() is called once per sample per
@@ -166,7 +165,7 @@ def software_dir() -> Path:
     Local directory to scan for external executables.
 
     `paths.software_path` is normally a local directory and is returned as-is. When it names a
-    `gs://` location (only permitted alongside --stage-gcs, see config.py) the tree is downloaded into
+    `gs://` location the tree is downloaded into
     the run's output directory on first use and the local copy is returned instead, because the
     executable search is a `find` over a real filesystem and cannot run against a bucket.
 
@@ -1741,7 +1740,7 @@ def stage_from_gcs(
         log_write("Troubleshooting:")
         log_write(" • Install the Google Cloud CLI: https://cloud.google.com/sdk/docs/install")
         log_write(" • On a cluster, check whether it needs loading first (e.g. `module load google-cloud-sdk`)")
-        log_write(" • Drop --stage-gcs to read these inputs off the local filesystem instead")
+        log_write(" • Or point the path at a local directory to read these inputs off the filesystem instead")
         sys.exit(1)
     except subprocess.TimeoutExpired:
         log_write(f"[ERROR]: staging {label} from GCS timed out after {GCS_TRANSFER_TIMEOUT}s and was killed")
@@ -1778,7 +1777,7 @@ def resolve_bcl_dir(bcl_id: str) -> Path:
     Resolve the Illumina run folder for a BCL ID from the run's local input directory.
 
     That directory is `paths.input_path` for a local run, and the `settings.gcs_download_dest` the
-    bucket was staged into for a `--stage-gcs`/`--gcp` one -- config.py re-points INPUT_PATH at the
+    bucket was staged into for a bucket-backed one -- config.py re-points INPUT_PATH at the
     latter, so this function (and everything else downstream) sees one local root either way.
 
     It is documented as the root directory holding BCL run folders, so the run folder is normally

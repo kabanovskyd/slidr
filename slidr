@@ -828,6 +828,18 @@ if [[ "$GCP" == true ]]; then
         echo " • The VM self-deletes when it finishes, so this is also the only place its results survive" >&2
         exit 1
     fi
+    # `paths.output_path` describes a filesystem on the machine doing the work, and a fresh VM has none
+    # of yours -- so slidr_gcp.sh exports SLIDR_OUTPUT_PATH=/pipeline/out and the configured value is
+    # overridden before it is ever read. Worth saying, because the same config file is normally used for
+    # local runs too, where the field very much does apply: without this, a --gcp user reasonably
+    # believes their results are landing under the path they configured. The literal below is owned by
+    # workflow/bash/slidr_gcp.sh; it is repeated here only to name it in the message.
+    CONFIG_OUTPUT_PATH="$(read_config_scalar output_path)"
+    if [[ -n "$CONFIG_OUTPUT_PATH" ]]; then
+        echo "[NOTE]: \`paths.output_path\` (${CONFIG_OUTPUT_PATH}) does not apply to a --gcp run; the VM works in /pipeline/out" >&2
+        echo " • Results are uploaded to \`settings.output_bucket\`, which is the only copy that outlives the VM" >&2
+    fi
+
     if [[ "$OUTPUT_BUCKET" == /* || "$OUTPUT_BUCKET" == '~'* ]]; then
         echo "[ERROR]: --gcp needs \`settings.output_bucket\` to be a GCS location, but it is a local path: '${OUTPUT_BUCKET}'" >&2
         echo "Troubleshooting:" >&2

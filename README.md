@@ -62,8 +62,8 @@ and the version change, if the version moved:
 
 ```
 ──────────────────────────────────────────────────────────────────────
-A newer slidr is available: 1.2.0-beta → 1.3.0-beta (5 commit(s) behind origin/main)
-  cca132f Bump to 1.3.0-beta
+A newer slidr is available: 1.4.0-beta → 1.5.0 (5 commit(s) behind origin/main)
+  cca132f Bump to 1.5.0
   eb128b0 Restrict cellranger count to the lanes the metadata declares
   ...
 Update with: ./slidr --update

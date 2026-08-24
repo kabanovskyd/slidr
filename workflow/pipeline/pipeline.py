@@ -71,7 +71,6 @@ SCRIPT_PATH = cfg['script_path']
 LOG_PATH = cfg['log_path']
 INPUT_PATH = cfg['input_path']
 FASTQ_INPUT = cfg['fastq_input']
-STAGE_GCS = cfg['stage_gcs']
 METADATA_PATH = cfg['metadata_path']
 TMP_PATH = cfg['tmp_path']
 METADATA_SRC = cfg['metadata_src']
@@ -107,7 +106,7 @@ FLEX_R2_PATH = cfg['flex_r2_path']
 FLEX_GEX_FASTQS = cfg['flex_gex_fastqs']
 BCL_ID = cfg['bcl_id']
 
-# Local directories GCS-hosted resources are staged into when --stage-gcs/--gcp is in effect. They
+# Local directories GCS-hosted resources are staged into when their path names a bucket. They
 # live under OUTPUT_PATH so a run is self-contained: on a cluster the pipeline may have no writable
 # location other than its own output tree, and keeping them there means nothing is left behind
 # outside it.
@@ -124,7 +123,7 @@ BARCODES_DEST = OUTPUT_PATH / "barcodes"
 
 # Directories under output/ that upload_outputs does not send to `settings.output_bucket`.
 #
-# Both are staging destinations for a --stage-gcs/--gcp run's own *inputs*, not results: `reference`
+# Both are staging destinations for a run's own *inputs*, not results: `reference`
 # is where the `settings.reference_genome` subdirectory of `paths.reference_path` is downloaded
 # (assigned to REF_DEST below), and `software` is where a gs:// `paths.software_path` is unpacked
 # (helpers.test_and_install_software). They live under output/ only because a staged run needs a
@@ -278,7 +277,7 @@ def staged_ref_dir() -> Path:
     configured reference_path otherwise.
     """
 
-    # keyed on reference_path naming a bucket, not on --stage-gcs: a run may now stage its reads
+    # keyed on reference_path naming a bucket: a run may stage its reads
     # while reading the reference off local disk, or the reverse
     if not is_gcs_path(REF_PATH):
         return Path(REF_PATH) / REF_GENOME
@@ -741,7 +740,7 @@ def stage_input_data(bcl_ids: list[str]) -> None:
     job here is what lets a split-BCL run work at all, and keeps one implementation with one
     already-staged rule and one destination.
 
-    A no-op unless this run stages from GCS: without --stage-gcs/--gcp `input_path` is a local
+    A no-op unless `paths.input_path` names a bucket: written as a local path it is a
     directory of run folders, and a missing one is reported by the caller's own check rather than
     silently downloaded.
 
@@ -1403,7 +1402,7 @@ def run_count() -> None:
             log_write(f" • Check the reference exists in the bucket: `gcloud storage ls {gcs_uri(REF_PATH)}/{REF_GENOME}`")
             log_write(f" • Delete the partial local copy at {genome} and re-run to stage it again")
         else:
-            log_write(" • If the reference lives in a bucket rather than on this filesystem, pass --stage-gcs to download it")
+            log_write(" • If the reference lives in a bucket rather than on this filesystem, write `reference_path` as a gs:// URL")
             log_write(" • Cellranger references are downloaded from https://www.10xgenomics.com/support/software/cell-ranger/downloads")
         sys.exit(1)
 

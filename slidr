@@ -27,8 +27,9 @@ Where inputs come from:
   Staging location is configuration, not a flag. \`paths.input_path\` in
   config/config.yaml is dual-purpose: a local directory of run folders normally,
   and the GCS prefix they are staged out of when staging. The VM or compute node
-  is handed that location and downloads what it needs itself. --gcp always stages
-  (a fresh VM has nothing else); --slurm stages only when asked with --stage-gcs.
+  is handed that location and downloads what it needs itself. Which it is comes
+  from the value: a \`gs://\` path is staged, anything else is read in place, and
+  each path field decides on its own. There is no flag to set.
 
   Both read the <BCL_ID> data folder from that prefix, and nothing else: no
   config.yaml or auth_key.json has to be put in a bucket by hand. A --slurm run
@@ -59,7 +60,7 @@ settings.threads / settings.memory in the config the job will run with):
   --partition NAME      Slurm partition to submit to (default: cluster default)
   --time      LIMIT     Job time limit, e.g. 24:00:00 or 1-00:00:00 (default: 24:00:00)
 
-Slurm staging options (only apply with --slurm --stage-gcs):
+Slurm staging options (only apply when \`paths.input_path\` is a gs:// prefix):
   --workdir  PATH       Directory on cluster storage to stage inputs into and
                          write outputs to. Usually unnecessary: it defaults to
                          the parent of \`paths.output_path\` in the config, then
@@ -81,11 +82,6 @@ Pipeline flags (passed through to workflow/main.py; short forms match its own):
                          where the input bucket is staged).
   --metadata, -md PATH  Metadata .tsv/.csv path (or Google Sheet URL) for this
                          run, overriding \`settings.metadata_source\`.
-  --stage-gcs, -sg      Fetch this run's inputs from GCS rather than the local
-                         filesystem: reference_path/puck_path/raw_barcodes_path
-                         for the pipeline, plus the run folders under
-                         \`paths.input_path\`, and -- under --slurm -- the auth
-                         key too. Implied by --gcp.
   --run-all, -ra        Run all pipeline components (default if no step flag given)
   --mkfastq, -mf        Run cellranger mkfastq only
   --count, -ct          Run cellranger count only
@@ -135,7 +131,6 @@ canonical_flag() {
         -ra) echo "--run-all" ;;
         -f)  echo "--force" ;;
         -fq) echo "--fastqs" ;;
-        -sg) echo "--stage-gcs" ;;
         -md) echo "--metadata" ;;
         -gc) echo "--gcp" ;;
         *)   echo "$1" ;;
@@ -532,11 +527,9 @@ MACHINE_TYPE="n1-standard-16"
 DISK_SIZE="200GB"
 # Where inputs are staged FROM always comes from `paths.input_path`: ./slidr only ever runs from a
 # checkout that has a config, and the VM / compute node is handed the location as a parameter. The
-# flags say *whether* to stage (--gcp implies it, --stage-gcs requests it), never where from -- which
+# value decides *whether* to stage -- a gs:// prefix is fetched, a directory read in place -- which
 # is also what makes it safe for that one field to mean a local directory the rest of the time.
 INPUT_GCS=""
-# set by --stage-gcs: intent to fetch this run's inputs from GCS rather than the local filesystem
-STAGE_GCS=""
 BCL_ID=""
 FASTQ_DIR=""
 METADATA_PATH=""
@@ -632,15 +625,9 @@ while [[ $# -gt 0 ]]; do
     # pass-through stage-selection flags
     -ra|--run-all|-mf|--mkfastq|-ct|--count|-cb|--cellbender|-sc|--spatial-count|-sa|--spatial-analysis)
                        STAGE_FLAG=true; SLIDR_ARGS+=("$(canonical_flag "$1")"); shift ;;
-    # pass-through boolean modifier flags. --stage-gcs asks the pipeline to pull
-    # reference_path/puck_path/raw_barcodes_path out of GCS; --gcp already implies it, so this is
-    # for staging on a cluster that is not a GCE VM.
+    # pass-through boolean modifier flags
     -nb|--no-cellbender|-f|--force)
                        SLIDR_ARGS+=("$(canonical_flag "$1")"); shift ;;
-    # --stage-gcs is both forwarded (the pipeline stages reference/puck/barcode paths) and acted on
-    # here (a --slurm run stages its config, key and sequencing data), so it is captured as well as
-    # passed through.
-    -sg|--stage-gcs)   STAGE_GCS=true; SLIDR_ARGS+=("$(canonical_flag "$1")"); shift ;;
     # handled inline (and before the --bcl check below) so `./slidr --version` works on its own
     -v|--version)      print_version ;;
     -h|--help)         usage ;;
@@ -687,7 +674,7 @@ fi
 # its own still runs the pipeline rather than silently doing nothing
 [[ -z "$STAGE_FLAG" ]] && SLIDR_ARGS+=(--run-all)
 
-# Resolve the input location from the config. Under --gcp/--stage-gcs this is the GCS prefix to stage
+# Resolve the input location from the config. Written as a gs:// prefix it is the location to stage
 # from; for a local run it is a directory and nothing here reads it. Trailing slashes are stripped
 # because everything downstream appends object names directly to it, and a GCS name containing '//' is
 # a different object.
@@ -814,7 +801,7 @@ if [[ "$GCP" == true ]]; then
         echo " • A fresh VM cannot see this machine's filesystem, so a --gcp run always stages from a bucket" >&2
         echo " • Set \`paths.input_path\` in ${LOCAL_CONFIG} to the prefix holding the ${BCL_ID} run folder" >&2
         echo " • Write the full URL including the scheme, e.g. gs://my-bucket/inputs" >&2
-        echo " • A local directory there is only valid for a run without --gcp/--stage-gcs" >&2
+        echo " • A local directory there is only valid for a run without --gcp, which has no filesystem of yours to read" >&2
         exit 1
     fi
     # The config the VM boots from is this checkout's own, uploaded into the folder the run's results go
@@ -828,6 +815,18 @@ if [[ "$GCP" == true ]]; then
         echo " • The VM self-deletes when it finishes, so this is also the only place its results survive" >&2
         exit 1
     fi
+    # `paths.output_path` describes a filesystem on the machine doing the work, and a fresh VM has none
+    # of yours -- so slidr_gcp.sh exports SLIDR_OUTPUT_PATH=/pipeline/out and the configured value is
+    # overridden before it is ever read. Worth saying, because the same config file is normally used for
+    # local runs too, where the field very much does apply: without this, a --gcp user reasonably
+    # believes their results are landing under the path they configured. The literal below is owned by
+    # workflow/bash/slidr_gcp.sh; it is repeated here only to name it in the message.
+    CONFIG_OUTPUT_PATH="$(read_config_scalar output_path)"
+    if [[ -n "$CONFIG_OUTPUT_PATH" ]]; then
+        echo "[NOTE]: \`paths.output_path\` (${CONFIG_OUTPUT_PATH}) does not apply to a --gcp run; the VM works in /pipeline/out" >&2
+        echo " • Results are uploaded to \`settings.output_bucket\`, which is the only copy that outlives the VM" >&2
+    fi
+
     if [[ "$OUTPUT_BUCKET" == /* || "$OUTPUT_BUCKET" == '~'* ]]; then
         echo "[ERROR]: --gcp needs \`settings.output_bucket\` to be a GCS location, but it is a local path: '${OUTPUT_BUCKET}'" >&2
         echo "Troubleshooting:" >&2
@@ -983,27 +982,13 @@ elif [[ "$SLURM" == true ]]; then
 
     # Whether this job has to stage its own inputs, which decides which payload is submitted below.
     #
-    # --stage-gcs says so explicitly. A `gs://` `paths.input_path` also says so, on its own: the
-    # pipeline stages such a value whether or not the flag was passed (config.py decides per field),
-    # and if the launcher did not agree it would submit the non-staging payload -- a bare `sbatch
-    # --wrap` around main.py, with no gcloud check, no SLIDR_OUTPUT_PATH and no workdir -- for a job
-    # that then downloads hundreds of GB into whatever `paths.output_path` happens to name.
-    #
-    # A bare `bucket/prefix` is deliberately not inferred from: it is indistinguishable from a
-    # relative directory, and only --stage-gcs settles which was meant.
-    # Mirrors config.py's `input_is_bucket`, and must: this decides which payload is submitted, and a
-    # launcher that disagreed with the pipeline about where the reads live would send a staging job to
-    # read local disk, or a plain --wrap job to download hundreds of GB with no workdir set up.
-    #
-    # NOT simply `--stage-gcs`, which no longer means "this run stages". Since paths decide for
-    # themselves, the flag may be present only to let some *other* field use the bare bucket/prefix
-    # form while the input is local -- a job that needs no staging payload at all.
+    # A `gs://` `paths.input_path` is the whole test, and it must match what config.py concludes: the
+    # pipeline stages such a value on the strength of its scheme, and a launcher that disagreed would
+    # submit the non-staging payload -- a bare `sbatch --wrap` around main.py, with no gcloud check, no
+    # SLIDR_OUTPUT_PATH and no workdir -- for a job that then downloads hundreds of GB into whatever
+    # `paths.output_path` happens to name.
     SLURM_STAGE=""
-    if [[ "$INPUT_GCS" == gs://* ]]; then
-        SLURM_STAGE=true
-    elif [[ "$STAGE_GCS" == true && -n "$INPUT_GCS" && "$INPUT_GCS" != /* && "$INPUT_GCS" != '~'* ]]; then
-        SLURM_STAGE=true
-    fi
+    [[ "$INPUT_GCS" == gs://* ]] && SLURM_STAGE=true
 
     # Every value read at submit time comes from this checkout's config, staged run or not: a --slurm
     # job always runs with config/config.yaml rather than a copy fetched from the bucket.
@@ -1011,11 +996,11 @@ elif [[ "$SLURM" == true ]]; then
 
     if [[ "$SLURM_STAGE" == true ]]; then
         command -v gcloud >/dev/null 2>&1 || {
-            echo "[ERROR]: --slurm --stage-gcs needs the gcloud CLI to stage inputs, but it is not on PATH" >&2
+            echo "[ERROR]: this job stages its inputs from GCS, which needs the gcloud CLI, but it is not on PATH" >&2
             echo "Troubleshooting:" >&2
             echo " • Many clusters ship it as a module; load it first (e.g. \`module load google-cloud-sdk\`)" >&2
             echo " • Otherwise install it: https://cloud.google.com/sdk/docs/install" >&2
-            echo " • Or drop --stage-gcs to run entirely off the local filesystem, with no staging" >&2
+            echo " • Or point \\`paths.input_path\\` at a local directory to run entirely off the filesystem, with no staging" >&2
             exit 1
         }
         # Reaching here means the input is already bucket-backed -- SLURM_STAGE is set from exactly
@@ -1054,11 +1039,11 @@ elif [[ "$SLURM" == true ]]; then
             fi
         fi
     elif [[ -n "$WORKDIR" ]]; then
-        echo "[ERROR]: --workdir applies to staged runs only; add --stage-gcs too" >&2
+        echo "[ERROR]: --workdir applies to staged runs only, and this run stages nothing" >&2
         echo "Troubleshooting:" >&2
         echo " • --workdir configures where inputs are staged *to*, so it only means something once there is something to stage" >&2
-        echo " • Add \`--stage-gcs\` to turn this into a self-staging run (the location comes from \`paths.input_path\`)" >&2
-        echo " • Or drop it: without --stage-gcs the job reads everything off the local filesystem, as configured in config/config.yaml" >&2
+        echo " • Point \`paths.input_path\` at a gs:// prefix to make this a self-staging run" >&2
+        echo " • Or drop it: with a local \\`paths.input_path\\` the job reads everything off the filesystem, as configured in config/config.yaml" >&2
         exit 1
     fi
 

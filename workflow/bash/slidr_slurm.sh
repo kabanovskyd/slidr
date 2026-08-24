@@ -15,10 +15,11 @@
 # already right there and is the file they just edited; downloading a copy written for a different
 # machine on top of it only invited the two to disagree. The GCP script still needs its own copy
 # because a fresh VM has no checkout to read. Consequences: the bucket needs no config.yaml for a
-# --slurm --stage-gcs run, and settings the submitter changes locally take effect on the next
+# staged --slurm run, and settings the submitter changes locally take effect on the next
 # submission with nothing to re-upload.
 #
-# Submitted by ./slidr --slurm --stage-gcs ; not intended to be run by hand. Inputs arrive as
+# Submitted by ./slidr --slurm for a run whose `paths.input_path` is a gs:// prefix; not intended to be
+# run by hand. Inputs arrive as
 # environment variables (sbatch exports the submitting environment by default):
 #
 #   INPUT           GCS prefix the run's inputs come from (`paths.input_path`). Logged for the record
@@ -139,7 +140,7 @@ mkdir -p "$SLIDR_WORKDIR" "$OUT_DIR" || die \
 # locations, metadata source -- comes from config/config.yaml as committed. That includes
 # `paths.auth_key_path`: nothing is exported for it here, because nothing stages a key any more.
 #
-# SLIDR_INPUT_PATH is deliberately NOT set. Under --stage-gcs `paths.input_path` is the gs:// prefix to
+# SLIDR_INPUT_PATH is deliberately NOT set. Here `paths.input_path` is the gs:// prefix to
 # stage *from*, so overriding it with a local directory would leave the job with nothing to download.
 # Where the data lands is a separate field, `settings.gcs_download_dest`, which defaults into the output
 # tree below -- so this job stages into ${OUT_DIR}/${BCL_ID}/data and needs no override either.
@@ -164,13 +165,12 @@ uv sync || die \
     "If the lockfile is stale, refresh it on the submit node with \`uv lock\`"
 
 log "Launching the pipeline"
-# --stage-gcs makes the pipeline pull the run folders under `paths.input_path`, the reference genome,
-# puck maps, raw barcodes and -- when `software_path` is a gs:// location -- the software, from the
-# locations named in the checkout's own config/config.yaml. No --config: this job runs with the repo's
-# config, not a staged copy of one.
+# The pipeline pulls whatever the checkout's own config/config.yaml names with a gs:// prefix -- the
+# run folders under `paths.input_path`, the reference genome, puck maps, raw barcodes, the software --
+# and reads the rest off this filesystem. No flag says so: the scheme does. No --config either, since
+# this job runs with the repo's config rather than a staged copy of one.
 uv run python workflow/main.py \
     --bcl "$BCL_ID" \
-    --stage-gcs \
     "$@" \
     || die "the pipeline exited with an error" \
            "The pipeline's own error and troubleshooting notes are above, and in ${OUT_DIR}/${BCL_ID}/log/runtime.log" \

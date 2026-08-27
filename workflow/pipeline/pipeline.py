@@ -2038,17 +2038,31 @@ def run_spatial_analysis() -> None:
             log_write(hint)
         percent_umi_filtering = 1
 
+    # The suffix a downsampled SBcounts file carries, and the one run_spatial.R is told to look for.
+    # It stays empty unless a downsampled file was actually written: the file and the label used to be
+    # derived from two different conditions -- the file only for a float rate, the label for any value
+    # that was not None -- so a non-float (a quoted '0.5' in the YAML, or an int) warned that
+    # downsampling was being skipped and then still sent R hunting for a SBcounts_downsampled_*.h5 that
+    # nothing had created, which it reported as a missing spatial-count output.
+    downsampling_label = ""
     if SPATIAL_DOWNSAMPLING is not None:
         if not isinstance(SPATIAL_DOWNSAMPLING, float):
             log_write(f"[WARNING]: spatial downsampling rate must be a float, but is currently set to {SPATIAL_DOWNSAMPLING!r}")
             log_write(f"Spatial downsampling will be ignored for this run (this may cause an OOM crash if your samples are sequenced deeply)")
             log_write(" • Set `workflow.spatial_downsampling` to a decimal fraction of reads to keep, e.g. 0.5 -- note that `1` parses as an integer, so write `1.0`")
+            log_write(" • Quote marks make it a string, which is not a rate either: write 0.5, not '0.5'")
             log_write(" • Remove the field entirely to run on all reads without this warning")
         else:
+            downsampling_label = str(SPATIAL_DOWNSAMPLING).replace('.', '')
             for sample in metadata_df['Sample Name'].astype(str).values:
                 downsample_spatial(
                     SPATIAL_COUNT_OUTS / sample / "SBcounts.h5",
-                    SPATIAL_COUNT_OUTS / sample / f"SBcounts_downsampled_{str(SPATIAL_DOWNSAMPLING).replace('.', '')}.h5"
+                    SPATIAL_COUNT_OUTS / sample / f"SBcounts_downsampled_{downsampling_label}.h5",
+                    # The rate has to be passed: without it the helper kept every fifth read regardless
+                    # of the configured value, so a file named for 0.5 held 20% of the reads -- and it
+                    # rescales metadata/num_reads by the same factor, leaving nothing downstream able to
+                    # notice the name and the contents disagreed.
+                    rate=SPATIAL_DOWNSAMPLING
                 )
 
     stage_started = log_stage_start("spatial analysis")
@@ -2123,7 +2137,7 @@ def run_spatial_analysis() -> None:
                     BCL_ID,
                     sample_list,
                     use_cellbender,
-                    str(SPATIAL_DOWNSAMPLING).replace('.', '') if SPATIAL_DOWNSAMPLING is not None else "",
+                    downsampling_label,
                     str(NUM_THREADS),
                     str(percent_umi_filtering)
                 ],

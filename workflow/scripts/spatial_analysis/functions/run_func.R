@@ -176,7 +176,10 @@ check_args_and_get_paths <- function(args) {
       missing_files <- c(missing_files, "metrics_summary.csv")
     }
     if (is.na(sb_path)) {
-      missing_files <- c(missing_files, "SBcounts.h5")
+      # the name that was looked for, not the literal "SBcounts.h5": under a downsampling rate the
+      # file being asked for is SBcounts_downsampled_<rate>.h5, and reporting the undownsampled name
+      # sends the reader to a file that is sitting right there
+      missing_files <- c(missing_files, basename(sb_file))
     }
     if (length(missing_files) > 0) {
       # name the stage that produces each missing file, so the message says which step to re-run

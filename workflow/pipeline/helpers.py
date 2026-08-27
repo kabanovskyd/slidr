@@ -2182,6 +2182,18 @@ def downsample_spatial(
     seed = 42
     chunk_size = 50_000_000   # rows per chunk; adjust down if still memory-tight
 
+    # Checked here rather than left to h5py, which reports a missing file as a bare OSError naming
+    # libhdf5 error codes -- unreadable as the "the spatial-count stage has not run for this sample"
+    # that it always means, and raised from inside the spatial-analysis stage, which is not where the
+    # reader would think to look.
+    if not Path(in_path).is_file():
+        log_write(f"[ERROR]: cannot downsample the spatial barcode counts: {in_path} does not exist")
+        log_write("Troubleshooting:")
+        log_write(" • Run the spatial-barcode counting stage first with --spatial-count")
+        log_write(" • Check the `Sample Name` metadata column matches the output directory names exactly")
+        log_write(" • A counting run that crashed part-way leaves the directory without SBcounts.h5; re-run it with --force")
+        sys.exit(1)
+
     with h5py.File(in_path, "r") as fin:
         n_rows = fin["matrix/cb_index"].shape[0]
         rng = np.random.default_rng(seed)

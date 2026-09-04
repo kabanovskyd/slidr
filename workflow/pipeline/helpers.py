@@ -2005,6 +2005,88 @@ def missing_fastqs(
     return missing
 
 
+# The ways one read can be placed in the spatial staging directory, in the order they are tried.
+# Which of them works is a property of the filesystem holding TMP_PATH, not of any one FASTQ:
+#
+#  - symlink   a few bytes per read, and supported by every local disk and POSIX network
+#              filesystem, so it is the default
+#  - hardlink  free as well, but only within a single filesystem, so it is available only when the
+#              reads and TMP_PATH are on the same one. Removing one is safe -- rmtree of the
+#              staging directory drops a name, not the data -- but a hardlink is the same inode as
+#              the delivered read, so anything that *wrote* through it would edit the delivery
+#              directory itself. Only spatial_count.jl reads this directory, and it opens the
+#              FASTQs read-only, which is what makes this rung acceptable at all
+#  - copy      always works, and the only rung that duplicates the reads -- gigabytes for an SB
+#              library -- which is why it is last
+#
+# The fallback exists because a CIFS/SMB share mounted without POSIX extensions or `mfsymlinks`
+# supports neither kind of link, and reports the refusal as ENOENT rather than EPERM. The bare
+# OSError then names the FASTQ as its first path (os.symlink raises with the target first, though
+# only the link path can be at fault) and reads as though the read were missing, which is
+# thoroughly misleading. Falling back keeps such a share usable and says which rung it landed on.
+STAGE_METHODS = ('symlink', 'hardlink', 'copy')
+
+
+def stage_one_fastq(file: Path, link: Path, method: str) -> None:
+    """
+    Place a single FASTQ in the staging directory by one specific method.
+
+    Inputs:
+     - file:   the FASTQ to stage, inside the --fastqs directory
+     - link:   the path to create inside the staging directory
+     - method: one of STAGE_METHODS
+    """
+
+    if method == 'symlink':
+        # resolve() so the link records where the read actually is, rather than pointing through
+        # whatever symlinked spelling of the --fastqs directory the config happened to use
+        link.symlink_to(file.resolve())
+    elif method == 'hardlink':
+        os.link(file, link)
+    elif method == 'copy':
+        shutil.copy2(file, link)
+    else:
+        raise ValueError(f"[INTERNAL ERROR]: unknown FASTQ staging method: {method}")
+
+
+def stage_fastq_with_fallback(
+    file: Path,
+    link: Path,
+    first_method: int = 0
+) -> tuple[int | None, dict[str, OSError]]:
+    """
+    Stage one FASTQ, trying STAGE_METHODS from `first_method` onward until one succeeds.
+
+    Methods before `first_method` are skipped: the caller has already established that they fail on
+    this filesystem, so re-probing them would repeat a known-failing syscall once per read and warn
+    once per read about a single filesystem's limitation.
+
+    Inputs:
+     - file:         the FASTQ to stage
+     - link:         the path to create inside the staging directory
+     - first_method: index into STAGE_METHODS to start at
+    Outputs:
+     - the index of the method that worked, with the errors from any that were tried and failed, or
+       (None, errors) if every method from `first_method` onward failed
+    """
+
+    errors: dict[str, OSError] = {}
+    for index in range(first_method, len(STAGE_METHODS)):
+        method = STAGE_METHODS[index]
+        try:
+            stage_one_fastq(file, link, method)
+            return index, errors
+        except OSError as error:
+            errors[method] = error
+            # a method that fails part-way can leave the destination behind -- a partial copy, or a
+            # link created and then rejected -- and the next rung would then fail on an existing
+            # path rather than on its own merits. unlink() does not follow symlinks, so this clears
+            # a broken one too
+            link.unlink(missing_ok=True)
+
+    return None, errors
+
+
 def stage_spatial_fastqs(
     fastq_path: Path | str,
     sample_name: str,
@@ -2012,12 +2094,14 @@ def stage_spatial_fastqs(
 ) -> Path:
     """
     Collect one sample's spatial-barcode FASTQs out of an externally supplied directory into a
-    dedicated staging directory of symlinks, and return that directory.
+    dedicated staging directory of links, and return that directory.
 
     spatial_count.jl takes a *directory* and selects files by substring-matching the sample ID, so
     handing it a mixed --fastqs directory would let the sample's gene-expression reads match the
     same ID and be counted as spatial reads. Staging just the spatial-barcode library keeps that
-    selection exact, and symlinking avoids duplicating FASTQs that are routinely hundreds of GB.
+    selection exact, and linking avoids duplicating FASTQs that are routinely hundreds of GB. See
+    STAGE_METHODS for how the reads are placed there and what happens on a filesystem that refuses
+    to link at all.
 
     Inputs:
      - fastq_path:  directory of already-demultiplexed FASTQs
@@ -2044,6 +2128,10 @@ def stage_spatial_fastqs(
         shutil.rmtree(stage_dir)
     stage_dir.mkdir(parents=True)
 
+    # settled on the first read and then reused, so the filesystem is probed once rather than once
+    # per FASTQ; a later read that cannot manage even that method falls further and says so again
+    method_index = 0
+
     for file in matches:
         link = stage_dir / file.name
         if link.exists():
@@ -2053,7 +2141,34 @@ def stage_spatial_fastqs(
             log_write(" • spatial_count.jl processes a flat directory, so filenames must be unique")
             log_write(" • Flatten the directory passed to --fastqs, or rename the duplicate files")
             sys.exit(1)
-        link.symlink_to(file.resolve())
+
+        used, errors = stage_fastq_with_fallback(file, link, method_index)
+
+        if used is None:
+            log_write(f"[ERROR]: could not place {file.name} in the spatial-barcode staging directory "
+                      f"for sample {sample_name}: {stage_dir}")
+            log_write("Troubleshooting:")
+            for method, error in errors.items():
+                log_write(f" • {method} failed: {error.strerror} (errno {error.errno})")
+            log_write(f" • Every way of placing a read there was refused, so this is the filesystem holding "
+                      f"{TMP_PATH} rather than anything about the reads themselves")
+            log_write(" • Point `paths.output_path` at a local disk (or $SCRATCH) so this run's tmp/ is not on it")
+            log_write(f" • Check the space and write access there: `df -h {TMP_PATH}` and `touch {stage_dir}/probe`")
+            sys.exit(1)
+
+        if used != method_index:
+            refused = ', '.join(
+                f"{method} ({errors[method].strerror})" for method in STAGE_METHODS[method_index:used]
+            )
+            log_write(f"[WARNING]: staging {sample_name}'s spatial-barcode FASTQs by {STAGE_METHODS[used]} "
+                      f"rather than {STAGE_METHODS[method_index]} -- {refused}")
+            if STAGE_METHODS[used] == 'copy':
+                staged_gb = sum(match.stat().st_size for match in matches) / 1024**3
+                log_write(f" • This duplicates {staged_gb:.1f} GB into {stage_dir}, which is scratch and is "
+                          f"safe to delete once the run has finished")
+                log_write(" • A CIFS/SMB mount reports an unsupported link as ENOENT; adding `mfsymlinks` to its "
+                          "mount options, or putting `paths.output_path` on a local disk, avoids the copy")
+            method_index = used
 
     return stage_dir
 

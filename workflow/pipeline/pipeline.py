@@ -2158,7 +2158,10 @@ def run_takara_spatial_profiling() -> None:
     # rather than complaining about a definition file that was never shipped.
     trekker_env = ensure_conda_env("trekker", environment_yml=None)
     takara_pipeline_log = LOG_PATH / "takara_pipeline.log"
-    takara_path = SCRIPT_PATH / "takara"
+    # The Takara module lives beside workflow/scripts rather than inside it: it is vendored from
+    # Takara/Trekker rather than slidr's own, so it is kept out of the tree holding the scripts
+    # this repository maintains. SCRIPT_PATH is workflow/scripts, so its parent is workflow/.
+    takara_path = SCRIPT_PATH.parent / "takara"
     flex_outputs_path = OUTPUT_PATH / "flex"
     flex_puck_path = flex_outputs_path / "pucks"
     flex_samplesheets_path = flex_outputs_path / "samplesheets"

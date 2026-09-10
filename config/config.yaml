@@ -33,3 +33,4 @@ workflow:
   flex_spatial_R1_path:
   flex_spatial_R2_path:
   flex_gex_fastqs:
+  trekker_samplesheet:

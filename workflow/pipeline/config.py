@@ -620,6 +620,7 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         FLEX_R1_PATH = workflow.get('flex_spatial_R1_path')
         FLEX_R2_PATH = workflow.get('flex_spatial_R2_path')
         FLEX_GEX_FASTQS = workflow.get('flex_gex_fastqs')
+        TREKKER_SAMPLESHEET = workflow.get('trekker_samplesheet')
 
     # The exact bucket folder this run's results go to, when the caller has already chosen one.
     #
@@ -1157,6 +1158,26 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
 
     console.print('[bold green]\\[SUCCESS][/bold green]: Setup complete')
 
+    # A ready-made Trekker pipeline samplesheet, naming the partitions to profile and where each
+    # one's spatial reads and RNA counts already are. Set, it replaces everything
+    # run_takara_spatial_profiling would otherwise derive: no Trekker demultiplexing, no puck
+    # download, no generated samplesheet. That is the point -- a lab that has already demultiplexed
+    # its spatial reads and run CellBender per partition has inputs in locations and formats slidr
+    # does not choose, and a sheet is how the Trekker module already takes them.
+    #
+    # Validated here rather than at the stage: it costs one stat, and the stage is reached hours into
+    # a run.
+    if TREKKER_SAMPLESHEET is not None and str(TREKKER_SAMPLESHEET).strip():
+        TREKKER_SAMPLESHEET = Path(str(TREKKER_SAMPLESHEET).strip()).expanduser()
+        if not TREKKER_SAMPLESHEET.is_file():
+            err_console.print(f"[bold red]\\[ERROR][/bold red]: `workflow.trekker_samplesheet` is set but is not a file: {TREKKER_SAMPLESHEET}")
+            err_console.print("Troubleshooting:")
+            err_console.print(" • Point it at a Trekker pipeline samplesheet (.csv or .tsv), or remove the field to have slidr generate one")
+            err_console.print(" • The path is read on the machine the pipeline runs on, so a --gcp run needs it present on the VM")
+            sys.exit(1)
+    else:
+        TREKKER_SAMPLESHEET = None
+
     # package global constants into a dictionary
     cfg = {
         'root_path': ROOT_DIR,
@@ -1214,6 +1235,7 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         'flex_r1_path': FLEX_R1_PATH,
         'flex_r2_path': FLEX_R2_PATH,
         'flex_gex_fastqs': FLEX_GEX_FASTQS,
+        'trekker_samplesheet': TREKKER_SAMPLESHEET,
         'start_time': START_TIME,
         'bcl_id': BCL_ID
     }

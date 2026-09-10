@@ -52,6 +52,7 @@ SLACK_TOKEN = cfg['slack_token']
 BCL_ID = cfg['bcl_id']
 START_TIME = cfg['start_time']
 SUMMARY_LOG = cfg['summary_log']
+TREKKER_SAMPLESHEET = cfg['trekker_samplesheet']
 
 # Local copy of a `gs://` software_path, once staged. Memoized because the tree is large (a single
 # cellranger release is a couple of GB) and test_and_install_software() is called once per sample per
@@ -1129,6 +1130,14 @@ def need_run_module(
     if 'Chemistry' in metadata_df.columns and (metadata_df['Chemistry'].astype(str).str.strip() == 'Flex').any():
         return True
 
+    # Same argument for a run whose spatial analysis is driven by an operator-supplied Trekker
+    # samplesheet: its outputs land in the Flex tree that _MODULE_IO does not model, and its inputs
+    # are paths outside this run directory entirely, so the required-inputs check below would
+    # hard-exit on count outputs the run has no reason to hold. Scoped to that one stage, since the
+    # rest of the pipeline still uses the standard layout.
+    if module == 'spatial_analysis' and TREKKER_SAMPLESHEET is not None:
+        return True
+
     # classify each sample's outputs once
     if module == 'mkfastq':
         # mkfastq has no upstream file outputs to compare mtimes against, so a sample is simply
@@ -2202,6 +2211,101 @@ def sanitize_path_component(value: str, field_name: str = "value") -> str:
         )
 
     return value
+
+
+# Columns of a Trekker pipeline samplesheet, in the order the module expects them. `sample` names
+# the partition, and everything else says where that partition's inputs are or how to run it.
+TREKKER_SHEET_COLUMNS = (
+    'sample', 'sc_sample', 'experiment_date', 'barcode_file', 'fastq_1', 'fastq_2',
+    'sc_outdir', 'sc_platform', 'profile', 'subsample', 'cores',
+)
+
+# The columns naming something that must already exist on disk. `sc_outdir` is a directory of
+# matrix files (barcodes/features/matrix), the two FASTQs are files, and `barcode_file` is a puck
+# map in whichever form the module accepts -- so only existence is checked here, not the kind.
+TREKKER_SHEET_PATH_COLUMNS = ('barcode_file', 'fastq_1', 'fastq_2', 'sc_outdir')
+
+
+def load_trekker_samplesheet(sheet_path: Path | str) -> pd.DataFrame:
+    """
+    Read and check a ready-made Trekker pipeline samplesheet supplied by the operator.
+
+    This is the alternative to having run_takara_spatial_profiling derive the sheet itself, for the
+    case where the spatial reads were demultiplexed elsewhere and the RNA counts are CellBender
+    matrices written beside somebody else's cellranger run. Both live in locations and formats slidr
+    did not choose, and the sheet is how the Trekker module already accepts them.
+
+    Every path the sheet names is checked before anything runs, and all failures are reported
+    together: the module is launched once per row and each row is expensive, so discovering a typo in
+    row 9 after eight partitions have been profiled is the outcome worth avoiding.
+
+    Inputs:
+     - sheet_path: path to the samplesheet, comma- or tab-separated (the separator is sniffed)
+    Output:
+     - the sheet as a DataFrame, with exactly TREKKER_SHEET_COLUMNS in that order
+    """
+
+    sheet_path = Path(sheet_path)
+    try:
+        # sep=None sniffs the delimiter, so a sheet exported as .tsv is accepted alongside a .csv
+        # without the operator having to convert it or rename it
+        sheet = pd.read_csv(sheet_path, sep=None, engine='python')
+    except Exception as error:
+        log_write(f"[ERROR]: could not read the Trekker samplesheet at {sheet_path}: {error}")
+        log_write("Troubleshooting:")
+        log_write(" • The file must be a comma- or tab-separated table with a header row")
+        log_write(f" • Required columns: {', '.join(TREKKER_SHEET_COLUMNS)}")
+        sys.exit(1)
+
+    sheet.columns = [str(column).strip() for column in sheet.columns]
+    missing = [column for column in TREKKER_SHEET_COLUMNS if column not in sheet.columns]
+    if missing:
+        log_write(f"[ERROR]: the Trekker samplesheet at {sheet_path} is missing required column(s): {', '.join(missing)}")
+        log_write("Troubleshooting:")
+        log_write(f" • Column names are matched exactly; the full required set is: {', '.join(TREKKER_SHEET_COLUMNS)}")
+        log_write(f" • Columns found: {', '.join(sheet.columns)}")
+        sys.exit(1)
+
+    if sheet.empty:
+        log_write(f"[ERROR]: the Trekker samplesheet at {sheet_path} has a header but no rows")
+        log_write("Troubleshooting:")
+        log_write(" • Add one row per partition to profile, or remove `workflow.trekker_samplesheet` to have slidr generate the sheet")
+        sys.exit(1)
+
+    # keep only the known columns, in the module's own order, so an extra column carried along in a
+    # working spreadsheet cannot shift what the wrapper reads
+    sheet = sheet[list(TREKKER_SHEET_COLUMNS)].copy()
+    for column in TREKKER_SHEET_COLUMNS:
+        sheet[column] = sheet[column].astype(str).str.strip()
+
+    duplicated = sheet['sample'][sheet['sample'].duplicated()].tolist()
+    if duplicated:
+        log_write(f"[ERROR]: the Trekker samplesheet names the same partition more than once: {', '.join(sorted(set(duplicated)))}")
+        log_write("Troubleshooting:")
+        log_write(" • Each row is profiled into flex/trekker/<experiment_date>_<sample>/, so two rows sharing a `sample` would overwrite each other")
+        log_write(" • Give the partitions distinct `sample` values, or delete the duplicate row")
+        sys.exit(1)
+
+    problems = []
+    for position, row in sheet.iterrows():
+        for column in TREKKER_SHEET_PATH_COLUMNS:
+            value = row[column]
+            if not value or value.lower() in ('nan', 'none'):
+                problems.append(f"row {position + 2} ({row['sample']}): `{column}` is empty")
+            elif not Path(value).exists():
+                problems.append(f"row {position + 2} ({row['sample']}): `{column}` does not exist: {value}")
+
+    if problems:
+        log_write(f"[ERROR]: the Trekker samplesheet at {sheet_path} names {len(problems)} input(s) that cannot be read:")
+        for problem in problems:
+            log_write(f"   • {problem}")
+        log_write("Troubleshooting:")
+        log_write(" • Row numbers count the header as line 1, matching what a spreadsheet shows")
+        log_write(" • `sc_outdir` is a directory of matrix files; `fastq_1`/`fastq_2` are the partition's demultiplexed spatial reads")
+        log_write(" • Paths are read on the machine the pipeline runs on, so a --gcp run needs them present on the VM")
+        sys.exit(1)
+
+    return sheet
 
 
 def retrieve_takara_bead_barcode_file(

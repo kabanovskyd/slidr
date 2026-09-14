@@ -2207,9 +2207,26 @@ def run_takara_spatial_profiling() -> None:
     flex_samplesheets_path.mkdir(exist_ok=True)
     metadata_df = pd.read_csv(SUMMARY_PATH)
 
-    # add the Trekker conda environment to PATH
+    # Activate the Trekker environment the same way the R and cellbender stages activate r_env, since
+    # this module runs the same kinds of tool: several Rscript invocations, an Rmd render, and Python
+    # that imports numpy/scipy/pandas.
+    #
+    #  - PYTHONNOUSERSITE, from conda_subprocess_env, so ~/.local/lib cannot shadow the environment's
+    #    own packages -- the failure that made cellbender train against the wrong torch
+    #  - the environment's bin ahead of everything else, so anything the scripts shell out to is the
+    #    environment's copy rather than the machine's
+    #  - CONDA_PREFIX, which some R packages read to locate resources relative to the environment they
+    #    were installed into, and which `mamba run` alone does not guarantee for a script that
+    #    re-execs. It is the same prefix handed to the scripts as PROFILE_CONDA_PATH, derived once
+    #    here so the two cannot drift
+    #
+    # PYTHONPATH is additionally dropped, which the r_env stages have no need of: the vendored module
+    # ships Python that imports by bare module name from its own directory, so an inherited PYTHONPATH
+    # can shadow it in a way R's library path cannot.
+    trekker_prefix = trekker_env.parent
     env = conda_subprocess_env()
-    env['PATH'] = f"{trekker_env}:{env.get('PATH', '')}"
+    env['PATH'] = f"{trekker_env}{os.pathsep}{env.get('PATH', '')}"
+    env['CONDA_PREFIX'] = str(trekker_prefix)
     env.pop('PYTHONPATH', None)
 
     # An operator-supplied sheet replaces everything the else-branch below derives: it names the
@@ -2424,7 +2441,7 @@ def run_takara_spatial_profiling() -> None:
                     sub_samplesheet_path,
                     takara_path / 'profiling',
                     flex_outputs_path / 'trekker',
-                    trekker_env.parent
+                    trekker_prefix
                 ],
                 stdout=logfile,
                 stderr=subprocess.STDOUT,
@@ -2510,7 +2527,7 @@ def run_takara_spatial_profiling() -> None:
                     sample['Sample Name'],
                     'conda',
                     takara_path / 'merging',
-                    str(trekker_env.parent)
+                    str(trekker_prefix)
                 ],
                 stdout=logfile,
                 stderr=subprocess.STDOUT,

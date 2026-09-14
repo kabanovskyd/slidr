@@ -450,8 +450,44 @@ once per metadata sample. So the output layout and the merge are unchanged, and 
 `flex/samplesheets/` are populated as usual — the normalized sheet is written to
 `flex/samplesheets/Trekker_flex_samplesheet.csv` so the run directory records what produced it.
 
+### Re-running the Takara stage
+
+Partitions are skipped individually when already profiled, so a failure late in the stage does not
+cost the partitions that succeeded:
+
+| | |
+|---|---|
+| Partition already profiled | skipped, unless `--force` |
+| What counts as profiled | `flex/trekker/<date>_<partition>/trekker_<partition>/output/<partition>_ConfPositioned_seurat_spatial.rds` exists and is non-empty |
+| The merger's `samplesheets/input/<sample>/` | cleared before every merge, with or without `--force` |
+| The merger's `samplesheets/log/<sample>/` | kept, unless `--force` |
+
+The completeness test is the final Seurat object rather than the output directory because
+`nuclei_locator.sh` creates the whole output tree with `mkdir -p` before doing any work — the
+directory exists from the first second of a partition that goes on to crash. The `.rds` is written
+at the end and is what the merge step consumes, so "is this usable by the merge" is the question
+actually being asked. A partition that failed *after* writing it (inside `genreport`) counts as
+complete; `--force` re-profiles it.
+
+`input/` is cleared unconditionally on purpose. `trekker_merger.sh` aborts outright when that
+directory exists and is non-empty, which is the state any failed merge leaves behind, so gating the
+cleanup on `--force` would make recovering a failed merge also re-profile every partition — hours of
+completed work discarded to redo a step that takes minutes. The directory is the merger's own
+staging area, holding copies of inputs it is about to re-stage; nothing else reads it and a stale one
+is never wanted. `log/` is kept because after a failure it holds that failure's logs.
+
+So the ordinary recovery from a failed merge is to re-run the stage with no flags at all.
+
 Design points:
 
+- **Supplied inputs are checked for shape, not just existence.** `sc_outdir` must hold the count
+  files the row's `sc_platform` requires (mirroring `check_snRNAseq_inputs` in
+  `nuclei_locator_wrapper.sh`), the FASTQs must actually be gzipped, and `barcode_file` must parse as
+  CSV with at least 4 columns — `splitspatialbarcodes.py` reads it positionally with
+  `header=None, index_col=0`, so a tab-separated puck map is seen as a single column and reported as
+  a truncated file. The check names the delimiter and whether columns are genuinely missing, which
+  the module's own "found 1" cannot distinguish. Only the first few lines are read, since a puck map
+  runs to millions of beads.
 - **The field selects the backend, not just its input.** `--spatial-analysis` normally routes to the
   Takara module only for `Chemistry: Flex`. A sheet naming every input the module needs is a
   stronger statement than the chemistry column, so it routes on its own; requiring `Flex` too would
@@ -867,6 +903,10 @@ installer.
 - **`unknown argument: --stage-gcs`**: the flag was removed. It only ever disambiguated the bare `bucket/prefix` form, which is no longer accepted either — write `gs://` and staging follows from the scheme. The two errors it used to produce (`input_path is a GCS location, but this run was not asked to stage from GCS`, and `must be a GCS location when staging from GCS`) are gone with it. Paths now decide for themselves — a `gs://` value is staged with no flag, and a local one is read in place even under `--stage-gcs` — so neither the combination they rejected nor the mixed configuration they made impossible is an error any more. A `gs://` path that cannot be read now fails where it is staged, with gcloud's own message.
 - **`<field> in the configuration file is not a directory`**: the value is neither a `gs://` URI nor an existing local directory. A bare `bucket/prefix` reads as a relative directory, so this is what a bucket written without its scheme looks like — add `gs://`.
 - **`no .fastq.gz files were staged to the FASTQ directory for --fastqs`**: a staged bare `--fastqs` downloaded `<input_path>/<BCL_ID>` and found no FASTQs in it. Usually that folder holds BCLs, in which case drop `--fastqs`.
+- **`... `barcode_file` has 1 comma-separated column(s) ... it is tab-separated`**: the puck map is read as CSV and positionally (`id, barcode, x, y`), so a tab-separated file parses as one column. The message says whether converting the delimiter is enough or whether columns are also missing — a 3-column tab file is barcode/x/y with no leading id, and needs both. Caught at startup rather than ~15 minutes into the first partition.
+- **`... `sc_outdir` does not hold the count files `sc_platform: X` requires`**: the directory exists but not in the layout that platform expects. `TrekkerFX_FLEX` and unlisted platforms need `barcodes.tsv.gz`/`features.tsv.gz`/`matrix.mtx.gz`; `TrekkerQ_P` also accepts `count_matrix.mtx`+`cell_metadata.csv`+`all_genes.csv`; `TrekkerU_IL` accepts the `*scRNA.filtered.*` or `*scRNA.*` triplets. The message lists what the directory actually contains.
+- **`... `fastq_1` is not gzipped`**: the file is named `.gz` but has no gzip magic bytes. The module reads `.fastq.gz`.
+- **A re-run re-profiles partitions that already finished**: it shouldn't — check the `.rds` named in [Re-running the Takara stage](#re-running-the-takara-stage) exists and is non-empty for that partition, and that you did not pass `--force`. Partitions profiled before this behaviour existed are recognised too, since the test is the module's own output rather than a marker slidr writes.
 - **`the Trekker samplesheet at ... names N input(s) that cannot be read`**: `workflow.trekker_samplesheet` is set and one or more of the `barcode_file`, `fastq_1`, `fastq_2` or `sc_outdir` paths in it is empty or absent. Every failure is listed at once with its spreadsheet line number (the header counts as line 1). `sc_outdir` is a directory of matrix files, not an `.h5`. Paths are read on the machine the pipeline runs on, so a `--gcp` run needs them present on the VM.
 - **`the Trekker samplesheet names no partition for these metadata sample(s)`**: a sample selected for this run has no row whose `sample` starts `TrekkerFX_<Sample Name>_`. That prefix is how the merge step groups partitions, so such a sample would merge nothing and still report success. Add its partitions to the sheet, or set `Run` to `NO` for it.
 - **`the Trekker samplesheet names the same partition more than once`**: two rows share a `sample` value. Each row is profiled into `flex/trekker/<experiment_date>_<sample>/`, so they would overwrite each other. Note two rows may legitimately share everything *except* `sample` — a partition re-demultiplexed on a later date is distinguished by a suffix, as in `..._AB007_cellBender_combined2`.

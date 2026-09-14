@@ -2220,10 +2220,149 @@ TREKKER_SHEET_COLUMNS = (
     'sc_outdir', 'sc_platform', 'profile', 'subsample', 'cores',
 )
 
-# The columns naming something that must already exist on disk. `sc_outdir` is a directory of
-# matrix files (barcodes/features/matrix), the two FASTQs are files, and `barcode_file` is a puck
-# map in whichever form the module accepts -- so only existence is checked here, not the kind.
+# The columns naming something that must already exist on disk.
 TREKKER_SHEET_PATH_COLUMNS = ('barcode_file', 'fastq_1', 'fastq_2', 'sc_outdir')
+
+# What the module requires inside `sc_outdir`, keyed on the row's `sc_platform`. Mirrors
+# check_snRNAseq_inputs in takara/profiling/nuclei_locator_wrapper.sh: any one of the listed sets
+# satisfies it, a name containing '*' is a glob, and a platform not named here takes the fallback.
+# Kept as data rather than reimplemented logic so the two can be compared line by line when the
+# vendored module is next updated.
+TREKKER_SC_OUTDIR_LAYOUTS = {
+    'TrekkerQ_P': (
+        ('barcodes.tsv.gz', 'features.tsv.gz', 'matrix.mtx.gz'),
+        ('count_matrix.mtx', 'cell_metadata.csv', 'all_genes.csv'),
+        ('count_matrix.mtx.gz', 'cell_metadata.csv.gz', 'all_genes.csv.gz'),
+    ),
+    'TrekkerU_IL': (
+        ('*scRNA.filtered.barcodes.tsv.gz', '*scRNA.filtered.features.tsv.gz', '*scRNA.filtered.matrix.mtx.gz'),
+        ('*scRNA.barcodes.tsv.gz', '*scRNA.features.tsv.gz', '*scRNA.matrix.mtx.gz'),
+    ),
+}
+TREKKER_SC_OUTDIR_DEFAULT = (('barcodes.tsv.gz', 'features.tsv.gz', 'matrix.mtx.gz'),)
+
+# Columns of the puck map, which splitspatialbarcodes.py reads positionally with
+# `pd.read_csv(..., header=None, index_col=0)`: comma-delimited, the first column discarded as the
+# index, leaving barcode/x/y. So the raw file needs at least four comma-separated columns.
+TREKKER_PUCK_MIN_COLUMNS = 4
+
+
+def trekker_sample_id(name: str) -> str:
+    """
+    Apply the same name sanitization the vendored Trekker scripts do, so slidr and the module agree
+    about where a partition's outputs are.
+
+    Both nuclei_locator_wrapper.sh and trekker_merger.sh rewrite their SAMPLE_ID with
+    `sed 's/[^a-zA-Z0-9_]/_/g'` before building any path from it. A sample named with a '-' or a '.'
+    therefore has outputs under a different name than the samplesheet spells, and anything slidr
+    derives from the raw name -- a skip check, a directory to clear -- would silently miss them.
+
+    Inputs:
+     - name: the partition or sample name as written in the samplesheet or metadata
+    Output:
+     - the name as the Trekker scripts will spell it on disk
+    """
+
+    return re.sub(r'[^a-zA-Z0-9_]', '_', str(name))
+
+
+def probe_delimited_width(path: Path, delimiters: tuple[str, ...] = (',', '\t'), lines: int = 3) -> dict[str, int]:
+    """
+    Report how many fields a text file's first lines yield under each candidate delimiter.
+
+    Only the first few lines are read. A puck map runs to millions of beads, and the question --
+    "which delimiter was this written with" -- is answered by the first line as well as by all of
+    them.
+
+    Inputs:
+     - path:       the file to inspect
+     - delimiters: the delimiters to try
+     - lines:      how many non-blank lines to sample
+    Output:
+     - delimiter -> the greatest field count seen across the sampled lines
+    """
+
+    widths = {delimiter: 0 for delimiter in delimiters}
+    with open(path, 'r', errors='replace') as handle:
+        seen = 0
+        for line in handle:
+            line = line.rstrip('\r\n')
+            if not line.strip():
+                continue
+            for delimiter in delimiters:
+                widths[delimiter] = max(widths[delimiter], len(line.split(delimiter)))
+            seen += 1
+            if seen >= lines:
+                break
+    return widths
+
+
+def trekker_input_format_problem(column: str, value: str, platform: str) -> str | None:
+    """
+    Check that one samplesheet input is the *shape* the Trekker module expects, not merely present.
+
+    Existence alone is a weak check here. The module reads each of these positionally and with a
+    fixed delimiter, so a file that is present but written differently -- a tab-separated puck map,
+    an uncompressed FASTQ, a count directory in another layout -- fails deep inside a partition that
+    has already been running for a quarter of an hour, and reports it as a column count rather than
+    as a delimiter.
+
+    Inputs:
+     - column:   which of TREKKER_SHEET_PATH_COLUMNS this is
+     - value:    the path from the sheet, already known to exist
+     - platform: the row's `sc_platform`, which selects what sc_outdir must contain
+    Output:
+     - a description of what is wrong, or None if the input looks usable
+    """
+
+    path = Path(value)
+
+    if column == 'barcode_file':
+        try:
+            widths = probe_delimited_width(path)
+        except OSError as error:
+            return f"cannot be read: {error.strerror}"
+        if widths[','] >= TREKKER_PUCK_MIN_COLUMNS:
+            return None
+        detail = (f"has {widths[',']} comma-separated column(s), but the puck map is read as CSV and needs "
+                  f"at least {TREKKER_PUCK_MIN_COLUMNS} (id, barcode, x, y)")
+        # Separate the two things a short row can mean, because they need different fixes and the
+        # module's own message ("found 1") cannot tell them apart: the delimiter is wrong, the
+        # columns are genuinely missing, or -- the case that wasted an afternoon -- both.
+        if widths['\t'] > widths[',']:
+            detail += f" -- it is tab-separated ({widths['\t']} columns split on tabs)"
+            if widths['\t'] >= TREKKER_PUCK_MIN_COLUMNS:
+                detail += "; convert the delimiter with `tr '\\t' ','`"
+            else:
+                detail += (f", and even split on tabs it has only {widths['\t']} of the {TREKKER_PUCK_MIN_COLUMNS} "
+                           f"columns, so it is also missing the leading id column that is read as the index")
+        elif widths[','] <= 1:
+            detail += " -- a single column usually means the file uses some other delimiter entirely"
+        return detail
+
+    if column in ('fastq_1', 'fastq_2'):
+        try:
+            with open(path, 'rb') as handle:
+                magic = handle.read(2)
+        except OSError as error:
+            return f"cannot be read: {error.strerror}"
+        if magic != b'\x1f\x8b':
+            return "is not gzipped (the module reads .fastq.gz); gzip it, or point the column at the .gz"
+        return None
+
+    if column == 'sc_outdir':
+        if not path.is_dir():
+            return "is not a directory (it must hold the RNA count matrix files)"
+        layouts = TREKKER_SC_OUTDIR_LAYOUTS.get(platform, TREKKER_SC_OUTDIR_DEFAULT)
+        for layout in layouts:
+            if all(any(path.glob(name)) if '*' in name else (path / name).exists() for name in layout):
+                return None
+        wanted = ' or '.join(', '.join(layout) for layout in layouts)
+        present = sorted(child.name for child in path.iterdir())[:6] or ['(empty)']
+        return (f"does not hold the count files `sc_platform: {platform}` requires ({wanted}); "
+                f"it contains: {', '.join(present)}")
+
+    return None
 
 
 def load_trekker_samplesheet(sheet_path: Path | str) -> pd.DataFrame:
@@ -2286,6 +2425,9 @@ def load_trekker_samplesheet(sheet_path: Path | str) -> pd.DataFrame:
         log_write(" • Give the partitions distinct `sample` values, or delete the duplicate row")
         sys.exit(1)
 
+    # Existence first, then shape. Both go into the same report: the module is launched once per row
+    # and each row runs for tens of minutes, so every problem the sheet can be told to have should be
+    # told at once rather than one per expensive attempt.
     problems = []
     for position, row in sheet.iterrows():
         for column in TREKKER_SHEET_PATH_COLUMNS:
@@ -2294,6 +2436,10 @@ def load_trekker_samplesheet(sheet_path: Path | str) -> pd.DataFrame:
                 problems.append(f"row {position + 2} ({row['sample']}): `{column}` is empty")
             elif not Path(value).exists():
                 problems.append(f"row {position + 2} ({row['sample']}): `{column}` does not exist: {value}")
+            else:
+                complaint = trekker_input_format_problem(column, value, row['sc_platform'])
+                if complaint:
+                    problems.append(f"row {position + 2} ({row['sample']}): `{column}` {complaint}: {value}")
 
     if problems:
         log_write(f"[ERROR]: the Trekker samplesheet at {sheet_path} names {len(problems)} input(s) that cannot be read:")
@@ -2302,6 +2448,8 @@ def load_trekker_samplesheet(sheet_path: Path | str) -> pd.DataFrame:
         log_write("Troubleshooting:")
         log_write(" • Row numbers count the header as line 1, matching what a spreadsheet shows")
         log_write(" • `sc_outdir` is a directory of matrix files; `fastq_1`/`fastq_2` are the partition's demultiplexed spatial reads")
+        log_write(" • Shape is checked as well as existence, because the module reads each of these positionally "
+                  "and with a fixed delimiter -- see the per-row detail above")
         log_write(" • Paths are read on the machine the pipeline runs on, so a --gcp run needs them present on the VM")
         sys.exit(1)
 

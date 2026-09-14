@@ -57,6 +57,7 @@ from helpers import (
     declared_lanes,
     FASTQ_NAME_RE,
     load_trekker_samplesheet,
+    trekker_sample_id,
     retrieve_takara_bead_barcode_file,
     sanitize_path_component,
     split_probe_barcodes,
@@ -2158,6 +2159,28 @@ def run_spatial_analysis() -> None:
         job_crash("run_spatial.R", proc.returncode, spatial_analysis_log)
 
 
+def trekker_partition_output(flex_outputs_path: Path, row) -> Path:
+    """
+    Where the Trekker module writes one partition's outputs.
+
+    nuclei_locator.sh builds this as
+    `<OUT_DIR>/<ANALYSIS_DATE>_<SAMPLE_ID>/trekker_<SAMPLE_ID>/output`, taking ANALYSIS_DATE and
+    SAMPLE_ID from the samplesheet row and sanitizing the latter. Derived in one place because three
+    things have to agree about it: the skip check, the merge samplesheet the merger is handed, and
+    the operator reading either.
+
+    Inputs:
+     - flex_outputs_path: the run's flex/ directory, whose trekker/ subdirectory is the module's OUT_DIR
+     - row:               a samplesheet row, supplying `sample` and `experiment_date`
+    Output:
+     - the partition's output directory
+    """
+
+    partition = trekker_sample_id(row['sample'])
+    return (flex_outputs_path / "trekker" / f"{row['experiment_date']}_{partition}"
+            / f"trekker_{partition}" / "output")
+
+
 def run_takara_spatial_profiling() -> None:
     """
     Run custom scripts from Takara for 10x Flex sample processing
@@ -2363,7 +2386,25 @@ def run_takara_spatial_profiling() -> None:
 
     # run the Takara pipeline on each partition
     (flex_outputs_path / 'trekker').mkdir(exist_ok=True)
+    profiled, skipped = [], []
     for _, sample in pipeline_samplesheet.iterrows():
+        # Skip a partition that has already been profiled. Each one runs for tens of minutes to
+        # hours, and the merge happens only after *all* of them finish, so a failure at the merge
+        # step -- or anywhere after the first partition -- otherwise costs a full re-profile of work
+        # that succeeded.
+        #
+        # Completeness is the final Seurat object rather than the output directory: nuclei_locator.sh
+        # mkdir -p's the whole tree at the start, so the directory exists from the first second of a
+        # partition that goes on to crash. The .rds is written at the end and is what the merge step
+        # consumes, which makes "the merge could use this" exactly the question being asked.
+        partition_out = trekker_partition_output(flex_outputs_path, sample)
+        finished = partition_out / f"{trekker_sample_id(sample['sample'])}_ConfPositioned_seurat_spatial.rds"
+        if finished.is_file() and finished.stat().st_size > 0 and not args.force:
+            skipped.append(sample['sample'])
+            log_write(f"Skipping sample [{sample['sample']}]: already profiled "
+                      f"({run_relative(finished)}); use --force to re-profile")
+            continue
+
         log_write(f"Processing sample [{sample['sample']}]... ")
         sub_samplesheet = pd.DataFrame(
             columns=pipeline_samplesheet.columns,
@@ -2393,9 +2434,13 @@ def run_takara_spatial_profiling() -> None:
             proc.wait()
 
         if proc.returncode == 0:
+            profiled.append(sample['sample'])
             log_write("Done.\n")
         else:
             job_crash("trekker_flex", proc.returncode, takara_pipeline_log)
+
+    if skipped:
+        log_detail(f"{len(profiled)} partition(s) profiled, {len(skipped)} already complete", terminal=False)
 
     # generate the merge samplesheet
     merge_samplesheet = {
@@ -2407,11 +2452,8 @@ def run_takara_spatial_profiling() -> None:
     # this path has to match where the profiling step above actually wrote them. For a sheet slidr
     # generated itself every row carries the one run date, so this is unchanged for that case.
     for _, row in pipeline_samplesheet.iterrows():
-        partition = row['sample']
-        merge_samplesheet['sample'].append(partition)
-        trekker_output_path = (flex_outputs_path / "trekker" / f"{row['experiment_date']}_{partition}"
-                               / f"trekker_{partition}" / "output")
-        merge_samplesheet['out_dir'].append(trekker_output_path)
+        merge_samplesheet['sample'].append(row['sample'])
+        merge_samplesheet['out_dir'].append(trekker_partition_output(flex_outputs_path, row))
     
     merge_samplesheet = pd.DataFrame(merge_samplesheet)
     merge_samplesheet.to_csv(flex_samplesheets_path / "Trekker_merge_samplesheet.csv", index=False)
@@ -2430,6 +2472,33 @@ def run_takara_spatial_profiling() -> None:
         sample_partitions = merge_samplesheet[merge_samplesheet['sample'].str.startswith(sample_prefix)]
         sample_merge_sheet = flex_samplesheets_path / f"Trekker_merge_samplesheet_{sample['Sample Name']}.csv"
         sample_partitions.to_csv(sample_merge_sheet, index=False)
+
+        # trekker_merger.sh refuses to start when its input directory already exists and is
+        # non-empty, telling the operator to delete it by hand. That makes the merge a one-shot:
+        # after any failure -- including one in a *later* sample -- the stage cannot be re-run at
+        # all, which is the state a merge crash leaves behind by definition. Since the merger takes
+        # SAMPLESHEET_DIR as the parent of the sheet it is handed, those directories are ours to
+        # manage, and clearing them is exactly what --force means everywhere else in slidr.
+        #
+        # Both names are sanitized the way the merger sanitizes its own SAMPLE_ID, or a sample whose
+        # name carries a '-' or a '.' would leave the real directory untouched and still abort.
+        # `input/` is cleared every time, not only under --force. Gating it on the flag would make
+        # recovering a failed merge require --force, which also re-profiles every partition -- five
+        # hours of completed work thrown away to redo a step that takes minutes, which is the exact
+        # bind the skip above exists to prevent. The directory is the merger's own staging area,
+        # holding copies of inputs it is about to re-stage; it is not an output, nothing else reads
+        # it, and a stale one is never wanted.
+        #
+        # `log/` is kept unless --force, since after a failed merge it holds that failure's logs.
+        merge_id = trekker_sample_id(sample['Sample Name'])
+        stale = [flex_samplesheets_path / 'input' / merge_id]
+        if args.force:
+            stale.append(flex_samplesheets_path / 'log' / merge_id)
+        for directory in [d for d in stale if d.is_dir()]:
+            shutil.rmtree(directory)
+            log_detail(f"cleared the merger's {directory.parent.name}/ directory for {sample['Sample Name']}",
+                       terminal=False)
+
         # run the Takara merger
         with open(LOG_PATH / 'takara_pipeline.log', "a") as logfile:
             proc = subprocess.Popen(

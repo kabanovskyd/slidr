@@ -347,6 +347,11 @@ workflow:
   flex_spatial_R2_path: /path/to/flex/fastqs/R2
   flex_gex_fastqs:                 # list of GEX FASTQ prefixes
     - fastq_prefix_1
+  trekker_samplesheet:             # optional path to a ready-made Trekker pipeline samplesheet.
+                                   # Set, `--spatial-analysis` runs the Takara module over its rows
+                                   # and skips Trekker demultiplexing, puck retrieval and samplesheet
+                                   # generation -- see [Running the Takara module from a supplied
+                                   # samplesheet](#running-the-takara-module-from-a-supplied-samplesheet)
 ```
 
 There is no separate `cloud:` section — bucket locations for the sequencing data, reference genome, puck files, and raw barcodes are the same `paths.*` fields used locally, just pointed at a `gs://` location, which is what makes them staged. Similarly `settings.output_bucket` replaces what used to be `cloud.output_bucket`, etc.
@@ -410,6 +415,64 @@ the other four did, for the same reason they do now.
 Staging is lazy (a warm `software_cache.txt` skips it), happens at most once per run, is reused by later
 runs in the same output tree, and ends by restoring execute bits, which `gcloud storage cp` does not
 preserve. A bare `bucket/prefix` is reported as a directory that does not exist, not silently misread.
+
+---
+
+## Running the Takara module from a supplied samplesheet
+
+`workflow.trekker_samplesheet` points at a Trekker pipeline samplesheet you already have. Set it and
+`--spatial-analysis` runs the Takara/Trekker module over that sheet's rows, skipping everything
+`run_takara_spatial_profiling` would otherwise derive:
+
+```bash
+./slidr --bcl <BCL_ID> --spatial-analysis      # workflow.trekker_samplesheet is set
+```
+
+This is for the case where the work upstream of the module was done elsewhere: the spatial reads are
+already demultiplexed per partition, and the RNA counts are CellBender matrices written beside
+somebody else's cellranger run. Those inputs sit in locations and formats slidr does not choose, and
+a samplesheet is how the module already takes them.
+
+What changes when the field is set:
+
+| | Derived (field unset) | Supplied sheet |
+|---|---|---|
+| Partitions | built from `Flex Probe Barcode IDs` as `TrekkerFX_<sample>_<AB>` | the sheet's `sample` column |
+| Spatial reads | `trekker_demux.py` run on `flex_spatial_R1_path`/`R2_path` → `flex/demux/` | `fastq_1`/`fastq_2`, used as given; **no demultiplexing runs** |
+| Puck maps | downloaded from Takara and converted to `<Puck ID>_BeadBarcodes.csv` | `barcode_file`, used as given; **no download runs** |
+| RNA counts | `count/flex/<BC>/count/sample_filtered_feature_bc_matrix` | `sc_outdir`, so CellBender matrices are usable |
+| `experiment_date` | one value per run, from `BCL_ID.split('_')[0]` | per row, so one sheet may mix demux dates |
+| `profile`, `cores`, `sc_platform` | `conda`, `settings.threads`, `TrekkerFX_FLEX` | as written, so `singularity` works |
+| Chemistry required | `Flex` | any -- the field selects the backend by itself |
+
+Still slidr's: running `nuclei_locator_wrapper.sh` per row into `flex/trekker/`, then `trekker_merger.sh`
+once per metadata sample. So the output layout and the merge are unchanged, and `flex/trekker/` and
+`flex/samplesheets/` are populated as usual — the normalized sheet is written to
+`flex/samplesheets/Trekker_flex_samplesheet.csv` so the run directory records what produced it.
+
+Design points:
+
+- **The field selects the backend, not just its input.** `--spatial-analysis` normally routes to the
+  Takara module only for `Chemistry: Flex`. A sheet naming every input the module needs is a
+  stronger statement than the chemistry column, so it routes on its own; requiring `Flex` too would
+  only mean mis-declaring the libraries to reach the module. It changes nothing else — the earlier
+  stages still key off `is_flex`, so a non-Flex run keeps its ordinary count/cellbender/spatial-count
+  path.
+- **Validated at config load, then in full before anything runs.** The file's existence is one stat at
+  startup; the sheet's columns and every path it names are checked in `helpers.load_trekker_samplesheet`
+  and reported *together*, because the module is launched once per row and each row is expensive.
+- **Separator is sniffed**, so a sheet exported as `.tsv` needs no conversion. Extra columns are
+  dropped and the known ones reordered to the module's own order, so a working spreadsheet carrying
+  notes cannot shift what the wrapper reads.
+- **`sample` must start `TrekkerFX_<Sample Name>_`** for each sample in the metadata. That prefix is how
+  the merge step groups partitions back into samples, and a sample with no partition would otherwise
+  merge nothing and report success.
+
+Note the Takara scripts themselves are **not in this repository**: `workflow/takara/` must
+provide `demultiplexing/trekker_demux.py`, `profiling/nuclei_locator_wrapper.sh` and
+`merging/trekker_merger.sh`, and a `trekker` conda environment must already exist (slidr carries no
+spec for it and only reports it missing). A supplied sheet removes the need for `trekker_demux.py`
+but not the other two.
 
 ---
 
@@ -804,6 +867,10 @@ installer.
 - **`unknown argument: --stage-gcs`**: the flag was removed. It only ever disambiguated the bare `bucket/prefix` form, which is no longer accepted either — write `gs://` and staging follows from the scheme. The two errors it used to produce (`input_path is a GCS location, but this run was not asked to stage from GCS`, and `must be a GCS location when staging from GCS`) are gone with it. Paths now decide for themselves — a `gs://` value is staged with no flag, and a local one is read in place even under `--stage-gcs` — so neither the combination they rejected nor the mixed configuration they made impossible is an error any more. A `gs://` path that cannot be read now fails where it is staged, with gcloud's own message.
 - **`<field> in the configuration file is not a directory`**: the value is neither a `gs://` URI nor an existing local directory. A bare `bucket/prefix` reads as a relative directory, so this is what a bucket written without its scheme looks like — add `gs://`.
 - **`no .fastq.gz files were staged to the FASTQ directory for --fastqs`**: a staged bare `--fastqs` downloaded `<input_path>/<BCL_ID>` and found no FASTQs in it. Usually that folder holds BCLs, in which case drop `--fastqs`.
+- **`the Trekker samplesheet at ... names N input(s) that cannot be read`**: `workflow.trekker_samplesheet` is set and one or more of the `barcode_file`, `fastq_1`, `fastq_2` or `sc_outdir` paths in it is empty or absent. Every failure is listed at once with its spreadsheet line number (the header counts as line 1). `sc_outdir` is a directory of matrix files, not an `.h5`. Paths are read on the machine the pipeline runs on, so a `--gcp` run needs them present on the VM.
+- **`the Trekker samplesheet names no partition for these metadata sample(s)`**: a sample selected for this run has no row whose `sample` starts `TrekkerFX_<Sample Name>_`. That prefix is how the merge step groups partitions, so such a sample would merge nothing and still report success. Add its partitions to the sheet, or set `Run` to `NO` for it.
+- **`the Trekker samplesheet names the same partition more than once`**: two rows share a `sample` value. Each row is profiled into `flex/trekker/<experiment_date>_<sample>/`, so they would overwrite each other. Note two rows may legitimately share everything *except* `sample` — a partition re-demultiplexed on a later date is distinguished by a suffix, as in `..._AB007_cellBender_combined2`.
+- **`workflow.trekker_samplesheet` is set but is not a file**: raised at config load, before any stage runs. Point it at a `.csv`/`.tsv` sheet, or remove the field to have slidr derive one from the metadata.
 - **`the following FASTQ files are missing from ...`**: a `--fastqs` directory is incomplete or its filenames don't follow the convention above. The message names each sample, library and read that couldn't be found; check the `Lane`/`SB Lane` metadata columns against the `_L00N_` tokens in the filenames. Under `--fastqs` the `Lane` column also becomes cellranger's own `--lanes`, so a lane declared there but absent from the filenames is a hard stop rather than something count quietly works around.
 - **`staging <sample>'s spatial-barcode FASTQs by hardlink rather than symlink`**, or `by copy`: a warning, not a failure. The `--fastqs` spatial staging directory (`helpers.stage_spatial_fastqs`) is normally a directory of symlinks, and the filesystem holding `tmp/` refused to create one. It falls back along `STAGE_METHODS` — symlink → hardlink → copy — and names the rung it landed on and why each earlier one was refused. A hardlink costs nothing; a copy duplicates the SB library, and the warning states how many GB and where. The usual cause is a CIFS/SMB mount without POSIX extensions or `mfsymlinks`: adding `mfsymlinks` to the mount options, or putting `paths.output_path` on a local disk, restores symlinking. The rung is settled on the first read and reused for the rest, so one warning covers the whole library.
 - **`could not place <file> in the spatial-barcode staging directory`**: symlink, hardlink *and* copy were all refused, so this is the filesystem holding `tmp/`, not the reads. The message lists each method with its own errno. Check space and write access (`df -h`, `touch`), or point `paths.output_path` at a local disk. Note the misleading shape of the underlying error if you see it raw: `os.symlink` raises with the *target* first, so a bare `FileNotFoundError` here names the FASTQ even though only the link path can be at fault — a CIFS share that cannot hold symlinks reports the refusal as `ENOENT` rather than `EPERM`, which reads exactly like a missing read. `stage_spatial_fastqs` is the only place slidr creates a symlink, so nothing else in a run is affected by this.

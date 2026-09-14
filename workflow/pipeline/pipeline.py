@@ -56,6 +56,7 @@ from helpers import (
     stage_spatial_fastqs,
     declared_lanes,
     FASTQ_NAME_RE,
+    load_trekker_samplesheet,
     retrieve_takara_bead_barcode_file,
     sanitize_path_component,
     split_probe_barcodes,
@@ -88,6 +89,7 @@ MEM_SIZE = cfg['mem_size']
 MKFASTQ_OUTS = cfg['mkfastq_outs']
 COUNT_OUTS = cfg['count_outs']
 CELLBENDER_OUTS = cfg['cellbender_outs']
+TREKKER_SAMPLESHEET = cfg['trekker_samplesheet']
 CELLBENDER_CELLS = cfg['cellbender_cells']
 CELLBENDER_DROPLETS = cfg['cellbender_droplets']
 CELLBENDER_EPOCHS = cfg['cellbender_epochs']
@@ -2170,7 +2172,10 @@ def run_takara_spatial_profiling() -> None:
     # rather than complaining about a definition file that was never shipped.
     trekker_env = ensure_conda_env("trekker", environment_yml=None)
     takara_pipeline_log = LOG_PATH / "takara_pipeline.log"
-    takara_path = SCRIPT_PATH / "takara"
+    # The Takara module lives beside workflow/scripts rather than inside it: it is vendored from
+    # Takara/Trekker rather than slidr's own, so it is kept out of the tree holding the scripts
+    # this repository maintains. SCRIPT_PATH is workflow/scripts, so its parent is workflow/.
+    takara_path = SCRIPT_PATH.parent / "takara"
     flex_outputs_path = OUTPUT_PATH / "flex"
     flex_puck_path = flex_outputs_path / "pucks"
     flex_samplesheets_path = flex_outputs_path / "samplesheets"
@@ -2184,143 +2189,177 @@ def run_takara_spatial_profiling() -> None:
     env['PATH'] = f"{trekker_env}:{env.get('PATH', '')}"
     env.pop('PYTHONPATH', None)
 
-    # generate demux samplesheet
-    # Build parallel lists (one row per (sample, spatial barcode) pair) rather than a dict keyed on
-    # the spatial barcode. Keying on the barcode silently dropped a sample whenever the same probe
-    # barcode ID appeared under two samples; emitting every pair means a genuinely reused barcode
-    # instead surfaces as trekker_demux.py's "Duplicate barcode label" error rather than a silent
-    # drop. `demux_samples` is the ordered list of partition names reused by the loops below.
-    demux_samples = []   # column 1: TrekkerFX_<sample>_<AB> partition names
-    demux_barcodes = []  # column 2: corresponding <AB> spatial barcodes
-    for _, sample in metadata_df.iterrows():
-        barcode_group = sample['Flex Probe Barcode IDs']
-        sample_barcodes = split_probe_barcodes(barcode_group)
-        if not sample_barcodes:
-            log_write(f"[ERROR]: no value provided for the `Flex Probe Barcode IDs` metadata field for sample {sample['Sample Name']}")
+    # An operator-supplied sheet replaces everything the else-branch below derives: it names the
+    # partitions, and for each one the demultiplexed spatial reads, the puck map and the RNA count
+    # matrix. So there is nothing to demultiplex, no puck to fetch from Takara and no sheet to
+    # build. It is written back out as this run's own Trekker_flex_samplesheet.csv -- normalized to
+    # CSV and to the module's column order -- so the run directory records the sheet that produced
+    # it even though the file itself lives elsewhere.
+    if TREKKER_SAMPLESHEET is not None:
+        pipeline_samplesheet = load_trekker_samplesheet(TREKKER_SAMPLESHEET)
+        log_write(f"  Using the Trekker samplesheet named by `workflow.trekker_samplesheet`: {TREKKER_SAMPLESHEET}")
+        log_write(f"  Profiling {len(pipeline_samplesheet)} partition(s): {', '.join(pipeline_samplesheet['sample'])}")
+        log_detail("Trekker demultiplexing and puck retrieval skipped: the sheet names the reads and puck maps directly",
+                   terminal=False)
+        pipeline_samplesheet.to_csv(flex_samplesheets_path / 'Trekker_flex_samplesheet.csv', index=False)
+
+        # Every sample the metadata declares has to own at least one partition. The merge step below
+        # runs the merger once per metadata sample against the whole sheet, so a sample with no
+        # partition in it does not fail -- it merges nothing and reports success, which is the one
+        # outcome worth catching here rather than at the end of a long run.
+        declared = [str(row['Sample Name']) for _, row in metadata_df.iterrows()]
+        partitions = list(pipeline_samplesheet['sample'])
+        unmatched = [
+            name for name in declared
+            if not any(partition.startswith(f"TrekkerFX_{name}_") for partition in partitions)
+        ]
+        if unmatched:
+            log_write(f"[ERROR]: the Trekker samplesheet names no partition for these metadata sample(s): {', '.join(unmatched)}")
             log_write("Troubleshooting:")
-            log_write(" • Fill in the `Flex Probe Barcode IDs` column for every Flex sample -- the Trekker demultiplexer needs it to split the spatial reads")
-            log_write(" • Use the probe barcode IDs from your Flex kit (e.g. BC001), separated by ',' or '|' when a sample carries more than one")
-            log_write(" • If this sample is not actually Flex, correct its `Chemistry` column instead")
+            log_write(" • Partition names must start `TrekkerFX_<Sample Name>_`, which is how the merge step groups them back into samples")
+            log_write(f" • Partitions in the sheet: {', '.join(partitions)}")
+            log_write(f" • Samples in the metadata: {', '.join(declared)}")
+            log_write(" • Set `Run` to NO for a sample this sheet does not cover, or add that sample's partitions to the sheet")
             log_write(f" • Metadata source: {METADATA_SRC}")
             sys.exit(1)
-        if len(sample_barcodes) == 1:
-            log_write(f"[WARNING]: only one probe barcode parsed from the `Flex Probe Barcode IDs` value for sample "
-                      f"{sample['Sample Name']} ('{barcode_group}'); treating it as a single barcode")
-            log_write(" • If this sample carries several probe barcodes, separate them with ',' or '|' (e.g. `BC001,BC002` or `BC001|BC002`)")
-        sample_name = sample['Sample Name']
-        for barcode in sample_barcodes:
-            spatial_barcode = barcode.replace('BC', 'AB')
-            demux_samples.append(f"TrekkerFX_{sample_name}_{spatial_barcode}")
-            demux_barcodes.append(spatial_barcode)
-
-    demux_samplesheet = pd.DataFrame({
-        'samples': demux_samples,
-        'barcodes': demux_barcodes
-    })
-    demux_samplesheet.to_csv(flex_samplesheets_path / 'Trekker_demux_samplesheet.csv', header=False, index=False)
-    log_write(f"  Generated Trekker demultiplexing samplesheet: {flex_samplesheets_path / 'Trekker_demux_samplesheet.csv'}")
-
-    # run trekker demultiplexer
-    log_write(f"  Running Trekker demultiplexer... ", terminal=False, terminator="")
-    with open(takara_pipeline_log, "w") as logfile:
-        with console.status("  Running Trekker demultiplexer... "):
-            proc = subprocess.Popen(
-                [
-                    'mamba', 'run', '-n', 'trekker', 'python',
-                    takara_path / 'demultiplexing' / 'trekker_demux.py',
-                    FLEX_R1_PATH,
-                    FLEX_R2_PATH,
-                    flex_samplesheets_path / 'Trekker_demux_samplesheet.csv',
-                    flex_outputs_path / 'demux'
-                ],
-                stdout=logfile,
-                stderr=subprocess.STDOUT,
-                env=env
-            )
-
-            proc.wait()
-
-    if proc.returncode == 0:
-        log_write("Done.")
     else:
-        job_crash("trekker_demux", proc.returncode, takara_pipeline_log)
+        # generate demux samplesheet
+        # Build parallel lists (one row per (sample, spatial barcode) pair) rather than a dict keyed on
+        # the spatial barcode. Keying on the barcode silently dropped a sample whenever the same probe
+        # barcode ID appeared under two samples; emitting every pair means a genuinely reused barcode
+        # instead surfaces as trekker_demux.py's "Duplicate barcode label" error rather than a silent
+        # drop. `demux_samples` is the ordered list of partition names reused by the loops below.
+        demux_samples = []   # column 1: TrekkerFX_<sample>_<AB> partition names
+        demux_barcodes = []  # column 2: corresponding <AB> spatial barcodes
+        for _, sample in metadata_df.iterrows():
+            barcode_group = sample['Flex Probe Barcode IDs']
+            sample_barcodes = split_probe_barcodes(barcode_group)
+            if not sample_barcodes:
+                log_write(f"[ERROR]: no value provided for the `Flex Probe Barcode IDs` metadata field for sample {sample['Sample Name']}")
+                log_write("Troubleshooting:")
+                log_write(" • Fill in the `Flex Probe Barcode IDs` column for every Flex sample -- the Trekker demultiplexer needs it to split the spatial reads")
+                log_write(" • Use the probe barcode IDs from your Flex kit (e.g. BC001), separated by ',' or '|' when a sample carries more than one")
+                log_write(" • If this sample is not actually Flex, correct its `Chemistry` column instead")
+                log_write(f" • Metadata source: {METADATA_SRC}")
+                sys.exit(1)
+            if len(sample_barcodes) == 1:
+                log_write(f"[WARNING]: only one probe barcode parsed from the `Flex Probe Barcode IDs` value for sample "
+                          f"{sample['Sample Name']} ('{barcode_group}'); treating it as a single barcode")
+                log_write(" • If this sample carries several probe barcodes, separate them with ',' or '|' (e.g. `BC001,BC002` or `BC001|BC002`)")
+            sample_name = sample['Sample Name']
+            for barcode in sample_barcodes:
+                spatial_barcode = barcode.replace('BC', 'AB')
+                demux_samples.append(f"TrekkerFX_{sample_name}_{spatial_barcode}")
+                demux_barcodes.append(spatial_barcode)
 
-    # retrieve bead barcode file
-    tile_ids = [sanitize_path_component(t, "Puck ID") for t in metadata_df['Puck ID'].tolist()]
-    puck_paths = []
-    for tile_id in tile_ids:
-        if not Path(flex_puck_path / f"{tile_id}_BeadBarcodes.csv").is_file():
-            puck_path = retrieve_takara_bead_barcode_file(tile_id, flex_puck_path)
-            with zipfile.ZipFile(puck_path, "r") as zf:
-                zf.extractall(puck_path.parent)
-            puck_path = str(puck_path).replace(".zip", ".txt")
-            puck_file = pd.read_table(puck_path)
-            puck_path = str(puck_path).replace(".txt", ".csv")
-            puck_paths.append(puck_path)
-            puck_file.to_csv(puck_path, header=False, index=False)
-            log_write(f"  Downloaded puck file {puck_path} from Takeda website")
+        demux_samplesheet = pd.DataFrame({
+            'samples': demux_samples,
+            'barcodes': demux_barcodes
+        })
+        demux_samplesheet.to_csv(flex_samplesheets_path / 'Trekker_demux_samplesheet.csv', header=False, index=False)
+        log_write(f"  Generated Trekker demultiplexing samplesheet: {flex_samplesheets_path / 'Trekker_demux_samplesheet.csv'}")
+
+        # run trekker demultiplexer
+        log_write(f"  Running Trekker demultiplexer... ", terminal=False, terminator="")
+        with open(takara_pipeline_log, "w") as logfile:
+            with console.status("  Running Trekker demultiplexer... "):
+                proc = subprocess.Popen(
+                    [
+                        'mamba', 'run', '-n', 'trekker', 'python',
+                        takara_path / 'demultiplexing' / 'trekker_demux.py',
+                        FLEX_R1_PATH,
+                        FLEX_R2_PATH,
+                        flex_samplesheets_path / 'Trekker_demux_samplesheet.csv',
+                        flex_outputs_path / 'demux'
+                    ],
+                    stdout=logfile,
+                    stderr=subprocess.STDOUT,
+                    env=env
+                )
+
+                proc.wait()
+
+        if proc.returncode == 0:
+            log_write("Done.")
         else:
-            puck_path = Path(flex_puck_path / f"{tile_id}_BeadBarcodes.csv")
-            log_write(f"  Using existing puck file: {puck_path}")
+            job_crash("trekker_demux", proc.returncode, takara_pipeline_log)
 
-    # extract experiment date
-    date = BCL_ID.split('_')[0]
-    try:
-        datetime.strptime(date, "%Y%m%d")
-    except ValueError:
-        # find another workaround in the long run
-        date = datetime.now().date()
-        date = date.strftime("%Y%m%d")
+        # retrieve bead barcode file
+        tile_ids = [sanitize_path_component(t, "Puck ID") for t in metadata_df['Puck ID'].tolist()]
+        puck_paths = []
+        for tile_id in tile_ids:
+            if not Path(flex_puck_path / f"{tile_id}_BeadBarcodes.csv").is_file():
+                puck_path = retrieve_takara_bead_barcode_file(tile_id, flex_puck_path)
+                with zipfile.ZipFile(puck_path, "r") as zf:
+                    zf.extractall(puck_path.parent)
+                puck_path = str(puck_path).replace(".zip", ".txt")
+                puck_file = pd.read_table(puck_path)
+                puck_path = str(puck_path).replace(".txt", ".csv")
+                puck_paths.append(puck_path)
+                puck_file.to_csv(puck_path, header=False, index=False)
+                log_write(f"  Downloaded puck file {puck_path} from Takeda website")
+            else:
+                puck_path = Path(flex_puck_path / f"{tile_id}_BeadBarcodes.csv")
+                log_write(f"  Using existing puck file: {puck_path}")
 
-    # generate pipeline samplesheet
-    pipeline_samplesheet = {
-        'sample': [],
-        'sc_sample': [],
-        'experiment_date': [],
-        'barcode_file': [],
-        'fastq_1': [],
-        'fastq_2': [],
-        'sc_outdir': [],
-        'sc_platform': [],
-        'profile': [],
-        'subsample': [],
-        'cores': []
-    }
-    for sample in demux_samples:
-        spatial_barcode = sample.split('_')[-1]
-        barcode = sample.replace('TrekkerFX_', '')
-        # reset per iteration: a sample matching no metadata row must error here rather than
-        # silently inherit the previous iteration's (or the download loop's leftover) puck_path
-        puck_path = None
-        for _, row in metadata_df.iterrows():
-            if f"TrekkerFX_{row['Sample Name']}_{spatial_barcode}" == sample:
-                puck_path = flex_puck_path / f"{sanitize_path_component(row['Puck ID'], 'Puck ID')}_BeadBarcodes.csv"
-                break
-        if puck_path is None:
-            log_write(f"[ERROR]: no metadata row matches spatial barcode partition '{sample}'; cannot assign a puck file")
-            log_write("Troubleshooting:")
-            log_write(" • Partition names are built as TrekkerFX_<Sample Name>_<probe barcode with BC replaced by AB>, so this means the sample name or barcode changed mid-run")
-            log_write(f" • Check the `Sample Name` and `Flex Probe Barcode IDs` columns are unchanged since this run started: {SUMMARY_PATH}")
-            log_write(" • Re-run the spatial analysis stage so the partitions are rebuilt from the current metadata")
-            log_write(f" • Metadata source: {METADATA_SRC}")
-            sys.exit(1)
-        demux_output = flex_outputs_path / 'demux'
-        count_output = COUNT_OUTS / 'flex' / barcode.replace('AB', 'BC') / 'count' / 'sample_filtered_feature_bc_matrix'
-        pipeline_samplesheet['sample'].append(sample)
-        pipeline_samplesheet['sc_sample'].append(sample.replace('_AB', '_scRNAseq_AB'))
-        pipeline_samplesheet['experiment_date'].append(date)
-        pipeline_samplesheet['barcode_file'].append(puck_path)
-        pipeline_samplesheet['sc_outdir'].append(count_output)
-        pipeline_samplesheet['fastq_1'].append(demux_output / f"{sample}_R1.fastq.gz")
-        pipeline_samplesheet['fastq_2'].append(demux_output / f"{sample}_R2.fastq.gz")
-        pipeline_samplesheet['sc_platform'].append('TrekkerFX_FLEX')
-        pipeline_samplesheet['profile'].append('conda')
-        pipeline_samplesheet['subsample'].append('no')
-        pipeline_samplesheet['cores'].append(str(NUM_THREADS))
+        # extract experiment date
+        date = BCL_ID.split('_')[0]
+        try:
+            datetime.strptime(date, "%Y%m%d")
+        except ValueError:
+            # find another workaround in the long run
+            date = datetime.now().date()
+            date = date.strftime("%Y%m%d")
 
-    pipeline_samplesheet = pd.DataFrame(pipeline_samplesheet)
-    pipeline_samplesheet.to_csv(flex_samplesheets_path / 'Trekker_flex_samplesheet.csv', index=False)
-    log_write(f"Generated Trekker pipeline samplesheet: {flex_samplesheets_path / 'Trekker_flex_samplesheet.csv'}\n")
+        # generate pipeline samplesheet
+        pipeline_samplesheet = {
+            'sample': [],
+            'sc_sample': [],
+            'experiment_date': [],
+            'barcode_file': [],
+            'fastq_1': [],
+            'fastq_2': [],
+            'sc_outdir': [],
+            'sc_platform': [],
+            'profile': [],
+            'subsample': [],
+            'cores': []
+        }
+        for sample in demux_samples:
+            spatial_barcode = sample.split('_')[-1]
+            barcode = sample.replace('TrekkerFX_', '')
+            # reset per iteration: a sample matching no metadata row must error here rather than
+            # silently inherit the previous iteration's (or the download loop's leftover) puck_path
+            puck_path = None
+            for _, row in metadata_df.iterrows():
+                if f"TrekkerFX_{row['Sample Name']}_{spatial_barcode}" == sample:
+                    puck_path = flex_puck_path / f"{sanitize_path_component(row['Puck ID'], 'Puck ID')}_BeadBarcodes.csv"
+                    break
+            if puck_path is None:
+                log_write(f"[ERROR]: no metadata row matches spatial barcode partition '{sample}'; cannot assign a puck file")
+                log_write("Troubleshooting:")
+                log_write(" • Partition names are built as TrekkerFX_<Sample Name>_<probe barcode with BC replaced by AB>, so this means the sample name or barcode changed mid-run")
+                log_write(f" • Check the `Sample Name` and `Flex Probe Barcode IDs` columns are unchanged since this run started: {SUMMARY_PATH}")
+                log_write(" • Re-run the spatial analysis stage so the partitions are rebuilt from the current metadata")
+                log_write(f" • Metadata source: {METADATA_SRC}")
+                sys.exit(1)
+            demux_output = flex_outputs_path / 'demux'
+            count_output = COUNT_OUTS / 'flex' / barcode.replace('AB', 'BC') / 'count' / 'sample_filtered_feature_bc_matrix'
+            pipeline_samplesheet['sample'].append(sample)
+            pipeline_samplesheet['sc_sample'].append(sample.replace('_AB', '_scRNAseq_AB'))
+            pipeline_samplesheet['experiment_date'].append(date)
+            pipeline_samplesheet['barcode_file'].append(puck_path)
+            pipeline_samplesheet['sc_outdir'].append(count_output)
+            pipeline_samplesheet['fastq_1'].append(demux_output / f"{sample}_R1.fastq.gz")
+            pipeline_samplesheet['fastq_2'].append(demux_output / f"{sample}_R2.fastq.gz")
+            pipeline_samplesheet['sc_platform'].append('TrekkerFX_FLEX')
+            pipeline_samplesheet['profile'].append('conda')
+            pipeline_samplesheet['subsample'].append('no')
+            pipeline_samplesheet['cores'].append(str(NUM_THREADS))
+
+        pipeline_samplesheet = pd.DataFrame(pipeline_samplesheet)
+        pipeline_samplesheet.to_csv(flex_samplesheets_path / 'Trekker_flex_samplesheet.csv', index=False)
+        log_write(f"Generated Trekker pipeline samplesheet: {flex_samplesheets_path / 'Trekker_flex_samplesheet.csv'}\n")
 
     # run the Takara pipeline on each partition
     (flex_outputs_path / 'trekker').mkdir(exist_ok=True)
@@ -2363,9 +2402,15 @@ def run_takara_spatial_profiling() -> None:
         'sample': [],
         'out_dir': []
     }
-    for sample in demux_samples:
-        merge_samplesheet['sample'].append(sample)
-        trekker_output_path = flex_outputs_path / "trekker" / f"{date}_{sample}" / f"trekker_{sample}" / "output"
+    # Keyed off the samplesheet rather than the derived partition list, and taking each row's own
+    # `experiment_date`: a supplied sheet can carry partitions demultiplexed on different days, and
+    # this path has to match where the profiling step above actually wrote them. For a sheet slidr
+    # generated itself every row carries the one run date, so this is unchanged for that case.
+    for _, row in pipeline_samplesheet.iterrows():
+        partition = row['sample']
+        merge_samplesheet['sample'].append(partition)
+        trekker_output_path = (flex_outputs_path / "trekker" / f"{row['experiment_date']}_{partition}"
+                               / f"trekker_{partition}" / "output")
         merge_samplesheet['out_dir'].append(trekker_output_path)
     
     merge_samplesheet = pd.DataFrame(merge_samplesheet)
@@ -2376,13 +2421,22 @@ def run_takara_spatial_profiling() -> None:
     # merge partitions for each sample
     for _, sample in metadata_df.iterrows():
         log_write(f"  Processing sample [{sample['Sample Name']}]... ")
+        # trekker_merger.sh merges *every* row of the sheet it is handed and uses its SAMPLE_ID
+        # argument only to name the outputs -- it does no filtering of its own. So each sample has
+        # to be given a sheet holding only its own partitions; passing the combined one merged all
+        # of them into every sample. `TrekkerFX_<Sample Name>_` is the documented grouping prefix,
+        # and it is already enforced above, so every partition lands under exactly one sample.
+        sample_prefix = f"TrekkerFX_{sample['Sample Name']}_"
+        sample_partitions = merge_samplesheet[merge_samplesheet['sample'].str.startswith(sample_prefix)]
+        sample_merge_sheet = flex_samplesheets_path / f"Trekker_merge_samplesheet_{sample['Sample Name']}.csv"
+        sample_partitions.to_csv(sample_merge_sheet, index=False)
         # run the Takara merger
         with open(LOG_PATH / 'takara_pipeline.log', "a") as logfile:
             proc = subprocess.Popen(
                 [
                     'mamba', 'run', '-n', 'trekker', 'bash',
                     takara_path / 'merging' / 'trekker_merger.sh',
-                    flex_samplesheets_path / 'Trekker_merge_samplesheet.csv',
+                    sample_merge_sheet,
                     flex_outputs_path,
                     sample['Sample Name'],
                     'conda',

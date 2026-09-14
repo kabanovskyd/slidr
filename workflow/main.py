@@ -41,6 +41,7 @@ OUTPUT_PATH = cfg['output_path']
 MKFASTQ_OUTS = cfg['mkfastq_outs']
 COUNT_OUTS = cfg['count_outs']
 CELLBENDER_OUTS = cfg['cellbender_outs']
+TREKKER_SAMPLESHEET = cfg['trekker_samplesheet']
 SPATIAL_COUNT_OUTS = cfg['spatial_count_outs']
 SPATIAL_ANALYSIS_OUTS = cfg['spatial_analysis_outs']
 SUMMARY_PATH = cfg['summary_path']
@@ -92,6 +93,13 @@ metadata_df = pd.read_csv(SUMMARY_PATH)
 # Flex chemistry uses cellranger multi (its own cell calling) and the Takara/Trekker spatial path,
 # so the standard CellBender and spatial-barcode-counting stages do not apply to Flex runs
 is_flex = 'Flex' in metadata_df['Chemistry'].tolist()
+
+# A supplied Trekker samplesheet routes spatial analysis through the same Takara module, whatever the
+# `Chemistry` column says. The module is what processes the sheet's partitions, and the sheet already
+# names every input it needs, so requiring `Chemistry: Flex` here would only mean mis-declaring the
+# chemistry of the libraries to reach it. It selects the backend and nothing else: the stages above
+# still key off is_flex, so a non-Flex run keeps its ordinary count/cellbender/spatial-count path.
+use_trekker = TREKKER_SAMPLESHEET is not None
 
 samples = [str(row['Sample Name']) for _, row in metadata_df.iterrows()]
 chemistry = str(metadata_df['Chemistry'].values[0])
@@ -191,7 +199,7 @@ if args.spatial_count or args.run_all:
 # check if spatial analysis / Flex pipeline needs to be run
 if args.spatial_analysis or args.run_all:
     if need_run_module("spatial_analysis", metadata_df) or args.force:
-        if is_flex:
+        if is_flex or use_trekker:
             run_takara_spatial_profiling()
         else:
             run_spatial_analysis()

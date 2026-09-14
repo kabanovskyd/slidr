@@ -2407,13 +2407,22 @@ def run_takara_spatial_profiling() -> None:
     # merge partitions for each sample
     for _, sample in metadata_df.iterrows():
         log_write(f"  Processing sample [{sample['Sample Name']}]... ")
+        # trekker_merger.sh merges *every* row of the sheet it is handed and uses its SAMPLE_ID
+        # argument only to name the outputs -- it does no filtering of its own. So each sample has
+        # to be given a sheet holding only its own partitions; passing the combined one merged all
+        # of them into every sample. `TrekkerFX_<Sample Name>_` is the documented grouping prefix,
+        # and it is already enforced above, so every partition lands under exactly one sample.
+        sample_prefix = f"TrekkerFX_{sample['Sample Name']}_"
+        sample_partitions = merge_samplesheet[merge_samplesheet['sample'].str.startswith(sample_prefix)]
+        sample_merge_sheet = flex_samplesheets_path / f"Trekker_merge_samplesheet_{sample['Sample Name']}.csv"
+        sample_partitions.to_csv(sample_merge_sheet, index=False)
         # run the Takara merger
         with open(LOG_PATH / 'takara_pipeline.log', "a") as logfile:
             proc = subprocess.Popen(
                 [
                     'mamba', 'run', '-n', 'trekker', 'bash',
                     takara_path / 'merging' / 'trekker_merger.sh',
-                    flex_samplesheets_path / 'Trekker_merge_samplesheet.csv',
+                    sample_merge_sheet,
                     flex_outputs_path,
                     sample['Sample Name'],
                     'conda',

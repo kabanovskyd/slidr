@@ -468,7 +468,7 @@ Design points:
   the merge step groups partitions back into samples, and a sample with no partition would otherwise
   merge nothing and report success.
 
-Note the Takara scripts themselves are **not in this repository**: `workflow/scripts/takara/` must
+Note the Takara scripts themselves are **not in this repository**: `workflow/takara/` must
 provide `demultiplexing/trekker_demux.py`, `profiling/nuclei_locator_wrapper.sh` and
 `merging/trekker_merger.sh`, and a `trekker` conda environment must already exist (slidr carries no
 spec for it and only reports it missing). A supplied sheet removes the need for `trekker_demux.py`

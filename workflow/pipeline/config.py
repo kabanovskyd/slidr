@@ -615,6 +615,7 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         CELLBENDER_CELLS = workflow.get('cellbender_estimated_cells')
         SPATIAL_DOWNSAMPLING = workflow.get('spatial_downsampling')
         PERCENT_UMI_FILTERING = workflow.get('top_n_percent_umi_filter')
+        MAX_BEADS_PER_CELL = workflow.get('max_beads_per_cell')
         EMPTYDROPS_MIN_UMI = workflow.get('flex_emptydrops_minimum_umis')
         FLEX_PROBE_SET = workflow.get('flex_probe_set')
         FLEX_R1_PATH = workflow.get('flex_spatial_R1_path')
@@ -1209,6 +1210,7 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         'cellbender_droplets': CELLBENDER_DROPLETS,
         'spatial_downsampling': SPATIAL_DOWNSAMPLING,
         'percent_umi_filtering': PERCENT_UMI_FILTERING,
+        'max_beads_per_cell': MAX_BEADS_PER_CELL,
         'emptydrops_min_umis': EMPTYDROPS_MIN_UMI,
         'flex_probe_set': FLEX_PROBE_SET,
         'flex_r1_path': FLEX_R1_PATH,

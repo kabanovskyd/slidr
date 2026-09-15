@@ -339,8 +339,19 @@ workflow:
   cellbender_estimated_cells:      # set null to let CellBender estimate
   cellbender_epochs: 160
   cellbender_learn_rate: 0.5
-  spatial_downsampling:            # optional float; downsamples spatial reads before spatial_count.jl
+  spatial_downsampling:            # optional float; thins the spatial reads of EVERY cell. Applied in
+                                   # the spatial-analysis stage, not before spatial_count.jl: it reads
+                                   # the existing SBcounts.h5 and writes SBcounts_downsampled_<rate>.h5
+                                   # beside it, so changing it needs no --spatial-count re-run. Must be
+                                   # a float (`0.5`, not `1` or `'0.5'`) or it is warned about and
+                                   # ignored. Reach for `max_beads_per_cell` first -- see below
   top_n_percent_umi_filter:        # optional float 0-100; bead UMI filtering percentile
+  max_beads_per_cell: 20000        # per-cell bead cap for the KDE positioning step; default 20000.
+                                   # Clamped to 46340, the largest n for which rdist::pdist can build
+                                   # the n x n distance matrix it needs (32-bit Armadillo: n^2 must fit
+                                   # in a signed int). Only cells above the cap are subsampled, and the
+                                   # draw is seeded off cb_index, so a run is reproducible and every
+                                   # other cell is bit-identical to an uncapped run
   flex_emptydrops_minimum_umis: 100
   flex_probe_set: /path/to/probe_set.csv
   flex_spatial_R1_path: /path/to/flex/fastqs/R1
@@ -819,6 +830,7 @@ installer.
 - **Google Sheets auth failure**: verify `auth_key_path` points to a valid *service account* JSON key (an OAuth client-secret file will not work — the error names the missing `client_email` field), and that the sheet is shared with the key's `client_email`, which the error quotes. `gcloud auth login` is not a substitute — the key is read directly. A `gs://` value is read with `gcloud storage cat`, so check the *active gcloud account* can read that object even though the key inside it is a different identity. If the metadata is a local `.tsv`/`.csv`, no key is needed at all.
 - **`auth_key_path` must be a gs:// object for a --gcp run**: the key is no longer copied onto the VM, so a local path names a file that does not exist there. Upload the key once, point the field at it, and the pipeline reads it straight out of the bucket when it opens the sheet. `./slidr` raises this at launch, before a VM is created.
 - **Slack alerts not arriving**: `settings.slack_token` may be a local file path, a `gs://` object or the literal token; a path-shaped value that does not resolve is a hard error rather than being tried as a token. The bot needs `users:read.email` (to map the `Email` column to a user) and `chat:write`. A token file that is group- or world-readable produces a warning.
+- **`Mat::init(): requested size is too large; suggest to enable ARMA_64BIT_WORD`** during spatial analysis: one cell carried more spatial beads than `kde()` can build a pairwise distance matrix for. `rdist::pdist` links against a 32-bit Armadillo, so the n x n matrix must hold fewer than 2^31-1 elements — a hard ceiling of **46340 beads per cell** — and the kernel and sweep that follow allocate two more matrices of the same shape, so memory bites at a similar size anyway (69209 beads is ~38 GB per copy). `workflow.max_beads_per_cell` caps this, defaulting to 20000, and the log names every cell it subsamples. Only ambient-dominated barcodes get that large: a real nucleus carries a few thousand beads, while such a barcode touches a sixth of the puck and is left unplaced by the existing `d2/d1 >= 1/3` ambiguity gate regardless. Prefer this over `workflow.spatial_downsampling`, which thins **every** cell and so drops marginal ones out of the spatial map — and not at random, since spatial capture tracks RNA content and therefore cell type.
 - **`only N% of <sample>'s reads carry a valid cell barcode`**: cellranger matched almost none of the sample's cell barcodes against the whitelist for the `Chemistry` it was given, which nearly always means that column is wrong (3' and 5' kits use different whitelists, so the wrong one leaves a few percent matching by chance; a correct one gives 85–95%). Only a warning — cellranger exits 0 and its output is intact — but left uncorrected, cellbender fails later with a `ZeroDivisionError` from scipy, having found no empty droplets to learn an ambient profile from. Fix the `Chemistry` column and re-run `--count --force`. Flex samples are not checked, since `cellranger multi` reports this metric in a different format.
 - **`FileNotFoundError` / exit 127 for `julia` when spatial counting starts**: a path in `software_cache.txt` that does not exist or does not run. Auto-installed Julia used to be cached as `<depot>/bin/julia`, a layout juliaup never creates, so the failure surfaced only once the spatial stage tried to launch it. Fixed by globbing the depot and executing the binary before caching it; a stale line from an earlier run is skipped automatically, and can be deleted from `software_cache.txt` if you would rather not look at it.
 - **`the Julia installer reported success, but no working julia binary was found`**: juliaup exited 0 but left nothing runnable under `~/.local/slidr/bin/julia`. The message names the exact `find` to run; a binary that is present but will not execute is usually a glibc or architecture mismatch, in which case install Julia yourself and pin it in `software_cache.txt`.

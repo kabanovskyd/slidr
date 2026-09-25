@@ -28,6 +28,7 @@ workflow:
   cellbender_learn_rate:
   spatial_downsampling:
   top_n_percent_umi_filter:
+  max_beads_per_cell:
   flex_emptydrops_minimum_umis:
   flex_probe_set:
   flex_spatial_R1_path:

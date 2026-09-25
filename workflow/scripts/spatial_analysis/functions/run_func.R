@@ -67,7 +67,7 @@ gex_summary_format <- function(summary_path) {
 check_args_and_get_paths <- function(args) {
   if (length(args) < 4) {
     stop(trouble(
-      "Usage: Rscript run_spatial.R BCLname [Sample1, Sample2] <cellbender> <downsampling_rate> [ncores] [percent_umi_filter]",
+      "Usage: Rscript run_spatial.R BCLname [Sample1, Sample2] <cellbender> <downsampling_rate> [ncores] [percent_umi_filter] [max_beads_per_cell]",
       "This script is normally invoked by the pipeline's spatial-analysis stage, not by hand",
       "Run it through the pipeline with `./slidr --bcl <BCL_ID> --spatial-analysis`",
       paste("Got", length(args), "argument(s):", paste(args, collapse = " "))
@@ -91,6 +91,8 @@ check_args_and_get_paths <- function(args) {
   ncores <- ifelse(length(args) >= 5, as.numeric(args[5]), 1)
   # top N percent of beads (by total UMI count) to filter out; defaults to 1 (top 1%) if not provided
   percent_umi_filter <- ifelse(length(args) >= 6, as.numeric(args[6]), 1)
+  # per-cell bead cap for the KDE step; defaults to 20000. positioning.R validates and clamps it
+  max_beads_per_cell <- ifelse(length(args) >= 7, as.numeric(args[7]), 20000)
 
   if (!is.null(SAMPLEnames)) {
     if (!grepl("^\\[.*\\]$", SAMPLEnames)) {
@@ -132,6 +134,7 @@ check_args_and_get_paths <- function(args) {
                          output = character(),
                          ncores = numeric(),
                          percent_umi_filter = numeric(),
+                         max_beads_per_cell = numeric(),
                          stringsAsFactors = FALSE)
 
   sample_rows <- vector("list", length(SAMPLEnames))
@@ -223,7 +226,8 @@ check_args_and_get_paths <- function(args) {
                spatial = sb_path,
                output = out_path,
                ncores = ncores,
-               percent_umi_filter = percent_umi_filter)
+               percent_umi_filter = percent_umi_filter,
+               max_beads_per_cell = max_beads_per_cell)
   }
   files_df <- do.call(rbind, c(list(files_df), sample_rows))
   return(files_df)

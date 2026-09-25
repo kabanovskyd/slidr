@@ -116,7 +116,8 @@ plot_dbscan <- function(coords, optim_plot) {
 # gaussian kernel density estimation over bead positions to find the dominant signal peak per cell
 # bw (bandwidth) controls the spatial smoothing radius; radius defines the inclusion zone around each peak
 # the ratio d2/d1 measures placement ambiguity: low ratio means one clear dominant location
-kde <- function(df, bw, radius) {
+# max_beads caps how many beads enter the pairwise distance matrix; see the note above the subsample below
+kde <- function(df, bw, radius, max_beads = Inf) {
   cb_i = unique(df$cb_index) ; stopifnot(len(cb_i)==1)
   df %<>% select(x_um, y_um, umi)
   res = c(cb_index=cb_i,
@@ -133,6 +134,38 @@ kde <- function(df, bw, radius) {
   # filter singleton beads (umi==1) when the cell has at least one bead with 3+ UMIs,
   # because singletons are likely noise and distort density estimates
   if (max(df$umi) >= 3) {df %<>% filter(umi > 1)}
+  # Cap the bead count before the pairwise distance matrix is built.
+  #
+  # pdist() below materialises a full n x n matrix, and rdist links against a 32-bit Armadillo, so
+  # the element count must fit in a signed int: n > 46340 aborts the whole run with
+  # "Mat::init(): requested size is too large; suggest to enable ARMA_64BIT_WORD". The kernel and
+  # the sweep that follow allocate two more matrices of the same shape, so memory bites at a similar
+  # size regardless -- at n = 69209 that is ~38 GB each, ~115 GB for the expression.
+  #
+  # Only ambient-dominated barcodes get that large: a nucleus here carries a few thousand beads,
+  # while such a barcode touches a sixth of the puck with no density peak worth the name. Rather
+  # than thin every cell in the sample (which is what `workflow.spatial_downsampling` does, and it
+  # pushes marginal cells below the threshold to be positioned at all, non-randomly, since spatial
+  # capture tracks RNA content and therefore cell type), thin only the cells that cannot be computed.
+  #
+  # The subsample is uniform over beads, NOT UMI-weighted: the kernel below already weights by
+  # df$umi, so drawing proportional to UMI would apply that weighting twice. A uniform draw scales
+  # the density surface by a constant and leaves the peak location unbiased.
+  #
+  # Seeded off cb_index so a capped cell draws the same beads on every run, whatever order the cells
+  # are processed in, and the global RNG stream is restored afterwards so nothing else shifts.
+  # Note that for a capped cell sumi/sbeads describe the subsample rather than the whole cell.
+  if (nrow(df) > max_beads) {
+    seed_state = if (exists(".Random.seed", envir=.GlobalEnv)) get(".Random.seed", envir=.GlobalEnv) else NULL
+    set.seed(cb_i)
+    keep = sort(sample.int(nrow(df), max_beads))
+    if (is.null(seed_state)) {
+      if (exists(".Random.seed", envir=.GlobalEnv)) rm(".Random.seed", envir=.GlobalEnv)
+    } else {
+      assign(".Random.seed", seed_state, envir=.GlobalEnv)
+    }
+    df = df[keep, ]
+  }
   # compute pairwise distances then apply a gaussian kernel weighted by UMI counts
   # density[i] = sum over all beads j of umi[j] * exp(-dist(i,j)^2 / bw)
   xmu = pdist(df[,c("x_um","y_um")])

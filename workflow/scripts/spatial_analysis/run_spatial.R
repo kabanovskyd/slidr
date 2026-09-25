@@ -75,10 +75,11 @@ for (n in result$name) {
   OutPath = result[result$name == n, ]$output
   ncores = result[result$name == n, ]$ncores
   PercentUmiFilter = result[result$name == n, ]$percent_umi_filter
+  MaxBeadsPerCell = result[result$name == n, ]$max_beads_per_cell
   # shQuote every arg: system2() does NOT shell-escape args (it pastes them unquoted into
   # /bin/sh -c), so a path derived from Sample Name/BCL metadata containing shell metacharacters
   # (e.g. `;`, `$(...)`) would otherwise execute as a command
-  positioning_result <- system2("Rscript", args = shQuote(c(run_positioning_src, RNAh5path, Molpath, SummaryPath, SBh5path, OutPath, as.character(ncores), as.character(PercentUmiFilter))))
+  positioning_result <- system2("Rscript", args = shQuote(c(run_positioning_src, RNAh5path, Molpath, SummaryPath, SBh5path, OutPath, as.character(ncores), as.character(PercentUmiFilter), as.character(MaxBeadsPerCell))))
   if (positioning_result != 0) {
     stop(trouble(
       paste0("run_positioning.R failed with code ", positioning_result, " for sample '", n, "'"),

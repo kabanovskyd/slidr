@@ -97,6 +97,7 @@ CELLBENDER_EPOCHS = cfg['cellbender_epochs']
 CELLBENDER_RATE = cfg['cellbender_rate']
 SPATIAL_DOWNSAMPLING = cfg['spatial_downsampling']
 PERCENT_UMI_FILTERING = cfg['percent_umi_filtering']
+MAX_BEADS_PER_CELL = cfg['max_beads_per_cell']
 FLEX_OUTS = cfg['flex_outs']
 SPATIAL_COUNT_OUTS = cfg['spatial_count_outs']
 SPATIAL_ANALYSIS_OUTS = cfg['spatial_analysis_outs']
@@ -2105,6 +2106,29 @@ def run_spatial_analysis() -> None:
             log_write(hint)
         percent_umi_filtering = 1
 
+    # Per-cell bead cap for the KDE step of positioning.
+    #
+    # kde() builds a full n x n pairwise distance matrix per cell, so one outsized cell can abort the
+    # whole sample: rdist links against a 32-bit Armadillo and cannot allocate past n = 46340, and the
+    # memory for three matrices of that shape is prohibitive well before it. Only ambient-dominated
+    # barcodes reach that size, so the cap thins those cells alone -- unlike
+    # `workflow.spatial_downsampling`, which thins every cell in the sample and drops the marginal
+    # ones out of the spatial map entirely.
+    max_beads_per_cell = MAX_BEADS_PER_CELL
+    if max_beads_per_cell is None:
+        max_beads_per_cell = 20000
+    elif isinstance(max_beads_per_cell, bool) or not is_number(max_beads_per_cell) or float(max_beads_per_cell) < 1:
+        log_write(f"[WARNING]: max_beads_per_cell must be a positive number, but is currently set to {max_beads_per_cell!r}")
+        log_write("Defaulting to 20000 beads per cell for this run")
+        log_write(" • Set `workflow.max_beads_per_cell` to a positive integer (e.g. 20000), unquoted")
+        log_write(" • Remove the field entirely to accept the default of 20000 without this warning")
+        hint = bool_value_hint(max_beads_per_cell, 'workflow.max_beads_per_cell')
+        if hint:
+            log_write(hint)
+        max_beads_per_cell = 20000
+    else:
+        max_beads_per_cell = int(max_beads_per_cell)
+
     # The suffix a downsampled SBcounts file carries, and the one run_spatial.R is told to look for.
     # It stays empty unless a downsampled file was actually written: the file and the label used to be
     # derived from two different conditions -- the file only for a float rate, the label for any value
@@ -2206,7 +2230,8 @@ def run_spatial_analysis() -> None:
                     use_cellbender,
                     downsampling_label,
                     str(NUM_THREADS),
-                    str(percent_umi_filtering)
+                    str(percent_umi_filtering),
+                    str(max_beads_per_cell)
                 ],
                 stdout=logfile,
                 stderr=subprocess.STDOUT,

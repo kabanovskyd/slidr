@@ -44,7 +44,8 @@ positioning_src <- paste0(r_func_path, '/positioning.R')
 
 
 # per-sample processing script invoked once per sample by run_spatial.R
-# args: RNApath, molecule_info_path, summary_path, SBpath, out_path, ncores, percent_umi_filter
+# args: RNApath, molecule_info_path, summary_path, SBpath, out_path, ncores, percent_umi_filter,
+#       max_beads_per_cell
 args <- commandArgs(trailingOnly = TRUE)
 RNApath <- args[[1]]
 molecule_info_path <- args[[2]]
@@ -54,6 +55,8 @@ out_path <- args[[5]]
 ncores <- as.numeric(args[[6]])
 # top N percent of beads (by total UMI count) to filter out; defaults to 1 (top 1%) if not provided
 percent_umi_filter <- ifelse(length(args) >= 7, as.numeric(args[[7]]), 1)
+# per-cell bead cap for the KDE step; defaults to 20000 if not provided. positioning.R validates it
+max_beads_per_cell <- ifelse(length(args) >= 8, as.numeric(args[[8]]), 20000)
 
 ### Load the RNA ###############################################################
 # load_seurat runs normalization, PCA, clustering, and UMAP; attaches cb (barcode without lane suffix)
@@ -102,7 +105,7 @@ Misc(obj, "spatial_metadata") <- fromJSON(file.path(out_path, "spatial_metadata.
 # run positioning.R as a subprocess; it reads matrix.csv.gz and writes coords.csv
 log_ts("positioning cells")
 t_position <- Sys.time()
-result <- system2("Rscript", args = shQuote(c(positioning_src, file.path(out_path, 'matrix.csv.gz'), out_path, as.character(ncores))))
+result <- system2("Rscript", args = shQuote(c(positioning_src, file.path(out_path, 'matrix.csv.gz'), out_path, as.character(ncores), as.character(max_beads_per_cell))))
 if (result != 0) {
   stop(trouble(
     paste("positioning.R failed with code", result),

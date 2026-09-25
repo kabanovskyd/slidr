@@ -49,13 +49,16 @@ radius = 200 # inclusion radius around density peak (µm)
 
 # parse arguments
 args <- commandArgs(trailingOnly = TRUE)
-if (length(args) == 3) {
+if (length(args) %in% c(3, 4)) {
   matrix_path <- args[[1]] # (cell, x, y, umi) dataframe from load_matrix.R
   out_path <- args[[2]]    # path to write coords.csv and diagnostic plots
   ncores <- as.numeric(args[[3]])
+  # per-cell bead cap for the KDE step; see the note in kde() for why it exists.
+  # defaults to 20000 when not provided so a by-hand invocation still cannot hit the pdist ceiling
+  max_beads <- ifelse(length(args) >= 4, as.numeric(args[[4]]), 20000)
 } else {
   stop(trouble(
-    "Usage: Rscript positioning.R matrix_path output_path ncores",
+    "Usage: Rscript positioning.R matrix_path output_path ncores [max_beads_per_cell]",
     "This script is normally invoked by the pipeline's spatial-analysis stage, not by hand",
     "Run it through the pipeline with `./slidr --bcl <BCL_ID> --spatial-analysis`",
     paste("Got", length(args), "argument(s):", paste(args, collapse = " "))
@@ -132,7 +135,29 @@ suppressMessages(suppressWarnings(make.pdf(plot, file.path(out_path, "DBSCAN.pdf
 ### Run KDE ####################################################################
 # kde() returns the top-2 density peak locations and their ratio (d2/d1) for each cell
 # ratio < 1/3 means the second peak is weak relative to the dominant peak — unambiguous placement
-kde_coords <- map(data.list, ~kde(., bw, radius)) %>% bind_rows
+#
+# ARMA_CEILING is the largest n for which rdist::pdist can allocate an n x n matrix: rdist links
+# against a 32-bit Armadillo, so n^2 must fit in a signed int, giving floor(sqrt(2^31-1)) = 46340.
+# A cap above it would let a cell abort the run, which is the failure this argument exists to stop,
+# so it is clamped rather than trusted.
+ARMA_CEILING <- 46340
+if (is.na(max_beads) || max_beads < 1) {
+  log_detail(g("[WARNING]: max_beads_per_cell is {args[[4]]}, which is not a positive number — using 20000"))
+  max_beads <- 20000
+}
+if (max_beads > ARMA_CEILING) {
+  log_detail(g("[WARNING]: max_beads_per_cell={max_beads} exceeds what pdist can allocate — clamping to {ARMA_CEILING}"))
+  max_beads <- ARMA_CEILING
+}
+# report the cells the cap will touch. The count here is pre-`umi > 1` filter, so it is an upper
+# bound on how many are actually subsampled, but it is the number the operator can see in
+# matrix.csv.gz and is what makes an unexpected result traceable to this step.
+capped <- keep(data.list, ~nrow(.) > max_beads)
+if (len(capped) > 0) {
+  log_detail(g("{len(capped)} of {len(data.list)} cell(s) exceed {max_beads} beads and will be subsampled for the KDE"))
+  log_detail(paste0("  cb_index ", names(capped), ": ", map_int(capped, nrow), " beads"))
+}
+kde_coords <- map(data.list, ~kde(., bw, radius, max_beads)) %>% bind_rows
 if (any(is.na(kde_coords$d1)) || any(is.na(kde_coords$d2))) {
   stop(trouble(
     "the kernel density estimation produced missing peak densities for some cells",

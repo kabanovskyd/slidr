@@ -5,6 +5,7 @@ import time
 import argparse
 import tomllib
 import subprocess
+import tempfile
 
 from datetime import datetime
 from pathlib import Path
@@ -89,6 +90,128 @@ def get_version():
             err_console.print("Troubleshooting:")
             err_console.print(" • Run `git pull` to restore the missing pyproject.toml file")
             sys.exit(1)
+
+
+# Filesystem types that cannot take the pipeline's logging pattern. `log_write` opens the logfile,
+# appends one line and closes it again, once per line -- and reopening an existing file for append
+# on an SMB/CIFS mount fails intermittently with EBADF. Measured on //helium/broad_thechenlab: 14%
+# of appends failed writing continuously to one file, 38% with a 5ms pause between them, while
+# writing the same volume to a *new* file each time and holding a single handle open both failed 0
+# times in 300. The trigger is the reopen, not the write rate: with `cache=strict,closetimeo=1` the
+# client holds the handle for up to a second after close, and reopening inside that window races the
+# deferred close. `soft` then surfaces it as an error rather than retrying. Two runs died this way.
+NETWORK_FSTYPES = frozenset({'cifs', 'smb3', 'smbfs'})
+
+
+def filesystem_type(path) -> str | None:
+    """
+    Return the type of the filesystem backing `path`, or None if it cannot be determined.
+
+    Resolves the path, then finds the longest mount point in /proc/self/mountinfo that contains it --
+    longest, because mounts nest and `/mnt/share` must win over `/` for a path inside it.
+
+    Inputs:
+     - path: the path to identify the backing filesystem of
+    Output:
+     - the filesystem type as the kernel names it ('ext4', 'cifs', 'nfs4', ...), or None where that
+       cannot be read, which includes macOS and any platform without /proc. None is treated as
+       "assume local" by every caller: a wrong guess here must never stop a run.
+    """
+
+    try:
+        target = Path(path).resolve()
+    except OSError:
+        return None
+
+    mounts = []
+    try:
+        with open('/proc/self/mountinfo', 'r') as handle:
+            for line in handle:
+                # mountinfo splits at ' - ': the mount point is field 5 on the left of that
+                # separator, the filesystem type the first field on the right
+                left, separator, right = line.partition(' - ')
+                if not separator:
+                    continue
+                left_fields, right_fields = left.split(), right.split()
+                if len(left_fields) < 5 or not right_fields:
+                    continue
+                mounts.append((left_fields[4], right_fields[0]))
+    except OSError:
+        return None
+
+    # Longest match wins because mounts nest. `>=` rather than `>` because two filesystems can share
+    # one mount point, and the later entry is the one actually in effect: an autofs direct map sits
+    # at the same path as the filesystem it mounts on demand, so the share used here appears twice --
+    # once as autofs, then as cifs over it. Taking the first match would report every automounted
+    # share as 'autofs' and the staging below would never engage on the mounts that need it.
+    best_length, best_type = -1, None
+    for mountpoint, fstype in mounts:
+        try:
+            target.relative_to(mountpoint)
+        except ValueError:
+            continue
+        if len(mountpoint) >= best_length:
+            best_length, best_type = len(mountpoint), fstype
+    return best_type
+
+
+def resolve_log_staging(log_path: Path, bcl_id: str) -> tuple[Path, Path | None]:
+    """
+    Decide where this run writes its logs, staging them on local disk when the run directory is on a
+    network filesystem that cannot take the append pattern (see NETWORK_FSTYPES).
+
+    Staging is chosen from the *filesystem*, not from a flag, for the same reason a `gs://` path is:
+    it is a property of where the outputs live, and the operator should not have to know which of
+    their storage targets happens to be a CIFS mount. `SLIDR_LOG_STAGE_DIR` overrides the location,
+    `SLIDR_NO_LOG_STAGING=1` disables it outright.
+
+    Inputs:
+     - log_path: the run's real log directory, <OUT_PATH>/log
+     - bcl_id:   this run's BCL ID, used to name the staging directory
+    Output:
+     - (write_path, final_path): where the run should write logs, and where they must be copied at
+       exit -- final_path is None when no staging is happening, which is the local-disk case and
+       leaves every existing path untouched
+    """
+
+    if os.environ.get('SLIDR_NO_LOG_STAGING') == '1':
+        return log_path, None
+
+    fstype = filesystem_type(log_path.parent)
+    if fstype not in NETWORK_FSTYPES:
+        return log_path, None
+
+    # One staging directory per process, not per BCL: two runs of the same BCL can overlap, and
+    # sharing a staging directory would interleave their runtime.log lines and race the copy back.
+    override = os.environ.get('SLIDR_LOG_STAGE_DIR')
+    base = Path(override) if override else Path(tempfile.gettempdir())
+    staged = base / f'slidr-logs-{bcl_id}-{os.getpid()}'
+
+    try:
+        staged.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        console.print(f"[yellow]\\[WARNING][/yellow]: {log_path.parent} is a {fstype} mount, where slidr's "
+                      f"logging is unreliable, but the staging directory {staged} could not be created: {error}")
+        console.print(f"  Logs will be written directly to {log_path}; a run may fail with "
+                      f"'[Errno 9] Bad file descriptor'")
+        console.print(f"  Set SLIDR_LOG_STAGE_DIR to a writable local directory to stage them instead")
+        return log_path, None
+
+    # A staging directory that is itself on a network mount buys nothing. This is reachable through
+    # SLIDR_LOG_STAGE_DIR, and on hosts whose TMPDIR points at shared storage.
+    staged_fstype = filesystem_type(staged)
+    if staged_fstype in NETWORK_FSTYPES:
+        console.print(f"[yellow]\\[WARNING][/yellow]: the log staging directory {staged} is itself on a "
+                      f"{staged_fstype} mount, so staging would not avoid the problem it exists for")
+        console.print(f"  Logs will be written directly to {log_path}")
+        console.print(f"  Point SLIDR_LOG_STAGE_DIR at local disk, or set SLIDR_NO_LOG_STAGING=1 to silence this")
+        try:
+            staged.rmdir()
+        except OSError:
+            pass
+        return log_path, None
+
+    return staged, log_path
 
 
 def is_gcs_path(value) -> bool:
@@ -922,6 +1045,15 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
     METADATA_PATH = OUT_PATH / "metadata"
     OUTPUT_PATH = OUT_PATH / "output"
     TMP_PATH = OUT_PATH / "tmp"
+
+    # On a CIFS/SMB run directory the logs are written to local disk for the duration of the run and
+    # copied into <OUT_PATH>/log at exit, because slidr's per-line open/append/close cannot be done
+    # reliably over SMB (see NETWORK_FSTYPES). LOG_PATH is redirected rather than each caller being
+    # taught about staging: every log file in the run -- runtime.log, the summary, and the per-stage
+    # tool logs -- is derived from it, so one substitution moves all of them and nothing else needs
+    # to change. LOG_DEST is None whenever the run directory is local, which is the unchanged path.
+    LOG_PATH, LOG_DEST = resolve_log_staging(LOG_PATH, BCL_ID)
+
     RUNTIME_LOG = LOG_PATH / "runtime.log"
     SUMMARY_PATH = METADATA_PATH / "metadata_summary.csv"
     SAMPLESHEET_PATH = METADATA_PATH / "samplesheet.csv"
@@ -932,8 +1064,11 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
     SPATIAL_ANALYSIS_OUTS = OUTPUT_PATH / "spatial_analysis"
     FLEX_OUTS = OUTPUT_PATH / "flex"
 
-    for path in [LOG_PATH, METADATA_PATH, TMP_PATH, OUTPUT_PATH]:
-        path.mkdir(exist_ok=True)
+    # LOG_DEST is included so the run directory has its log/ from the start even while the logs are
+    # being staged elsewhere -- it is where they land at exit, and `upload_diagnostics` expects it
+    for path in [LOG_PATH, LOG_DEST, METADATA_PATH, TMP_PATH, OUTPUT_PATH]:
+        if path is not None:
+            path.mkdir(exist_ok=True)
 
     # ------------------------------------------------------------------------------------- #
     #                      resolve where this run reads its reads from                       #
@@ -1190,6 +1325,7 @@ def _load() -> tuple[argparse.ArgumentParser, dict]:
         'script_path': SCRIPT_PATH,
         'metadata_path': METADATA_PATH,
         'log_path': LOG_PATH,
+        'log_dest': LOG_DEST,
         'tmp_path': TMP_PATH,
         'software_path': SOFTWARE_PATH,
         'metadata_src': METADATA_SRC,

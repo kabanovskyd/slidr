@@ -70,6 +70,7 @@ ROOT_PATH = cfg['root_path']
 OUTPUT_PATH = cfg['output_path']
 SCRIPT_PATH = cfg['script_path']
 LOG_PATH = cfg['log_path']
+LOG_DEST = cfg['log_dest']
 INPUT_PATH = cfg['input_path']
 FASTQ_INPUT = cfg['fastq_input']
 METADATA_PATH = cfg['metadata_path']
@@ -967,6 +968,70 @@ def upload_outputs() -> None:
             log_write(" • `gcloud storage rsync -r` resumes a partial upload, where `cp -r` restarts it")
         log_write(f" • The outputs are still on this machine at {OUTPUT_PATH}; run the upload manually:")
         log_write(f"    `{' '.join(cmd)}`")
+
+
+def flush_staged_logs() -> None:
+    """
+    Copy this run's staged logs into the run directory's `log/`, however the run ended.
+
+    A no-op unless `LOG_DEST` is set, which happens only when config.py found the run directory on a
+    CIFS/SMB mount and redirected `LOG_PATH` to local disk. Every other run writes its logs straight
+    into the run directory and there is nothing to move.
+
+    Copying is safe on the filesystem that made staging necessary: what fails over SMB is reopening
+    an existing file to append, and each file here is created once and written in a single pass --
+    the pattern measured at 0 failures in 500 on the same mount where per-line appends failed 14-38%.
+
+    Registered with `atexit` by main.py, after `upload_diagnostics`, so it runs *before* it: handlers
+    run last-registered-first, and the logs should be in their final place on disk before anything
+    tries to ship them onwards. `upload_diagnostics` reads `LOG_PATH`, so it uploads the staged copy
+    either way -- the contents are identical and neither depends on the other having run.
+
+    Output:
+     - none; failures are reported but never raised, because this runs while the process is already
+       exiting and must not replace the error the user actually needs to read
+    """
+
+    try:
+        if LOG_DEST is None:
+            return
+        source = Path(LOG_PATH)
+        dest = Path(LOG_DEST)
+        if not source.is_dir() or source == dest:
+            return
+
+        files = sorted(entry for entry in source.iterdir() if entry.is_file())
+        if not files:
+            return
+
+        # Written before the copy, not after, so this line is present in the copy rather than only
+        # in the staging directory that is about to be discarded.
+        log_write(f"  Copying {len(files)} log file(s) to {dest}", terminal=False)
+
+        dest.mkdir(parents=True, exist_ok=True)
+        failed = []
+        for entry in files:
+            try:
+                shutil.copy2(entry, dest / entry.name)
+            except OSError as error:
+                failed.append(f"{entry.name}: {error}")
+
+        if failed:
+            # straight to the console: the logfile these lines would otherwise go to is the thing
+            # that just failed to copy
+            console.print(f"[yellow]\\[WARNING][/yellow]: {len(failed)} of {len(files)} log file(s) could not be "
+                          f"copied from {source} to {dest}")
+            for detail in failed[:5]:
+                console.print(f"  • {detail}")
+            console.print(f"  The staged copies are intact at {source} -- copy them by hand before that is cleared")
+            return
+
+        # Only discard the staging copy once every file is known to have landed.
+        console.print(f"  Logs written to {dest}")
+        shutil.rmtree(source, ignore_errors=True)
+    except Exception:
+        # bookkeeping must never mask the failure that brought us here
+        pass
 
 
 def upload_diagnostics() -> None:

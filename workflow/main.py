@@ -22,6 +22,7 @@ from pipeline.pipeline import (
     stage_input_data,
     upload_outputs,
     upload_diagnostics,
+    flush_staged_logs,
     run_mkfastq,
     write_metadata_to_file,
     create_samplesheet,
@@ -63,6 +64,12 @@ BCL_ID = cfg['bcl_id']
 # that job_failure prints points at a file nobody can ever read. atexit rather than a call at the
 # bottom of this script, since the failing paths leave through sys.exit and never reach it.
 atexit.register(upload_diagnostics)
+
+# Move staged logs into the run directory, for a run whose outputs are on a CIFS/SMB mount and whose
+# logs are therefore being written to local disk. Registered *after* upload_diagnostics so that it
+# runs *before* it -- atexit handlers run last-registered-first -- putting the logs in their final
+# place on disk before anything ships them onwards. A no-op for every run on local storage.
+atexit.register(flush_staged_logs)
 
 # save sample metadata locally
 write_metadata_to_file()

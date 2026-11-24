@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo_small.png" alt="slidr logo" width="420"/>
+  <img src="assets/new_logo.png" alt="slidr logo" width="420"/>
 </p>
 
 # `slidr` — The Slide-tags Analysis Pipeline

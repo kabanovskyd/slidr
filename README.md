@@ -2,9 +2,9 @@
   <img src="assets/logo_small.png" alt="slidr logo" width="420"/>
 </p>
 
-# `slidr` — The Slide-Tag Analysis Pipeline
+# `slidr` — The Slide-tags Analysis Pipeline
 
-A pipeline for processing Slide-Tag spatial transcriptomics data. Starting from BCL files or pre-demultiplexed FASTQs, `slidr` runs demultiplexing, gene expression quantification, ambient RNA removal, and spatial barcode assignment to produce analysis-ready outputs.
+A pipeline for processing Slide-tags spatial transcriptomics data. Starting from BCL files or pre-demultiplexed FASTQs, `slidr` runs demultiplexing, gene expression quantification, ambient RNA removal, and spatial barcode assignment to produce analysis-ready outputs.
 
 
 
@@ -182,7 +182,7 @@ This is the only place the location is configured; there is no command-line equi
 paths:
   input_path: /mnt/sequencer
 
-# staged run -- the scheme is what makes it one
+# staged run - the scheme is what makes it one
 paths:
   input_path: gs://slidr_data/inputs
 ```
@@ -601,7 +601,7 @@ case it is taken as the run directory itself rather than nested again.
 | `count/<sample>/outs/filtered_feature_bc_matrix.h5` | count | Cellranger filtered expression matrix |
 | `cellbender/<sample>/cellbender_output_filtered.h5` | cellbender | Ambient-corrected expression matrix |
 | `spatial_barcodes/<sample>/SBcounts.h5` | spatial-count | Cell barcode → spatial coordinate mapping |
-| `spatial_analysis/<sample>/seurat.qs` | spatial-analysis | Seurat object with spatial embeddings |
+| `spatial_analysis/<sample>/seurat.qs2` | spatial-analysis | Seurat object with spatial embeddings (`seurat.qs` when `workflow.seurat_format: qs`) |
 | `spatial_analysis/<sample>/coords.csv` | spatial-analysis | Cell coordinates |
 | `spatial_analysis/<sample>/summary.pdf` | spatial-analysis | QC summary plots |
 

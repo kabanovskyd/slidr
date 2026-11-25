@@ -10,8 +10,8 @@ paths:
 
 # run settings
 settings:
-  memory: 50
-  threads: 16
+  memory:
+  threads:
   metadata_source:
   gcs_download_dest:
   output_bucket:
@@ -21,7 +21,7 @@ settings:
 
 # workflow components and parameters
 workflow:
-  generate_bam: false
+  generate_bam:
   cellbender_total_droplets:
   cellbender_estimated_cells:
   cellbender_epochs:
@@ -35,3 +35,4 @@ workflow:
   flex_spatial_R2_path:
   flex_gex_fastqs:
   trekker_samplesheet:
+  seurat_format:
